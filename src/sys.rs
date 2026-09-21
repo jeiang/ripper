@@ -307,18 +307,22 @@ pub struct Walk {
     pub manifest: Manifest,
 }
 
-/// ino -> (size, mtime). mtime, not ctime: unlinking one name of a hard-linked
-/// inode changes the inode's ctime, so a ctime manifest would report every
-/// other link in the tree as changed.
+/// `(dev, ino) -> (size, mtime)`. Keyed by the pair, not ino alone: a bare
+/// inode number is only unique within one `st_dev`, and nested btrfs
+/// subvolumes (each its own `st_dev`, docs/design.md §1 "Nested btrfs
+/// subvolumes count") routinely reuse low inode numbers, so two unrelated
+/// entries on different subvolumes can share an ino. mtime, not ctime:
+/// unlinking one name of a hard-linked inode changes the inode's ctime, so a
+/// ctime manifest would report every other link in the tree as changed.
 #[derive(Debug, Default)]
 pub struct Manifest {
-    dirs: HashSet<u64>,
-    files: HashMap<u64, (u64, (i64, u32))>,
+    dirs: HashSet<(Dev, u64)>,
+    files: HashMap<(Dev, u64), (u64, (i64, u32))>,
 }
 
 impl Manifest {
     pub fn unchanged(&self, m: &Meta) -> bool {
-        self.files.get(&m.id.ino) == Some(&(m.size, m.mtime))
+        self.files.get(&(m.id.dev, m.id.ino)) == Some(&(m.size, m.mtime))
     }
 }
 
@@ -391,12 +395,15 @@ struct WalkCtx {
 }
 
 fn count_leaf(m: &Meta, w: &mut Walk) {
+    let key = (m.id.dev, m.id.ino);
     // A hard-linked inode (nlink > 1) counts once: skip the size add on a
     // repeat sighting, but keep refreshing the manifest entry (same value).
-    if !w.manifest.files.contains_key(&m.id.ino) {
+    // Keyed by (dev, ino), so a same-numbered inode on a different
+    // subvolume is never mistaken for a repeat sighting of this one.
+    if !w.manifest.files.contains_key(&key) {
         w.size += m.size;
     }
-    w.manifest.files.insert(m.id.ino, (m.size, m.mtime));
+    w.manifest.files.insert(key, (m.size, m.mtime));
 }
 
 fn flag_immutable(m: &Meta, rel: &Path, w: &mut Walk) {
@@ -455,7 +462,7 @@ fn walk_open_dir(
     ctx: &WalkCtx,
     w: &mut Walk,
 ) -> Option<WalkFrame> {
-    w.manifest.dirs.insert(m.id.ino);
+    w.manifest.dirs.insert((m.id.dev, m.id.ino));
     if m.id.mnt != ctx.own_mnt {
         if ctx.uid.is_some() {
             w.problem
@@ -635,7 +642,9 @@ fn enter_or_unlink(
         r.kept.push((rel, "a mount point; not crossing it".into()));
         return None;
     }
-    if o.manifest.is_some_and(|mf| !mf.dirs.contains(&m.id.ino)) {
+    if o.manifest
+        .is_some_and(|mf| !mf.dirs.contains(&(m.id.dev, m.id.ino)))
+    {
         r.kept.push((rel, "new since it was copied".into()));
         return None;
     }
@@ -818,6 +827,23 @@ mod tests {
         open_dir(CWD, dir.path()).unwrap()
     }
 
+    /// A `Meta` for a regular file, without touching the filesystem: used to
+    /// simulate an inode-number collision across two devices (as two nested
+    /// btrfs subvolumes commonly produce, docs/design.md §1) without needing
+    /// a real multi-device test filesystem.
+    fn synthetic_file_meta(dev: Dev, ino: u64, size: u64, mtime: (i64, u32)) -> Meta {
+        Meta {
+            id: Ident { dev, ino, mnt: 0 },
+            mode: S_IFREG,
+            uid: 0,
+            nlink: 1,
+            size,
+            mtime,
+            ctime: mtime,
+            attrs: StatxAttributes::empty(),
+        }
+    }
+
     // ---- noreplace_with (docs/design.md §6.3) ----
 
     #[test]
@@ -870,6 +896,42 @@ mod tests {
 
         let w = walk(r.as_fd(), OsStr::new("d"), Check::Size).unwrap();
         assert_eq!(w.size, 5);
+    }
+
+    #[test]
+    fn manifest_keeps_colliding_ino_on_different_dev_distinct() {
+        // Two entries that share an inode number but live on different
+        // devices, as two nested btrfs subvolumes commonly do for their
+        // root directory and first ordinary file (docs/design.md §1
+        // "Nested btrfs subvolumes count", since `cp -a` copies them). A
+        // manifest keyed by ino alone treats the second sighting as a
+        // hard-link repeat of the first: it skips adding its size, and
+        // overwrites the first entry's (size, mtime), so the first file
+        // is later reported "changed" even though it never changed.
+        let dev_a = Dev(1, 0);
+        let dev_b = Dev(1, 1);
+        let colliding_ino = 257;
+        let file_a = synthetic_file_meta(dev_a, colliding_ino, 5, (100, 0));
+        let file_b = synthetic_file_meta(dev_b, colliding_ino, 9, (200, 0));
+
+        let mut w = Walk {
+            size: 0,
+            problem: None,
+            manifest: Manifest::default(),
+        };
+        count_leaf(&file_a, &mut w);
+        count_leaf(&file_b, &mut w);
+
+        assert_eq!(
+            w.size,
+            5 + 9,
+            "colliding ino on a different dev undercounted the walk size"
+        );
+        assert!(
+            w.manifest.unchanged(&file_a),
+            "file_a's manifest entry must survive file_b's colliding-ino sighting"
+        );
+        assert!(w.manifest.unchanged(&file_b));
     }
 
     #[test]
@@ -1115,6 +1177,51 @@ mod tests {
         assert!(kept.iter().any(|n| n.contains("change.txt")), "{kept:?}");
         assert!(kept.iter().any(|n| n.contains("new.txt")), "{kept:?}");
         assert!(!kept.iter().any(|n| n.contains("keep.txt")), "{kept:?}");
+    }
+
+    #[test]
+    fn remove_tree_manifest_dir_does_not_match_colliding_ino_on_a_different_dev() {
+        // Simulates the nested-btrfs-subvolume case (docs/design.md §1):
+        // a manifest entry recorded on one device (`foreign_dev`) shares an
+        // inode number with a real, *different* directory on this test's
+        // own device. `victim/sub` was never actually walked, so it must
+        // stay "new" and be kept, not be mistaken for the manifest's entry
+        // just because their ino numbers coincide.
+        let dir = tempfile::tempdir().unwrap();
+        let r = root(&dir);
+        mkdirat(&r, "victim", Mode::from_raw_mode(0o700)).unwrap();
+        mkdirat(&r, "victim/sub", Mode::from_raw_mode(0o700)).unwrap();
+
+        let victim = stat_at(&r, "victim").unwrap();
+        let sub = stat_at(&r, "victim/sub").unwrap();
+        let foreign_dev = Dev(sub.id.dev.0, sub.id.dev.1.wrapping_add(1));
+        let mut manifest = Manifest::default();
+        // "victim" itself is recorded correctly, so the walk descends into
+        // it; only "sub" gets the foreign-dev collision entry.
+        manifest.dirs.insert((victim.id.dev, victim.id.ino));
+        manifest.dirs.insert((foreign_dev, sub.id.ino));
+
+        let mnt = ident(&r).unwrap().mnt;
+        let res = remove_tree(
+            r.as_fd(),
+            OsStr::new("victim"),
+            &Remove {
+                mnt,
+                manifest: Some(&manifest),
+                trash: false,
+            },
+        );
+
+        let kept: Vec<String> = res
+            .kept
+            .iter()
+            .map(|(p, _)| p.to_string_lossy().into_owned())
+            .collect();
+        assert!(kept.iter().any(|n| n.contains("sub")), "{kept:?}");
+        assert!(
+            stat_at(&r, "victim/sub").is_ok(),
+            "victim/sub must not be removed: it never matched the manifest"
+        );
     }
 
     #[test]
