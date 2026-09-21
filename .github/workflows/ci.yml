@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: lint and formatting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: cachix/install-nix-action@v31
+      - name: Lints and formatting
+        run: nix develop --command just check
+
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: cachix/install-nix-action@v31
+      - name: Build the package (runs the unit tests)
+        run: nix build --print-build-logs
+      - name: Wrapper and completions
+        run: |
+          ./result/bin/rip --version
+          test -s result/share/fish/vendor_completions.d/rip.fish
+          test -s result/share/bash-completion/completions/rip.bash
+          test -s result/share/zsh/site-functions/_rip
