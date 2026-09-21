@@ -37,3 +37,30 @@ jobs:
           test -s result/share/fish/vendor_completions.d/rip.fish
           test -s result/share/bash-completion/completions/rip.bash
           test -s result/share/zsh/site-functions/_rip
+
+  test:
+    name: test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: cachix/install-nix-action@v31
+      # ubuntu-24.04 blocks unprivileged user namespaces through AppArmor, and a
+      # bwrap from /nix/store has no AppArmor profile. The sandbox harness's own
+      # preflight (tests/common/mod.rs) would otherwise fail every test here.
+      - name: Allow unprivileged user namespaces
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sysctl kernel.apparmor_restrict_unprivileged_userns
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      # A real btrfs, so the subvolume tests run here as they do on artemis.
+      - name: Scratch btrfs
+        run: |
+          truncate -s 1G "$RUNNER_TEMP/btrfs.img"
+          nix develop --command mkfs.btrfs -q "$RUNNER_TEMP/btrfs.img"
+          sudo mkdir -p /mnt/btrfs
+          sudo mount -o loop "$RUNNER_TEMP/btrfs.img" /mnt/btrfs
+          sudo chown "$(id -u):$(id -g)" /mnt/btrfs
+          echo "RIP_TEST_BTRFS=/mnt/btrfs" >> "$GITHUB_ENV"
+      - name: Tests
+        run: nix develop --command just test

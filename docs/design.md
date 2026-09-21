@@ -209,7 +209,9 @@ between the check and the rename on such filesystems.
 
 The copy path is: copy into a fresh box in `.rip-staging`, reserve the
 `.trashinfo`, publish with `NOREPLACE`, `syncfs`, then remove the source
-using a preflight manifest (`ino -> (size, mtime)`, mtime rather than ctime
+using a preflight manifest (`(dev, ino) -> (size, mtime)`; dev and ino
+together because a bare ino is only unique within one `st_dev`, and nested
+btrfs subvolumes routinely reuse low inode numbers; mtime rather than ctime
 because unlinking one name of a hard-linked inode changes ctime but not
 mtime) so a source entry that changed during the copy is left in place
 instead of being deleted out from under a stale assumption.
@@ -255,7 +257,7 @@ is mid-deletion through an open fd.
 | A live bind source, a trash, or a dir holding mounts moved | `mount_conflict`, `inside_trash`, `contains_trash` | `refusals`; `mount_conflict` units |
 | `rip dir dir/f` moves `f` out of the trashed item | Each operand resolved just before it moves | `parent_then_child` |
 | Source deleted before the copy is complete and durable | Box, then reserve, publish, `syncfs`, then removal | `copy_rollback_unreadable_file`, `ephemeral_root_copies` |
-| A source entry changed during the copy is deleted | Manifest `(ino, size, mtime)` | `remove_tree` manifest unit |
+| A source entry changed during the copy is deleted | Manifest `(dev, ino) -> (size, mtime)` | `remove_tree` manifest unit |
 | A hard-linked tree is reported as changed | mtime, not ctime | `copy_hardlinked_tree`; hard-link unit |
 | Copy complete but the source half-deleted | Full-tree preflight | `copy_refused_unwritable_subdir`, `copy_refused_sticky_foreign` |
 | Removal crosses into another mount | Pre-check plus the mount-id guard | `never_crosses_mounts`, `refusals` |
