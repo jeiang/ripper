@@ -259,8 +259,9 @@ pub fn open_home(path: &Path, create: bool, uid: u32) -> io::Result<Option<Trash
     // `missing_ok: true`: an impermanence setup routinely bind-mounts the
     // home trash's *parent* directory into place before `rip` ever runs
     // there, so `Trash/` itself can exist, real and correctly owned, with
-    // no `files/`/`info/` yet -- exactly like "no home trash at all" to a
-    // read-only command, not a warning-worthy oddity.
+    // *both* `files/` and `info/` absent -- exactly like "no home trash at
+    // all" to a read-only command, not a warning-worthy oddity. Only one of
+    // the two missing is never silenced by `missing_ok` (see `finish_open`).
     finish_open(dir, Kind::Home, canonical, base, true)
 }
 
@@ -307,9 +308,13 @@ pub fn open_trash(path: &Path, kind: Kind, base: &Path, uid: u32) -> io::Result<
 /// already-owner-checked trash root, opens `files/` and `info/`
 /// (`O_NOFOLLOW`; a `files -> $HOME` symlink must never let `empty` delete
 /// the home directory) and requires both to share the root's mount.
-/// `missing_ok` decides what a missing `files/`/`info/` means: `Ok(None)`
-/// (ordinary, silent -- see `open_home`'s caller) or a warning-worthy `Err`
-/// (see `open_trash`'s caller).
+/// `missing_ok` decides what *both* `files/` and `info/` being absent
+/// means: `Ok(None)` (ordinary, silent -- see `open_home`'s caller) or a
+/// warning-worthy `Err` (see `open_trash`'s caller, which always passes
+/// `false`). Exactly one of the two missing is never silent, `missing_ok`
+/// or not: that is corruption (e.g. a crash between `ensure_home()`'s two
+/// `mkdirat` calls), not "no trash dir yet", and it can hide real trashed
+/// data if swallowed.
 fn finish_open(
     dir: OwnedFd,
     kind: Kind,
@@ -318,17 +323,22 @@ fn finish_open(
     missing_ok: bool,
 ) -> io::Result<Option<Trash>> {
     let id = sys::ident(&dir)?;
-    let files = match sys::open_dir(&dir, "files") {
+    let files_r = sys::open_dir(&dir, "files");
+    let info_r = sys::open_dir(&dir, "info");
+    let not_found =
+        |r: &io::Result<OwnedFd>| matches!(r, Err(e) if e.kind() == ErrorKind::NotFound);
+    if missing_ok && not_found(&files_r) && not_found(&info_r) {
+        return Ok(None);
+    }
+    let files = match files_r {
         Ok(fd) => fd,
-        Err(e) if e.kind() == ErrorKind::NotFound && missing_ok => return Ok(None),
         Err(e) if e.kind() == ErrorKind::NotFound => {
             return Err(io::Error::other("its files/ subdirectory is missing"));
         }
         Err(e) => return Err(e),
     };
-    let info = match sys::open_dir(&dir, "info") {
+    let info = match info_r {
         Ok(fd) => fd,
-        Err(e) if e.kind() == ErrorKind::NotFound && missing_ok => return Ok(None),
         Err(e) if e.kind() == ErrorKind::NotFound => {
             return Err(io::Error::other("its info/ subdirectory is missing"));
         }

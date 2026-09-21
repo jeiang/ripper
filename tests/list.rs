@@ -210,6 +210,47 @@ fn skips_invalid_dirs() {
 }
 
 #[test]
+fn home_trash_missing_one_of_files_info_warns() {
+    let uid = getuid().as_raw();
+    let sandbox = Sandbox::artemis();
+
+    // Corrupt the home trash: `files/` exists with a real trashed entry,
+    // but `info/` is missing (e.g. a crash between ensure_home()'s two
+    // mkdirat calls, or an accidental deletion). open_home must not treat
+    // this like "no home trash yet" -- that silent skip is only for *both*
+    // files/ and info/ being absent (the impermanence pre-mount case) -- so
+    // it must warn instead of silently hiding the trashed data.
+    let trash_host = sandbox.host("/home/u/.local/share/Trash");
+    std::fs::create_dir_all(trash_host.join("files")).unwrap();
+    std::fs::write(trash_host.join("files/secret"), b"data").unwrap();
+
+    // A real item in a topdir trash, so this also proves discovery keeps
+    // going past the broken home trash instead of aborting the command.
+    sandbox.plant(
+        &format!("/mnt/other/.Trash-{uid}"),
+        b"good",
+        b"/mnt/other/good",
+        "2026-01-01T00:00:00",
+        Body::File(b"data".to_vec()),
+    );
+
+    let out = with_timeout(20, move || sandbox.rip("/", &["list", "--all", "-0"]));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("info/ subdirectory is missing"),
+        "expected a warning about the home trash's missing info/, got: {stderr:?}"
+    );
+    let records = parse_null_records(&out.stdout);
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].1, b"mnt/other/good");
+}
+
+#[test]
 fn unreadable_mountpoint_skipped() {
     let mut sandbox = Sandbox::artemis();
     let locked = tempfile::tempdir().unwrap();

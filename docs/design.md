@@ -61,6 +61,12 @@ Each item here is a deliberate choice, reversible if it causes trouble:
 - **Waiting.** A put waits while an `empty` holds its short exclusive lock,
   and an `empty` waits for running puts and restores. Both print `waiting for
   another rip`.
+- **Home trash: missing `files/`/`info/`.** A home trash whose `files/` and
+  `info/` are *both* absent is silent, like no home trash existing yet (an
+  impermanence setup can bind-mount the home trash's parent into place
+  before either is created). Exactly one of the two missing is corruption,
+  not impermanence: it warns and is skipped, the same as a topdir trash
+  missing one of them, instead of silently hiding real trashed data.
 
 ## 2. CLI parsing
 
