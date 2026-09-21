@@ -96,10 +96,8 @@ fn first_field(line: &str) -> &str {
 }
 
 /// The sandbox has no real trash, no `/mnt/Mumei` and none of the stray
-/// `.Trash-*` dirs the host has: `rip list --all` must print nothing. Needs
-/// `rip list`, which lands in C3.
+/// `.Trash-*` dirs the host has: `rip list --all` must print nothing.
 #[test]
-#[ignore = "needs rip list (C3)"]
 fn no_real_trash_visible() {
     let sandbox = Sandbox::artemis();
 
@@ -115,9 +113,10 @@ fn no_real_trash_visible() {
         String::from_utf8_lossy(&out.stdout)
     );
 
-    // A planted trash entry is still only visible on disk, not through
-    // `rip` (list isn't implemented yet); this keeps `plant` itself
-    // exercised even while this test is ignored.
+    // A planted trash entry is only visible on disk here (list already ran
+    // above, against a sandbox that had none): this keeps `plant` itself
+    // exercised, and documents that it is not somehow already reflected in
+    // the assertion above.
     sandbox.plant(
         "/home/u/.local/share/Trash",
         b"x",
