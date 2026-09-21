@@ -4,19 +4,19 @@
 
 use std::ffi::{OsStr, OsString};
 use std::io;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use jiff::civil;
-use rustix::fs::{CWD, Mode, mkdirat};
+use rustix::fs::{AtFlags, CWD, Mode, mkdirat, unlinkat};
 use rustix::io::Errno;
 
 use crate::info::{self, Kind};
 use crate::mounts::{self, FsId, Mount, Mounts};
-use crate::sys::{self, Dev, Lock, Meta};
+use crate::sys::{self, Check, Dev, Lock, Meta, Removal, Remove};
 use crate::trash::{self, Trash};
-use crate::{Cli, Cx, confirm, escape, human};
+use crate::{Cli, Cx, Fallback, confirm, escape, human};
 
 // ---------------------------------------------------------------------------
 // Placement (docs/design.md §5.4, pure)
@@ -359,10 +359,6 @@ fn leak(s: String) -> &'static str {
 
 enum Done {
     Moved(PathBuf),
-    // First constructed by the real copy_to_home, which lands in the very
-    // next commit (`feat(put): copy into the home trash when no trash is
-    // usable`); this commit's stub never returns it.
-    #[allow(dead_code)]
     Copied(PathBuf, u64),
     Declined,
 }
@@ -573,27 +569,143 @@ fn move_in(
 // Cross-filesystem copy into the home trash (docs/design.md §6.5-§6.7)
 // ---------------------------------------------------------------------------
 
-/// Stub for this commit: the cross-filesystem copy fallback (docs/design.md
-/// §6.5-§6.7) lands in the very next commit
-/// (`feat(put): copy into the home trash when no trash is usable`), which
-/// replaces this whole function. Until then, an operand that needs it fails
-/// clearly instead of silently doing nothing.
+fn removal_summary(rm: &Removal) -> String {
+    rm.kept
+        .iter()
+        .map(|(p, why)| format!("{}: {why}", p.display()))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 #[allow(clippy::too_many_arguments)]
 fn copy_to_home(
-    _cx: &Cx,
-    _cli: &Cli,
-    _s: &Session,
-    _pfd: &OwnedFd,
-    _name: &OsStr,
+    cx: &Cx,
+    cli: &Cli,
+    s: &Session,
+    pfd: &OwnedFd,
+    name: &OsStr,
     path: &Path,
-    _st: &Meta,
+    st: &Meta,
     why: &str,
 ) -> Result<Done, PutErr> {
-    Err(format!(
-        "'{}' has no usable trash on its filesystem ({why}); the copy fallback is not implemented yet",
-        path.display()
-    )
-    .into())
+    if cx.cfg.fallback == Fallback::Refuse {
+        return Err(format!(
+            "no usable trash on its filesystem ({why}); left it untouched (fallback = \"refuse\" in {})",
+            cx.cfg.source.display()
+        )
+        .into());
+    }
+
+    let w = sys::walk(pfd.as_fd(), name, Check::Removable { uid: cx.uid })?; // one pass, before any write
+    if let Some(p) = w.problem {
+        return Err(format!("{p}; not copying it").into());
+    }
+    if !cli.force
+        && w.size > cx.cfg.copy_threshold
+        && !confirm(
+            &format!(
+                "'{}' ({}) has no usable trash on its filesystem ({why}). Copy it into {} and delete the original?",
+                path.display(),
+                human(w.size),
+                s.home().path.display()
+            ),
+            "-f",
+        )?
+    {
+        return Ok(Done::Declined);
+    }
+    eprintln!(
+        "rip: '{}' has no usable trash on its filesystem ({why}); copying {} into the home trash",
+        path.display(),
+        human(w.size)
+    );
+
+    let home = s.home();
+    let _lock = sys::lock(&home.dir, Lock::Shared)?; // held for the whole copy: empty waits
+    let staging = trash::staging(home)?;
+    let (bx, bfd) = sys::make_box(staging.as_fd(), "put")?;
+    let drop_box = |bx: &OsStr| {
+        sys::remove_tree(
+            staging.as_fd(),
+            bx,
+            &Remove {
+                mnt: home.id.mnt,
+                manifest: None,
+                trash: true,
+            },
+        );
+    };
+
+    // 1. Copy. The source is only read. No info exists yet, so a long copy
+    // leaves nothing dangling.
+    if let Err(e) = sys::cp_archive(pfd.as_fd(), name, bfd.as_fd(), OsStr::new("item")) {
+        drop_box(&bx);
+        return Err(format!("copying into the home trash failed: {e}; left it untouched").into());
+    }
+
+    // 2. Reserve, 3. publish with NOREPLACE.
+    let mut r = match trash::reserve(
+        home,
+        name,
+        info::encode(path.as_os_str().as_bytes(), s.date),
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            drop_box(&bx);
+            return Err(e.into());
+        }
+    };
+    loop {
+        match sys::rename_noreplace(&bfd, OsStr::new("item"), &home.files, r.name()) {
+            Ok(()) => break,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                if let Err(e) = r.advance() {
+                    drop_box(&bx);
+                    return Err(e.into());
+                }
+            }
+            Err(e) => {
+                drop_box(&bx);
+                return Err(e.into());
+            }
+        }
+    }
+    let n = r.commit();
+    let _ = unlinkat(&staging, &bx, AtFlags::REMOVEDIR);
+
+    // 4. The copy, its info and the rename are on disk before any source
+    // byte is removed.
+    sys::syncfs(&home.files)?;
+
+    // 5. Delete only what the walk saw, unchanged, through the same parent
+    // fd cp copied from.
+    let rm = sys::remove_tree(
+        pfd.as_fd(),
+        name,
+        &Remove {
+            mnt: st.id.mnt,
+            manifest: Some(&w.manifest),
+            trash: false,
+        },
+    );
+    if !rm.removed_any {
+        // Nothing gone: no duplicate stays behind.
+        trash::discard(home, &cx.mounts, &n)?;
+        return Err(format!(
+            "it changed while it was copied; left it untouched ({})",
+            removal_summary(&rm)
+        )
+        .into());
+    }
+    if !rm.kept.is_empty() {
+        return Err(format!(
+            "the trash holds a complete copy ({}); these source entries were kept: {}",
+            home.path.join("files").join(&n).display(),
+            removal_summary(&rm)
+        )
+        .into());
+    }
+    Ok(Done::Copied(home.path.join("files").join(n), w.size))
 }
 
 // ---------------------------------------------------------------------------

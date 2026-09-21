@@ -5,7 +5,9 @@
 
 mod common;
 
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::process::Output;
 
@@ -46,9 +48,7 @@ fn empty_dir(path: &Path) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Placement: the rename path, through a containing mount or a topdir trash
-// (docs/design.md §3.2, §13.3). The copy fallback lands, with its own
-// tests, in the next commit.
+// Placement: rename vs. copy, per source (docs/design.md §3.2, §13.3)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -137,6 +137,148 @@ fn pside_bind_root_uses_home_trash() {
 }
 
 #[test]
+fn side_bind_root_copies_no_topdir_trash() {
+    let uid = getuid().as_raw();
+    let sandbox = Sandbox::artemis();
+    let target = sandbox.host("/mnt/side").join("x");
+    std::fs::write(&target, b"hello").unwrap();
+    let before = inode(&target);
+
+    let out = sandbox.rip("/mnt/side", &["x"]);
+    assert_ok(&out);
+
+    let trashed = sandbox.host("/home/u/.local/share/Trash").join("files/x");
+    assert!(trashed.is_file());
+    assert_ne!(
+        inode(&trashed),
+        before,
+        "another subvolume: must copy, not rename"
+    );
+    assert!(!target.exists());
+    assert!(
+        !sandbox
+            .host("/mnt/side")
+            .join(format!(".Trash-{uid}"))
+            .exists(),
+        "no topdir trash on the home trash's own filesystem"
+    );
+}
+
+#[test]
+fn ephemeral_root_copies() {
+    let sandbox = Sandbox::artemis();
+    let tree = sandbox.host("/home/u").join("foo");
+    // create_dir_all: unlike Downloads/Documents/Trash, nothing pre-creates
+    // the ephemeral root's "u" directory on the host side before the first
+    // bwrap invocation runs.
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(tree.join("exec"), b"#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(tree.join("exec"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::os::unix::fs::symlink("exec", tree.join("link")).unwrap();
+    rustix::fs::mkfifoat(
+        rustix::fs::CWD,
+        tree.join("fifo"),
+        rustix::fs::Mode::from_raw_mode(0o600),
+    )
+    .unwrap();
+    let before_mtime = std::fs::symlink_metadata(tree.join("exec"))
+        .unwrap()
+        .mtime();
+
+    let out = sandbox.rip("/home/u", &["foo"]);
+    assert_ok(&out);
+
+    assert!(!tree.exists());
+    let trash = sandbox.host("/home/u/.local/share/Trash");
+    let copied = trash.join("files/foo");
+    assert!(copied.is_dir());
+    let exec_meta = std::fs::metadata(copied.join("exec")).unwrap();
+    assert_eq!(exec_meta.permissions().mode() & 0o777, 0o755);
+    assert_eq!(exec_meta.mtime(), before_mtime);
+    assert_eq!(
+        std::fs::read_link(copied.join("link")).unwrap(),
+        Path::new("exec")
+    );
+    assert!(
+        std::fs::symlink_metadata(copied.join("fifo"))
+            .unwrap()
+            .file_type()
+            .is_fifo()
+    );
+    assert!(empty_dir(&trash.join(".rip-staging")), "no box left behind");
+
+    let info = read_info(&trash.join("info/foo.trashinfo"));
+    assert!(info.contains("Path=/home/u/foo"), "{info}");
+}
+
+#[test]
+fn copy_hardlinked_tree() {
+    let sandbox = Sandbox::artemis();
+    let dir = sandbox.host("/home/u").join("hl");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a"), b"data").unwrap();
+    std::fs::hard_link(dir.join("a"), dir.join("b")).unwrap();
+
+    let out = sandbox.rip("/home/u", &["hl"]);
+    assert_ok(&out);
+    assert!(!dir.exists());
+
+    let trashed = sandbox.host("/home/u/.local/share/Trash").join("files/hl");
+    assert_eq!(std::fs::read(trashed.join("a")).unwrap(), b"data");
+    assert_eq!(std::fs::read(trashed.join("b")).unwrap(), b"data");
+    assert_eq!(inode(&trashed.join("a")), inode(&trashed.join("b")));
+}
+
+#[test]
+fn no_common_mount_copies() {
+    let mut sandbox = Sandbox::artemis();
+    sandbox.without("/persist");
+    let target = sandbox.host("/home/u/Downloads").join("x");
+    std::fs::write(&target, b"hello").unwrap();
+    let before = inode(&target);
+
+    let out = sandbox.rip("/home/u/Downloads", &["x"]);
+    assert_ok(&out);
+
+    let trashed = sandbox.host("/home/u/.local/share/Trash").join("files/x");
+    assert!(trashed.is_file());
+    assert_ne!(
+        inode(&trashed),
+        before,
+        "no mount shows both paths: must copy"
+    );
+    assert!(!target.exists());
+}
+
+#[test]
+fn covered_persist_not_used() {
+    let mut sandbox = Sandbox::artemis();
+    // Isolate the case: no other route candidate should exist besides
+    // /persist itself.
+    sandbox.without("/mnt/side");
+    sandbox.without("/mnt/pside");
+    let cover = tempfile::tempdir().unwrap();
+    std::fs::write(cover.path().join("marker"), b"cover").unwrap();
+    sandbox.bind(cover.path(), "/persist");
+
+    let target = sandbox.host("/home/u/Downloads").join("x");
+    std::fs::write(&target, b"hello").unwrap();
+    let before = inode(&target);
+
+    let out = sandbox.rip("/home/u/Downloads", &["x"]);
+    assert_ok(&out);
+
+    let trashed = sandbox.host("/home/u/.local/share/Trash").join("files/x");
+    assert!(trashed.is_file());
+    assert_ne!(inode(&trashed), before, "/persist is covered: must copy");
+    assert!(!target.exists());
+    assert!(
+        cover.path().join("marker").is_file(),
+        "the covering dir must be untouched"
+    );
+}
+
+#[test]
 fn other_fs_topdir_trash() {
     let uid = getuid().as_raw();
     let sandbox = Sandbox::artemis();
@@ -200,8 +342,196 @@ fn admin_trash_non_sticky_falls_back_with_warning() {
     );
 }
 
+#[test]
+fn invalid_user_trash_symlink_falls_back() {
+    let uid = getuid().as_raw();
+    let sandbox = Sandbox::artemis();
+    let real_target = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(
+        real_target.path(),
+        sandbox.host("/mnt/other").join(format!(".Trash-{uid}")),
+    )
+    .unwrap();
+    let target = sandbox.host("/mnt/other").join("x");
+    std::fs::write(&target, b"hello").unwrap();
+    let before = inode(&target);
+
+    let out = sandbox.rip("/mnt/other", &["x"]);
+    assert_ok(&out);
+
+    let trashed = sandbox.host("/home/u/.local/share/Trash").join("files/x");
+    assert!(trashed.is_file());
+    assert_ne!(inode(&trashed), before);
+    assert!(!target.exists());
+    assert!(
+        std::fs::read_dir(real_target.path())
+            .unwrap()
+            .next()
+            .is_none(),
+        "a symlinked .Trash-U must never be followed into"
+    );
+}
+
+#[test]
+fn unwritable_topdir_copies() {
+    let sandbox = Sandbox::artemis();
+    let work = sandbox.host("/mnt/ro").join("work");
+    let target = work.join("x");
+    std::fs::write(&target, b"hello").unwrap();
+    let before = inode(&target);
+    let ro_root = sandbox.host("/mnt/ro");
+    let before_mode = std::fs::metadata(&ro_root).unwrap().permissions().mode() & 0o777;
+
+    let out = sandbox.rip("/mnt/ro/work", &["x"]);
+    assert_ok(&out);
+
+    let trashed = sandbox.host("/home/u/.local/share/Trash").join("files/x");
+    assert!(trashed.is_file());
+    assert_ne!(inode(&trashed), before);
+    assert!(!target.exists());
+    let after_mode = std::fs::metadata(&ro_root).unwrap().permissions().mode() & 0o777;
+    assert_eq!(before_mode, after_mode);
+    assert_eq!(before_mode, 0o555);
+}
+
+#[test]
+fn bind_over_topdir_trash_exdev() {
+    let uid = getuid().as_raw();
+    let mut sandbox = Sandbox::artemis();
+    std::fs::write(sandbox.host("/mnt/other").join("seed"), b"seed").unwrap();
+    let out = sandbox.rip("/mnt/other", &["seed"]);
+    assert_ok(&out);
+    let trash_dir = sandbox.host("/mnt/other").join(format!(".Trash-{uid}"));
+    assert!(trash_dir.join("files/seed").is_file());
+
+    // Cover the just-created topdir trash with a bind from elsewhere: a
+    // later put must re-verify its mount identity (step 4) and fall back
+    // to a copy instead of renaming into a directory that changed
+    // underneath it.
+    let elsewhere = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(elsewhere.path().join("files")).unwrap();
+    std::fs::create_dir_all(elsewhere.path().join("info")).unwrap();
+    sandbox.bind(elsewhere.path(), &format!("/mnt/other/.Trash-{uid}"));
+
+    let target = sandbox.host("/mnt/other").join("x");
+    std::fs::write(&target, b"hello").unwrap();
+    let before = inode(&target);
+
+    let out = sandbox.rip("/mnt/other", &["x"]);
+    assert_ok(&out);
+
+    let trashed = sandbox.host("/home/u/.local/share/Trash").join("files/x");
+    assert!(trashed.is_file(), "expected the home trash to hold a copy");
+    assert_ne!(inode(&trashed), before);
+    assert!(!target.exists());
+}
+
 // ---------------------------------------------------------------------------
-// Collisions and symlinks (docs/design.md §4, §6.1, §13.3)
+// Fallback config, copy threshold, copy rollback (docs/design.md §5.5, §6.5)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fallback_refuse() {
+    let sandbox = Sandbox::artemis();
+    sandbox.config("fallback = \"refuse\"\n");
+    let target = sandbox.host("/home/u").join("x");
+    std::fs::write(&target, b"hello").unwrap();
+
+    let out = sandbox.rip("/home/u", &["x"]);
+    assert_fail(&out);
+    assert!(target.is_file(), "the source must be left untouched");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("fallback"), "{stderr}");
+    assert!(empty_dir(&sandbox.host("/home/u/.local/share/Trash/files")));
+}
+
+#[test]
+fn copy_threshold() {
+    let sandbox = Sandbox::artemis();
+    sandbox.config("copy_threshold = \"1K\"\n");
+    let base = sandbox.host("/home/u");
+    let trash_files = sandbox.host("/home/u/.local/share/Trash/files");
+
+    // No terminal: fails, untouched.
+    std::fs::write(base.join("a"), vec![b'x'; 4096]).unwrap();
+    let out = sandbox.rip("/home/u", &["a"]);
+    assert_fail(&out);
+    assert!(base.join("a").is_file());
+
+    // -f: copies without asking.
+    let out = sandbox.rip("/home/u", &["-f", "a"]);
+    assert_ok(&out);
+    assert!(!base.join("a").exists());
+    assert!(trash_files.join("a").is_file());
+
+    // Terminal, "n": declined, untouched, exit 0.
+    std::fs::write(base.join("b"), vec![b'x'; 4096]).unwrap();
+    let out = sandbox.rip_tty("/home/u", &["b"], "n\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(base.join("b").is_file());
+
+    // Terminal, "y": copies.
+    let out = sandbox.rip_tty("/home/u", &["b"], "y\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(!base.join("b").exists());
+    assert!(trash_files.join("b").is_file());
+}
+
+#[test]
+fn copy_rollback_unreadable_file() {
+    let sandbox = Sandbox::artemis();
+    let base = sandbox.host("/home/u");
+    let dir = base.join("d");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("secret"), b"x").unwrap();
+    std::fs::set_permissions(dir.join("secret"), std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let out = sandbox.rip("/home/u", &["d"]);
+    std::fs::set_permissions(dir.join("secret"), std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    assert_fail(&out);
+    assert!(dir.is_dir());
+    assert!(dir.join("secret").is_file());
+    let trash = sandbox.host("/home/u/.local/share/Trash");
+    assert!(!trash.join("files/d").exists());
+    assert!(!trash.join("info/d.trashinfo").exists());
+    assert!(empty_dir(&trash.join(".rip-staging")));
+}
+
+#[test]
+fn copy_refused_unwritable_subdir() {
+    let sandbox = Sandbox::artemis();
+    let base = sandbox.host("/home/u");
+    let dir = base.join("d");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir(dir.join("sub")).unwrap();
+    std::fs::write(dir.join("sub/f"), b"x").unwrap();
+    std::fs::set_permissions(dir.join("sub"), std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let out = sandbox.rip("/home/u", &["d"]);
+    std::fs::set_permissions(dir.join("sub"), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert_fail(&out);
+    assert!(dir.is_dir());
+    assert!(dir.join("sub/f").is_file());
+    assert!(
+        !sandbox
+            .host("/home/u/.local/share/Trash/files")
+            .join("d")
+            .exists()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Collisions, non-UTF-8, symlinks (docs/design.md §4, §6.1, §13.3)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -252,6 +582,32 @@ fn collisions_and_name_max() {
     for n in &entries {
         assert!(n.len() + ".trashinfo".len() <= 255, "{n}: {}", n.len());
     }
+}
+
+#[test]
+fn non_utf8() {
+    let sandbox = Sandbox::artemis();
+    let bad = OsStr::from_bytes(&[b'c', b'a', b'f', 0xE9]);
+    let mut info_name = bad.as_bytes().to_vec();
+    info_name.extend_from_slice(b".trashinfo");
+    let info_name = OsStr::from_bytes(&info_name).to_owned();
+
+    // Rename path.
+    let downloads = sandbox.host("/home/u/Downloads");
+    std::fs::write(downloads.join(bad), b"1").unwrap();
+    let out = sandbox.rip("/home/u/Downloads", &[bad]);
+    assert_ok(&out);
+    let trash = sandbox.host("/home/u/.local/share/Trash");
+    assert!(trash.join("files").join(bad).exists());
+    let info = std::fs::read(trash.join("info").join(&info_name)).unwrap();
+    let text = String::from_utf8_lossy(&info);
+    assert!(text.contains("caf%E9"), "{text}");
+
+    // Copy path.
+    let root = sandbox.host("/home/u");
+    std::fs::write(root.join(bad), b"2").unwrap();
+    let out = sandbox.rip("/home/u", &[bad]);
+    assert_ok(&out);
 }
 
 #[test]
