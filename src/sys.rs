@@ -1400,4 +1400,99 @@ mod tests {
         });
         assert!(start.elapsed() >= std::time::Duration::from_millis(100));
     }
+
+    // ---- route (docs/design.md §5.2) ----
+    //
+    // `Mounts` has no public constructor from `Mount` values directly (its
+    // inner `Vec` field is private), so these go through the real mountinfo
+    // text parser with one hand-written line, the same thing the fixture
+    // tests in mounts.rs do with a whole captured file. That also keeps
+    // these tests portable: a plain `cargo test` process cannot create a
+    // second real mount of the same filesystem without a mount namespace
+    // (that is what the bwrap sandbox in tests/common is for, and it is not
+    // reachable from a `src/` unit test), so each test below uses exactly
+    // one real mount and either a trivial same-mount candidate (the
+    // "successful route" case, which self-cancels to the original paths
+    // regardless of the fabricated `root`/`point` values) or a deliberately
+    // wrong expected identity (the "covered candidate" case) to exercise
+    // `route`'s real open-and-verify logic without needing a second one.
+
+    /// A `Mounts` with exactly one entry: `id`, mounted at `point`, sharing
+    /// an arbitrary `FsId`. `root` is never dereferenced on disk; it only
+    /// has to round-trip through `inside`/`through`'s path algebra.
+    fn one_mount(id: u64, point: &Path) -> Mounts {
+        let text = format!(
+            "{id} 1 77:77 /fake-root {} rw - tmpfs none rw\n",
+            point.display()
+        );
+        mounts::Mounts::parse(text.as_bytes())
+    }
+
+    #[test]
+    fn route_finds_a_working_candidate_through_its_own_mount() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = root(&dir);
+        mkdirat(&r, "a", Mode::from_raw_mode(0o700)).unwrap();
+        mkdirat(&r, "b", Mode::from_raw_mode(0o700)).unwrap();
+
+        let real_mnt = ident(&r).unwrap().mnt;
+        let ms = one_mount(real_mnt, dir.path());
+
+        let a_path = dir.path().join("a");
+        let b_path = dir.path().join("b");
+        let a_id = ident(open_dir(&r, "a").unwrap()).unwrap();
+        let b_id = ident(open_dir(&r, "b").unwrap()).unwrap();
+
+        let (fa, fb) = route(&ms, &a_path, a_id, &b_path, b_id)
+            .unwrap()
+            .expect("a same-mount candidate must be found");
+        assert!(ident(&fa).unwrap().same_file(&a_id));
+        assert!(ident(&fb).unwrap().same_file(&b_id));
+    }
+
+    #[test]
+    fn route_rejects_a_candidate_whose_identity_does_not_match() {
+        // "Each candidate is checked, not trusted" (docs/design.md §5.2):
+        // the translated path for `b` opens fine here (it is a real
+        // directory), but the caller's expected identity does not match it
+        // -- as if something else were mounted over it since `b_id` was
+        // recorded. The one candidate must be rejected, not returned as a
+        // false match.
+        let dir = tempfile::tempdir().unwrap();
+        let r = root(&dir);
+        mkdirat(&r, "a", Mode::from_raw_mode(0o700)).unwrap();
+        mkdirat(&r, "real_b", Mode::from_raw_mode(0o700)).unwrap();
+        mkdirat(&r, "decoy", Mode::from_raw_mode(0o700)).unwrap();
+
+        let real_mnt = ident(&r).unwrap().mnt;
+        let ms = one_mount(real_mnt, dir.path());
+
+        let a_path = dir.path().join("a");
+        let b_path = dir.path().join("real_b");
+        let a_id = ident(open_dir(&r, "a").unwrap()).unwrap();
+        let wrong_b_id = ident(open_dir(&r, "decoy").unwrap()).unwrap();
+
+        let result = route(&ms, &a_path, a_id, &b_path, wrong_b_id).unwrap();
+        assert!(result.is_none(), "a covered candidate must not be returned");
+    }
+
+    #[test]
+    fn route_returns_none_for_an_unknown_mount_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = root(&dir);
+        mkdirat(&r, "a", Mode::from_raw_mode(0o700)).unwrap();
+
+        let real_mnt = ident(&r).unwrap().mnt;
+        let ms = one_mount(real_mnt, dir.path());
+        let a_path = dir.path().join("a");
+        let a_id = ident(open_dir(&r, "a").unwrap()).unwrap();
+        let bogus = Ident {
+            dev: a_id.dev,
+            ino: a_id.ino,
+            mnt: real_mnt.wrapping_add(999_999),
+        };
+
+        let result = route(&ms, &a_path, a_id, Path::new("/nowhere"), bogus).unwrap();
+        assert!(result.is_none());
+    }
 }
