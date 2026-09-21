@@ -1,5 +1,6 @@
 //! Stub for C1. Real implementation (list, selection, fzf picker, restore,
-//! undo, purge) lands in C3 (list) and C4b (the rest). See docs/design.md §7, §9.
+//! undo, purge) lands in C3 (list) and C4b (the rest). See docs/design.md
+//! §5.3 (restore crash consistency).
 #![allow(dead_code, unused_variables)]
 
 use std::path::PathBuf;

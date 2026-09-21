@@ -22,48 +22,49 @@ use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum, ValueH
 fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().collect();
     match parse(args) {
-        Ok(cli) => run_cli(cli),
+        Ok(cli) => ExitCode::from(dispatch(cli)),
         Err(e) => e.exit(),
     }
 }
 
-/// Dispatches a successfully parsed `Cli`. Split from `main` so the exit-code
-/// logic (missing operand, completions, config, stub errors) is one place.
-fn run_cli(cli: Cli) -> ExitCode {
+/// Dispatches a successfully parsed `Cli` and returns the process exit code
+/// (docs/design.md §2.2). Returns a plain `u8` rather than `ExitCode` (which
+/// has no `PartialEq`) so tests can assert on the result directly; `main` is
+/// the only caller that wraps it for the real process exit.
+fn dispatch(cli: Cli) -> u8 {
     if let Some(shell) = cli.completions {
         let mut out = io::stdout().lock();
         let _ = out.write_all(&completions_script(shell));
-        // A diagnostic print, not a completed command: nothing was trashed.
-        return ExitCode::from(2);
+        return completions_exit_code();
     }
 
     if cli.cmd.is_none() && cli.files.is_empty() {
         if cli.force {
-            return ExitCode::SUCCESS;
+            return 0;
         }
         eprintln!("rip: missing operand");
-        return ExitCode::from(2);
+        return 2;
     }
 
     let home = match home_dir() {
         Ok(h) => h,
         Err(e) => {
             eprintln!("rip: {e}");
-            return ExitCode::from(2);
+            return 2;
         }
     };
     let cfg = match load_config(cli.config.as_deref(), &config_home(&home)) {
         Ok(cfg) => cfg,
         Err(e) => {
             eprintln!("rip: {e}");
-            return ExitCode::from(2);
+            return 2;
         }
     };
     let cx = match Cx::new(cfg, home) {
         Ok(cx) => cx,
         Err(e) => {
             eprintln!("rip: {e}");
-            return ExitCode::from(2);
+            return 2;
         }
     };
 
@@ -86,17 +87,17 @@ fn run_cli(cli: Cli) -> ExitCode {
     };
 
     match result {
-        Ok(true) => ExitCode::SUCCESS,
-        Ok(false) => ExitCode::FAILURE,
+        Ok(true) => 0,
+        Ok(false) => 1,
         Err(e) => {
             eprintln!("rip: {e}");
-            ExitCode::FAILURE
+            1
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// CLI types (design §2.1)
+// CLI types
 // ---------------------------------------------------------------------------
 
 #[derive(Parser, Debug)]
@@ -196,7 +197,7 @@ pub enum Shell {
 }
 
 // ---------------------------------------------------------------------------
-// The argv pre-scan (design §2.2)
+// The argv pre-scan (docs/design.md §2.1)
 // ---------------------------------------------------------------------------
 
 pub fn parse(args: Vec<OsString>) -> Result<Cli, clap::Error> {
@@ -251,7 +252,7 @@ fn first_word(cmd: &clap::Command, args: &[OsString]) -> First {
 }
 
 // ---------------------------------------------------------------------------
-// Prompts and value parsers (design §2.4)
+// Prompts and value parsers
 // ---------------------------------------------------------------------------
 
 /// Without a terminal nobody can answer. The caller then does nothing irreversible.
@@ -349,7 +350,7 @@ pub fn human(n: u64) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Config (design §10)
+// Config
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -441,7 +442,7 @@ fn load_config(explicit: Option<&Path>, config_dir: &Path) -> Result<Config, Str
 }
 
 // ---------------------------------------------------------------------------
-// Completions (design §11)
+// Completions
 // ---------------------------------------------------------------------------
 
 fn completions_script(shell: Shell) -> Vec<u8> {
@@ -458,8 +459,15 @@ fn generate_completion(shell: clap_complete::aot::Shell) -> Vec<u8> {
     buf
 }
 
+/// `--completions` prints the script and succeeds (docs/design.md §2.2):
+/// only combining it with another argument is a usage error, and clap's own
+/// `exclusive` check rejects that before `dispatch` ever sees it.
+fn completions_exit_code() -> u8 {
+    0
+}
+
 // ---------------------------------------------------------------------------
-// Shared context (design §14.1)
+// Shared context
 // ---------------------------------------------------------------------------
 
 /// Built once after argv parsing and config loading. Read by put/restore/empty
@@ -490,7 +498,7 @@ impl Cx {
 }
 
 // ---------------------------------------------------------------------------
-// Tests (design §13.1)
+// Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -511,7 +519,7 @@ mod tests {
         words.iter().map(PathBuf::from).collect()
     }
 
-    // ---- §2.2 parse table ----
+    // ---- argv pre-scan table (docs/design.md §2.1) ----
 
     #[test]
     fn plain_files() {
@@ -616,7 +624,15 @@ mod tests {
         assert!(try_parse(&["rip", "--completions", "fish", "foo"]).is_err());
     }
 
-    // ---- extra cases (§13.1) ----
+    #[test]
+    fn completions_flag_exits_success() {
+        // `--completions` prints the script and succeeds; only combining it
+        // with another argument is a (clap-level) usage error (docs/design.md
+        // §2.2), already covered by `completions_flag_conflicts_with_other_args`.
+        assert_eq!(completions_exit_code(), 0);
+    }
+
+    // ---- extra cases ----
 
     #[test]
     fn file_then_verbose_then_subcommand_name() {
@@ -696,7 +712,7 @@ mod tests {
         Cli::command().debug_assert();
     }
 
-    // ---- config (§13.1) ----
+    // ---- config ----
 
     #[test]
     fn config_missing_default_file_gives_defaults() {
@@ -808,11 +824,20 @@ mod tests {
 
     #[test]
     fn confirm_without_a_terminal_fails_clearly() {
+        // `cargo test` on artemis/CI has no controlling terminal, so this
+        // exercises the real "no terminal" path. A developer running `cargo
+        // test` interactively has a real stdin, which would make `confirm`
+        // block on `read_line`; skip in that case rather than hang. The
+        // sandbox tests (a later checkpoint) cover this path with a `rip`
+        // that genuinely never has a terminal.
+        if io::stdin().is_terminal() {
+            return;
+        }
         let err = confirm("proceed?", "-y").unwrap_err();
         assert!(err.contains("-y"), "{err}");
     }
 
-    // ---- completions (§11) ----
+    // ---- completions ----
 
     #[test]
     fn completions_bash_and_zsh_nonempty() {

@@ -1,5 +1,6 @@
 //! Stub for C1. Real implementation (fd-based rename, walk, removal, copy and
-//! lock primitives) lands in C2b. See docs/design.md §3, §6.3, §6.6-§6.8.
+//! lock primitives) lands in C2b. See docs/design.md §4 (on-disk names) and
+//! §5 (crash consistency), whose tables describe what these primitives back.
 #![allow(dead_code, unused_variables)]
 
 use std::collections::{HashMap, HashSet};

@@ -1,5 +1,5 @@
 //! Stub for C1. Real implementation (mountinfo parsing, path translation, mount
-//! refusals) lands in C2a. See docs/design.md §5.1-§5.3.
+//! refusals) lands in C2a. See docs/design.md §3 (placement for put).
 #![allow(dead_code, unused_variables)]
 
 use std::ffi::OsString;

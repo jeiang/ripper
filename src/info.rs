@@ -1,5 +1,5 @@
 //! Stub for C1. Real implementation (.trashinfo encode/parse, Path= codec,
-//! dates, collision names) lands in C2c. See docs/design.md §3.
+//! dates, collision names) lands in C2c. See docs/design.md §4 (on-disk names).
 #![allow(dead_code, unused_variables)]
 
 use std::ffi::{OsStr, OsString};

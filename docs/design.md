@@ -96,7 +96,8 @@ clap (see `first_word` in `src/main.rs`):
 | `rip -- empty`, `rip -f -- -f`, `rip -- -- x` | Files `[empty]`, `[-f]`, `[--, x]`. |
 | `rip -rf empty`, `rip -v list`, `rip --config c -v empty`, `rip -f empty` | Exit 2 with the `rip -- NAME` hint. This happens before any filesystem access. |
 | `rip help`, `rip -` | Files (`help` is not a registered subcommand: `disable_help_subcommand` is set). |
-| `rip --completions fish`; `rip --completions fish foo` | Prints the script; exit 2 (`exclusive`). |
+| `rip --completions fish` | Prints the script; exit 0. |
+| `rip --completions fish foo` | Exit 2: `--completions` is `exclusive`, so combining it with another argument is a clap usage error and nothing is printed. |
 | `rip` / `rip -f` | Exit 2 "missing operand" / exit 0. `main` checks this after parsing. |
 
 ### 2.2 Exit codes

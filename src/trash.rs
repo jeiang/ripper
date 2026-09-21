@@ -1,5 +1,6 @@
 //! Stub for C1. Real implementation (discovery, load, reserve, staging,
-//! delete_batch, discard) lands in C3. See docs/design.md §3-§4, §6.3, §8.3.
+//! delete_batch, discard) lands in C3. See docs/design.md §4 (on-disk names)
+//! and §5.4 (empty and purge / delete_batch).
 #![allow(dead_code, unused_variables)]
 
 use std::ffi::{OsStr, OsString};
