@@ -446,6 +446,24 @@ fn local_ctime(m: &sys::Meta) -> civil::DateTime {
         .datetime()
 }
 
+/// Every trash dir (the home trash, opened read-only, then the topdir
+/// trashes) and their contents. Discovery warnings come first in
+/// `Contents::warnings`. A home trash that fails to open is a warning, the
+/// same as a topdir trash in `discover`.
+pub fn load_all(ms: &Mounts, uid: u32) -> Result<(Vec<Trash>, Contents), String> {
+    let home_path = home_path()?;
+    let mut warn = Vec::new();
+    let home = open_home(&home_path, false, uid).unwrap_or_else(|e| {
+        warn.push(format!("skipping {}: {e}", home_path.display()));
+        None
+    });
+    let trashes = discover(home, ms, uid, &mut warn);
+    let mut contents = load(&trashes);
+    warn.append(&mut contents.warnings);
+    contents.warnings = warn;
+    Ok((trashes, contents))
+}
+
 pub fn load(ts: &[Trash]) -> Contents {
     let mut c = Contents::default();
     for (idx, t) in ts.iter().enumerate() {

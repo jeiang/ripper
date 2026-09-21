@@ -11,8 +11,8 @@ use crate::trash::{self, Item};
 use crate::{Cx, escape};
 
 pub fn list(cx: &Cx, all: bool, null: bool) -> Result<bool, String> {
-    let (contents, discovery_warnings) = load_contents(cx)?;
-    for w in discovery_warnings.iter().chain(&contents.warnings) {
+    let (_, contents) = trash::load_all(&cx.mounts, cx.uid)?;
+    for w in &contents.warnings {
         eprintln!("rip: {w}");
     }
 
@@ -38,27 +38,6 @@ pub fn list(cx: &Cx, all: bool, null: bool) -> Result<bool, String> {
         Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(true),
         Err(e) => Err(e.to_string()),
     }
-}
-
-/// Opens the home trash read-only (a missing one is not an error: read-only
-/// commands simply have no home trash to show) and discovers every topdir
-/// trash, returning discovery's own warnings alongside the loaded contents.
-/// A home trash that fails to open (for example, exactly one of `files/`
-/// or `info/` present -- see `trash::finish_open`) is a warning, not a
-/// hard failure of the whole command, matching how `trash::discover`
-/// already treats a topdir trash that fails to open.
-fn load_contents(cx: &Cx) -> Result<(trash::Contents, Vec<String>), String> {
-    let home_path = trash::home_path()?;
-    let mut warn = Vec::new();
-    let home = match trash::open_home(&home_path, false, cx.uid) {
-        Ok(home) => home,
-        Err(e) => {
-            warn.push(format!("skipping {}: {e}", home_path.display()));
-            None
-        }
-    };
-    let trashes = trash::discover(home, &cx.mounts, cx.uid, &mut warn);
-    Ok((trash::load(&trashes), warn))
 }
 
 /// `original`, relative to `cwd` when it lies under `cwd`, absolute
