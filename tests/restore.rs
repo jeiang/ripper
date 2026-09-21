@@ -39,10 +39,11 @@ fn assert_fails(out: &Output, ctx: &str) {
     );
 }
 
-fn ino(path: &Path) -> u64 {
-    std::fs::symlink_metadata(path)
-        .unwrap_or_else(|e| panic!("stat {}: {e}", path.display()))
-        .ino()
+/// `(dev, ino)`: inode numbers on two filesystems can be equal by chance.
+fn ino(path: &Path) -> (u64, u64) {
+    let m =
+        std::fs::symlink_metadata(path).unwrap_or_else(|e| panic!("stat {}: {e}", path.display()));
+    (m.dev(), m.ino())
 }
 
 fn stdout_str(out: &Output) -> String {

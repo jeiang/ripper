@@ -1,7 +1,8 @@
 //! `rip FILE...` (docs/design.md §13.3 "tests/put.rs"). Every test runs
 //! `rip` inside the bwrap sandbox (tests/common), never against a real trash.
 //! "Same inode" (`inode()` equal) proves a rename; a different inode proves
-//! a copy.
+//! a copy. `inode()` includes the device: inode numbers on two different
+//! filesystems can be equal by chance.
 
 mod common;
 
@@ -14,10 +15,10 @@ use std::process::Output;
 use common::Sandbox;
 use rustix::process::getuid;
 
-fn inode(path: &Path) -> u64 {
-    std::fs::symlink_metadata(path)
-        .unwrap_or_else(|e| panic!("stat {}: {e}", path.display()))
-        .ino()
+fn inode(path: &Path) -> (u64, u64) {
+    let m =
+        std::fs::symlink_metadata(path).unwrap_or_else(|e| panic!("stat {}: {e}", path.display()));
+    (m.dev(), m.ino())
 }
 
 fn read_info(path: &Path) -> String {
