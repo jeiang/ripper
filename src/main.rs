@@ -489,8 +489,18 @@ pub struct Cx {
 impl Cx {
     fn new(cfg: Config, home: PathBuf) -> Result<Self, String> {
         let uid = rustix::process::getuid().as_raw();
-        let cwd = std::env::current_dir()
-            .map_err(|e| format!("cannot determine the current directory: {e}"))?;
+        let cwd = match std::env::current_dir() {
+            Ok(cwd) => cwd,
+            Err(e) => {
+                let fallback = cwd_fallback(env_abs("PWD"));
+                eprintln!(
+                    "rip: cannot determine the current directory ({e}); \
+                     using {} instead; a relative operand or PATH may fail",
+                    fallback.display()
+                );
+                fallback
+            }
+        };
         let mounts = mounts::Mounts::read().map_err(|e| e.to_string())?;
         Ok(Cx {
             cfg,
@@ -500,6 +510,17 @@ impl Cx {
             home,
         })
     }
+}
+
+/// The stand-in cwd used when `getcwd` fails, for example because a command
+/// just deleted the directory the shell was sitting in. `$PWD` (only when it
+/// is set and absolute) is a shell's best record of where it last was, so
+/// commands that need no relative-path resolution still work; otherwise `/`.
+/// Either way, resolving a relative operand or a relative restore/purge PATH
+/// against it then simply fails to find the entry, exactly as it would from
+/// any other stale working directory.
+fn cwd_fallback(pwd_env: Option<PathBuf>) -> PathBuf {
+    pwd_env.unwrap_or_else(|| PathBuf::from("/"))
 }
 
 // ---------------------------------------------------------------------------
@@ -904,5 +925,24 @@ mod tests {
         let after = getrlimit(Resource::Nofile);
         let _ = setrlimit(Resource::Nofile, before); // best-effort restore
         assert_eq!(after.current, Some(max), "dispatch did not raise NOFILE");
+    }
+
+    // ---- Cx cwd fallback (c26) ----
+
+    // Regression for c26: Cx::new used to propagate getcwd's error outright,
+    // so every command exited 2 once the cwd itself had been deleted (e.g. by
+    // `rip ../x` run from inside `x`), even `rip undo`, which needs no cwd at
+    // all. cwd_fallback is the pure selection Cx::new now falls back to.
+    #[test]
+    fn cwd_fallback_prefers_an_absolute_pwd() {
+        assert_eq!(
+            cwd_fallback(Some(PathBuf::from("/home/u/x"))),
+            PathBuf::from("/home/u/x")
+        );
+    }
+
+    #[test]
+    fn cwd_fallback_defaults_to_root_without_pwd() {
+        assert_eq!(cwd_fallback(None), PathBuf::from("/"));
     }
 }
