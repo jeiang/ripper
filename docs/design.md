@@ -174,6 +174,20 @@ qmark-noglob feature (default since fish 4.0) makes `?` a literal character
 in a glob rather than a wildcard, so its rm-style-flag pattern must be
 `'-*'`, not `'-?*'` (which stopped matching any real flag under fish 4).
 
+bash needed two more fixes of its own. Real readline splits `COMP_WORDS` not
+just on whitespace but at every run of a non-whitespace `COMP_WORDBREAKS`
+character (default includes `=` and `:`), so `--config=PATH` and a
+colon-bearing path (a trashed original path, or a file) arrive as several
+words instead of one; `completions/rip.bash`'s `_rip_reassemble` glues such
+runs back onto their neighbors before `_rip_state` and the file/trashed-path
+matching run, and each match is then trimmed back down to only the part
+readline still expects to insert (the bash-completion
+`__ltrim_colon_completions` trick, generalized to both split characters).
+Readline also leaves a still-typed prefix in its raw quoted form (an
+inserted `My\ Doc`, or a still-open `'My Do`); `_rip_dequote` strips that
+before matching a file or trashed path, since `compgen -f` has the same
+problem matching a raw escaped prefix literally.
+
 ### 2.2 Exit codes
 
 | Code | Meaning |

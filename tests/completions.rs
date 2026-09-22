@@ -45,16 +45,89 @@ fn sandbox_with_shell_completions() -> Sandbox {
     sandbox
 }
 
+/// Splits `cmdline` the way real bash computes `COMP_WORDS` for a
+/// registered `complete -F` function: readline splits not just on
+/// whitespace but at every run of a non-whitespace `COMP_WORDBREAKS`
+/// character (default includes `=` and `:`, verified interactively against
+/// a real bash -- see `completions/rip.bash`'s `_rip_reassemble`), so
+/// `--config=c.toml` arrives as three words and a colon-bearing path splits
+/// mid-word too. A shell word that opens a quote or ends in a backslash
+/// escape is exempt (quoting is verified interactively to suppress
+/// COMP_WORDBREAKS splitting for its own span); rip's own test commands
+/// only ever carry one in their last (cursor) word, so this only needs to
+/// recognize "some quote/backslash appears in this whitespace-delimited
+/// word", not parse it. A trailing space in `cmdline` yields a trailing
+/// empty word, the word under the cursor.
+fn comp_words(cmdline: &str) -> Vec<String> {
+    const BREAK: &[char] = &['"', '\'', '@', '>', '<', '=', ';', '|', '&', '(', ':'];
+
+    let mut shell_words: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    let mut chars = cmdline.chars();
+    while let Some(c) = chars.next() {
+        if let Some(q) = quote {
+            cur.push(c);
+            if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '\'' | '"' => {
+                quote = Some(c);
+                cur.push(c);
+            }
+            '\\' => {
+                cur.push(c);
+                if let Some(next) = chars.next() {
+                    cur.push(next);
+                }
+            }
+            c if c.is_whitespace() => shell_words.push(std::mem::take(&mut cur)),
+            c => cur.push(c),
+        }
+    }
+    shell_words.push(cur);
+
+    let mut words = Vec::new();
+    for w in shell_words {
+        if w.contains(['\'', '"', '\\']) {
+            words.push(w);
+            continue;
+        }
+        let mut piece = String::new();
+        let mut piece_is_break = false;
+        for c in w.chars() {
+            let is_break = BREAK.contains(&c);
+            if !piece.is_empty() && is_break != piece_is_break {
+                words.push(std::mem::take(&mut piece));
+            }
+            piece.push(c);
+            piece_is_break = is_break;
+        }
+        if !piece.is_empty() {
+            words.push(piece);
+        } else if w.is_empty() {
+            words.push(w);
+        }
+    }
+    words
+}
+
 /// Drives `_rip` (from `completions/rip.bash`, sourced fresh) the way real
-/// bash completion would: `cmdline` is split on spaces into `COMP_WORDS`
-/// (its trailing empty word, from a trailing space, is the word under the
-/// cursor), `COMP_CWORD`/`COMP_LINE`/`COMP_POINT` are set to match, and the
-/// resulting `COMPREPLY` is returned. `compopt -o filenames` always fails
-/// here (bash only allows it from inside real readline completion; see
-/// `_rip` in `completions/rip.bash`), so that one message is tolerated on
-/// stderr and anything else fails the test outright.
+/// bash completion would: `cmdline` is split into `COMP_WORDS` the way
+/// readline would split it (`comp_words`), `COMP_CWORD`/`COMP_LINE`/
+/// `COMP_POINT` are set to match, and the resulting `COMPREPLY` is
+/// returned. `compopt -o filenames` always fails here (bash only allows it
+/// from inside real readline completion; see `_rip` in
+/// `completions/rip.bash`), so that one message is tolerated on stderr and
+/// anything else fails the test outright.
 fn complete_bash(sandbox: &Sandbox, cwd: &str, cmdline: &str) -> Vec<String> {
-    let words: Vec<String> = cmdline.split(' ').map(single_quote).collect();
+    let words: Vec<String> = comp_words(cmdline)
+        .iter()
+        .map(|w| single_quote(w))
+        .collect();
     let cword = words.len() - 1;
     let script = format!(
         "source /run/rip/completions/rip.bash\n\
@@ -618,6 +691,86 @@ fn bash_candidates_with_a_space_are_not_split() {
     assert!(
         trashed.iter().any(|w| w == "has space too"),
         "the trashed path with a space must complete as one candidate, not split: {trashed:?}"
+    );
+}
+
+// Real readline splits COMP_WORDS at `=` (a COMP_WORDBREAKS character), so
+// `--config=c.toml` arrives as three words, not one; `completions/rip.bash`
+// must still recognize the value and complete it as a file.
+#[test]
+fn bash_config_equals_form_completes_files_for_the_value() {
+    let sandbox = sandbox_with_shell_completions();
+    std::fs::write(sandbox.host("/home/u/Downloads").join("c.toml"), b"").unwrap();
+
+    let got = complete_bash(&sandbox, "/home/u/Downloads", "rip --config=");
+    assert!(
+        got.iter().any(|w| w == "c.toml"),
+        "rip --config=<TAB> must complete files: {got:?}"
+    );
+
+    let got = complete_bash(&sandbox, "/home/u/Downloads", "rip --config=c");
+    assert!(
+        got.iter().any(|w| w == "c.toml"),
+        "rip --config=c<TAB> must complete files: {got:?}"
+    );
+}
+
+// `:` is also a COMP_WORDBREAKS character, so a colon-bearing trashed path
+// (e.g. a screenshot's default name, "...at 10:00:00.png") splits mid-word
+// too: the word under the cursor is only the part after the last colon.
+// Without trimming a match back down to that same tail, the already-typed
+// part of the prefix would be inserted a second time.
+#[test]
+fn bash_restore_completes_a_colon_bearing_trashed_path_without_duplicating_it() {
+    let sandbox = sandbox_with_shell_completions();
+    sandbox.plant(
+        "/home/u/.local/share/Trash",
+        b"shot",
+        b"/home/u/Downloads/10:00:00.png",
+        "2026-01-01T00:00:00",
+        Body::File(b"data".to_vec()),
+    );
+
+    let got = complete_bash(&sandbox, "/home/u/Downloads", "rip restore 10:00:0");
+    assert!(
+        got.iter().any(|w| w == "00.png"),
+        "must complete to only the part after the last colon, not the whole \
+         path again: {got:?}"
+    );
+}
+
+// After readline inserts a backslash escape for a space (or a person types
+// one directly), COMP_WORDS[COMP_CWORD] still carries the backslash, so a
+// literal-string match against a real (unescaped) name fails once any
+// prefix is typed. compgen -f has the same problem matching a raw escaped
+// prefix against real file names.
+#[test]
+fn bash_restore_completes_an_escaped_partial_prefix_with_a_space() {
+    let sandbox = sandbox_with_shell_completions();
+    sandbox.plant(
+        "/home/u/.local/share/Trash",
+        b"x",
+        b"/home/u/Downloads/has space too",
+        "2026-01-01T00:00:00",
+        Body::File(b"data".to_vec()),
+    );
+
+    let got = complete_bash(&sandbox, "/home/u/Downloads", "rip restore has\\ spa");
+    assert!(
+        got.iter().any(|w| w == "has space too"),
+        "an escaped partial prefix must still match the trashed path: {got:?}"
+    );
+}
+
+#[test]
+fn bash_completes_an_escaped_partial_prefix_with_a_space_for_a_file() {
+    let sandbox = sandbox_with_shell_completions();
+    std::fs::write(sandbox.host("/home/u/Downloads").join("has space"), b"x").unwrap();
+
+    let got = complete_bash(&sandbox, "/home/u/Downloads", "rip has\\ spa");
+    assert!(
+        got.iter().any(|w| w == "has space"),
+        "an escaped partial prefix must still match the file: {got:?}"
     );
 }
 
