@@ -409,6 +409,66 @@ fn invalid_user_trash_symlink_falls_back() {
 }
 
 #[test]
+fn topdir_trash_swap_race_never_creates_outside_the_trash() {
+    // docs/design.md c15: topdir_trash must open/create `.Trash-$uid` (and
+    // files/, info/) fd-relative, never by re-resolving a path, so a symlink
+    // a concurrent writer swaps in for it is refused by O_NOFOLLOW on the
+    // reopen, never followed. A host thread races a tight
+    // renameat2(RENAME_EXCHANGE) loop, swapping a real (used) `.Trash-$uid`
+    // for a symlink to `victim`, against many `rip` invocations; whichever
+    // way each one lands, `victim` (reachable only through the symlink) must
+    // never receive a files/info subdirectory.
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let uid = getuid().as_raw();
+    let sandbox = Sandbox::artemis();
+    let other = sandbox.host("/mnt/other");
+    let real_trash = other.join(format!(".Trash-{uid}"));
+    std::fs::create_dir_all(real_trash.join("files")).unwrap();
+    std::fs::create_dir_all(real_trash.join("info")).unwrap();
+    let victim = other.join("victim");
+    std::fs::create_dir_all(&victim).unwrap();
+    let swap_name = other.join(format!(".Trash-{uid}.swap"));
+    // A relative target ("victim", a sibling of `swap_name` in the same
+    // directory): it resolves the same way whether dereferenced from the
+    // host (this process, running the swap loop) or from inside the bwrap
+    // sandbox (where `rip` actually runs), unlike an absolute host path,
+    // which would not exist inside the sandbox's own mount namespace at all.
+    std::os::unix::fs::symlink("victim", &swap_name).unwrap();
+
+    const ROUNDS: usize = 400;
+    for i in 0..ROUNDS {
+        std::fs::write(other.join(format!("x{i}")), b"hello").unwrap();
+    }
+
+    let racing = AtomicBool::new(true);
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            while racing.load(Ordering::Relaxed) {
+                let _ = rustix::fs::renameat_with(
+                    rustix::fs::CWD,
+                    &real_trash,
+                    rustix::fs::CWD,
+                    &swap_name,
+                    rustix::fs::RenameFlags::EXCHANGE,
+                );
+            }
+        });
+        for i in 0..ROUNDS {
+            let _ = sandbox.rip("/mnt/other", &["-v", &format!("x{i}")]);
+        }
+        racing.store(false, Ordering::Relaxed);
+    });
+
+    assert!(
+        std::fs::read_dir(&victim).unwrap().next().is_none(),
+        "a directory reached only through the swapped-in symlink must never \
+         receive files/info: topdir_trash must never re-resolve a path after \
+         checking it"
+    );
+}
+
+#[test]
 fn unwritable_topdir_copies() {
     let sandbox = Sandbox::artemis();
     let work = sandbox.host("/mnt/ro").join("work");
