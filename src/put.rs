@@ -837,6 +837,15 @@ fn copy_to_home(
         }
     }
     let n = r.commit();
+    // The entry's own identity, captured immediately after publishing it:
+    // if the source turns out not to be removable below, the rollback must
+    // discard exactly this entry, not whatever a concurrent restore or put
+    // has since done with the name `n` (docs/design.md c0 -- the same race
+    // restore.rs's own copy-back rollback closes with `discard_verified`).
+    let published = sys::stat_at(&home.files, &n)
+        .ok()
+        .map(|m| m.id)
+        .zip(trash::reread_info(home, &n));
     let _ = unlinkat(&staging, &bx, AtFlags::REMOVEDIR);
 
     // 4. The copy, its info and the rename are on disk before any source
@@ -855,8 +864,13 @@ fn copy_to_home(
         },
     );
     if !rm.removed_any {
-        // Nothing gone: no duplicate stays behind.
-        trash::discard(home, &cx.mounts, &n)?;
+        // Nothing gone: no duplicate stays behind. Tied to `published` so a
+        // name reused by someone else in the meantime is never deleted in
+        // this entry's place (c0); if identity could not even be captured
+        // right after commit, there is nothing safe to discard by name.
+        if let Some((entry, info)) = &published {
+            trash::discard_verified(home, &cx.mounts, &n, Some((*entry, info)))?;
+        }
         return Err(format!(
             "it changed while it was copied; left it untouched ({})",
             removal_summary(&rm)

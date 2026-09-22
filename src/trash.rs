@@ -417,8 +417,11 @@ fn push_new(
 /// bytes when it is a plain, small (`<= MAX_INFO_SIZE`) regular file --
 /// `Vec::new()` otherwise, since reading a non-regular or oversized info
 /// would defeat the point of the check. `None` means it could not be opened
-/// at all (raced away, or genuinely not `S_ISREG`-openable).
-fn reread_info(t: &Trash, name: &OsStr) -> Option<(Ident, Vec<u8>)> {
+/// at all (raced away, or genuinely not `S_ISREG`-openable). `pub(crate)`:
+/// also used by put.rs's copy-fallback rollback to build the `expected`
+/// identity `discard_verified` checks for the entry it just published
+/// itself.
+pub(crate) fn reread_info(t: &Trash, name: &OsStr) -> Option<(Ident, Vec<u8>)> {
     let info_name = info_file_name(name);
     let fd = openat(
         &t.info,
@@ -907,9 +910,11 @@ pub fn discard(t: &Trash, ms: &Mounts, name: &OsStr) -> io::Result<()> {
 /// renamed back with `NOREPLACE` instead of being deleted. The info is
 /// unlinked only when it still matches `info`'s identity and bytes, so a
 /// `.trashinfo` a different item just published under the freed name
-/// survives too. This is the fix for finding c0 (a copy-back restore that
-/// discards whatever now holds the name, not necessarily what it copied).
-/// First called by restore.rs's `restore_item` (C4b).
+/// survives too. This is the fix for finding c0 (a copy-back restore, or
+/// put's own copy-fallback rollback, that discards whatever now holds the
+/// name, not necessarily what it wrote). First called by restore.rs's
+/// `restore_item` (C4b); put.rs's copy-fallback rollback now calls it
+/// directly too, always with `Some`.
 #[allow(dead_code)]
 pub fn discard_verified(
     t: &Trash,
@@ -931,7 +936,7 @@ pub fn discard_verified(
             // refuse, rather than delete whatever raced into the name.
             let _ = sys::rename_noreplace(&staging_fd, &tomb, &t.files, name);
             return Err(io::Error::other(
-                "the trash entry changed identity since it was restored; leaving it in place",
+                "the trash entry changed identity; leaving it in place",
             ));
         }
         if info_matches(t, name, info) {
