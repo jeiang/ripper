@@ -751,6 +751,18 @@ fn sort_parents_first(items: &mut [&Item]) {
     });
 }
 
+/// The first path in `blocked` that `original` is (or is under), if any
+/// (design §7.1 "Restore and undo sort their batch parents first", finding
+/// c4): once a batch parent's own restore is declined, refused or fails, a
+/// child of it must not be restored into a directory `ensure_parent` then
+/// has to fabricate in its place.
+fn blocking_ancestor<'a>(blocked: &'a [PathBuf], original: &Path) -> Option<&'a Path> {
+    blocked
+        .iter()
+        .find(|b| original.starts_with(b.as_path()))
+        .map(PathBuf::as_path)
+}
+
 pub fn restore(
     cx: &Cx,
     paths: &[PathBuf],
@@ -773,13 +785,24 @@ pub fn restore(
     sort_parents_first(&mut items);
 
     let mut ok = true;
+    let mut blocked: Vec<PathBuf> = Vec::new();
     for it in items {
+        if let Some(parent) = blocking_ancestor(&blocked, &it.original) {
+            eprintln!(
+                "rip: cannot restore '{}': its parent {} was not restored; it stays in the trash",
+                it.original.display(),
+                parent.display()
+            );
+            ok = false;
+            continue;
+        }
         match restore_item(cx, &trashes, it, rename, yes) {
             Ok(Some(path)) => print_path(&cx.cwd, &path),
-            Ok(None) => {}
+            Ok(None) => blocked.push(it.original.clone()),
             Err(e) => {
                 eprintln!("rip: cannot restore '{}': {e}", it.original.display());
                 ok = false;
+                blocked.push(it.original.clone());
             }
         }
     }
@@ -813,10 +836,20 @@ pub fn undo(cx: &Cx, yes: bool) -> Result<bool, String> {
     let batch = undo_batch(&contents.items, newest);
 
     let mut ok = true;
+    let mut blocked: Vec<PathBuf> = Vec::new();
     for it in batch {
+        if let Some(parent) = blocking_ancestor(&blocked, &it.original) {
+            eprintln!(
+                "rip: cannot restore '{}': its parent {} was not restored; it stays in the trash",
+                it.original.display(),
+                parent.display()
+            );
+            ok = false;
+            continue;
+        }
         match restore_item(cx, &trashes, it, false, yes) {
             Ok(Some(path)) => print_path(&cx.cwd, &path),
-            Ok(None) => {}
+            Ok(None) => blocked.push(it.original.clone()),
             Err(RestoreError::Conflict(_)) => {
                 let trash_path = trashes[it.trash].path.join("files").join(&it.name);
                 eprintln!(
@@ -825,10 +858,12 @@ pub fn undo(cx: &Cx, yes: bool) -> Result<bool, String> {
                     trash_path.display()
                 );
                 ok = false;
+                blocked.push(it.original.clone());
             }
             Err(RestoreError::Other(msg)) => {
                 eprintln!("rip: cannot restore '{}': {msg}", it.original.display());
                 ok = false;
+                blocked.push(it.original.clone());
             }
         }
     }
@@ -1048,5 +1083,27 @@ mod tests {
     fn resolve_falls_back_to_lexical_when_the_parent_does_not_exist() {
         let got = resolve(Path::new("/"), Path::new("/no/such/dir/../also-gone"));
         assert_eq!(got, PathBuf::from("/no/such/also-gone"));
+    }
+
+    // ---- blocking_ancestor (finding c4: skip a child whose batch parent
+    // was declined, refused or failed) ----
+
+    #[test]
+    fn blocking_ancestor_matches_a_path_under_a_blocked_parent() {
+        let blocked = vec![PathBuf::from("/home/u/dir")];
+        assert_eq!(
+            blocking_ancestor(&blocked, Path::new("/home/u/dir/f")),
+            Some(Path::new("/home/u/dir"))
+        );
+    }
+
+    #[test]
+    fn blocking_ancestor_ignores_an_unrelated_sibling() {
+        let blocked = vec![PathBuf::from("/home/u/dir")];
+        assert_eq!(
+            blocking_ancestor(&blocked, Path::new("/home/u/dir-other/f")),
+            None,
+            "a name that merely shares a prefix is not \"under\" it"
+        );
     }
 }

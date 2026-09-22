@@ -1291,6 +1291,73 @@ fn undo_partial_conflict() {
     assert!(!trash_host_path(&sandbox, "/home/u/.local/share/Trash", b"ok_item").exists());
 }
 
+// finding c4: a batch parent whose restore is declined must not leave its
+// child restored into a directory `ensure_parent` fabricates in its place.
+#[test]
+fn undo_skips_child_when_parent_restore_is_declined() {
+    let sandbox = Sandbox::artemis();
+    sandbox.config("copy_threshold = \"8\"\n");
+    sandbox.plant(
+        "/home/u/.local/share/Trash",
+        b"dir",
+        b"/home/u/dir",
+        "2026-01-01T00:00:00",
+        Body::Dir,
+    );
+    // Real content inside the trashed dir, big enough that copying it back
+    // needs the size prompt: bare "/home/u" (unlike its Downloads/
+    // Documents/Trash sub-binds) is not on the trash's own subvolume, so
+    // restoring it is a copy-back.
+    std::fs::write(
+        trash_host_path(&sandbox, "/home/u/.local/share/Trash", b"dir").join("big"),
+        vec![b'x'; 100],
+    )
+    .unwrap();
+    sandbox.plant(
+        "/home/u/.local/share/Trash",
+        b"f",
+        b"/home/u/dir/f",
+        "2026-01-01T00:00:00",
+        Body::File(b"abc".to_vec()),
+    );
+
+    let out = sandbox.rip_tty("/", &["undo"], "n\n");
+    let text = stdout_str(&out);
+    assert!(
+        !out.status.success(),
+        "the batch is incomplete (f was correctly withheld): {text}"
+    );
+    assert!(
+        text.contains("was not restored"),
+        "f's skip must be reported: {text}"
+    );
+
+    // dir must not exist at all: not restored (declined), and not
+    // fabricated empty just to hold f. Both items stay in the trash,
+    // intact and still restorable together later.
+    assert!(
+        !sandbox.host("/home/u/dir").exists(),
+        "dir must not be partially recreated to hold only f"
+    );
+    assert!(trash_host_path(&sandbox, "/home/u/.local/share/Trash", b"dir").exists());
+    assert!(trash_host_path(&sandbox, "/home/u/.local/share/Trash", b"f").exists());
+
+    // The batch is still fully recoverable: undo -y restores both, parent
+    // first, exactly as if the decline had never happened.
+    let out = sandbox.rip("/", &["undo", "-y"]);
+    assert_ok(&out, "undo -y after a declined-then-retried batch");
+    assert_eq!(
+        std::fs::read(sandbox.host("/home/u/dir/f")).unwrap(),
+        b"abc"
+    );
+    assert_eq!(
+        std::fs::read(sandbox.host("/home/u/dir/big"))
+            .unwrap()
+            .len(),
+        100
+    );
+}
+
 #[test]
 fn undo_empty() {
     let sandbox = Sandbox::artemis();
