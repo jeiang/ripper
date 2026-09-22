@@ -673,6 +673,32 @@ pub fn staging(t: &Trash) -> io::Result<OwnedFd> {
     Ok(fd)
 }
 
+/// `.rip-staging`, opened only if it already exists -- never created.
+/// `delete_batch` uses this instead of `staging()` when a trash dir has
+/// nothing doomed, so a trash on a read-only mount that has never held a
+/// staging box does not fail `empty` merely because there is nothing there
+/// to clean up (docs/design.md §8.2).
+fn open_staging_if_exists(t: &Trash) -> io::Result<Option<OwnedFd>> {
+    let fd = match sys::open_dir(&t.dir, STAGING_NAME) {
+        Ok(fd) => fd,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let meta = sys::stat_at(&t.dir, STAGING_NAME)?;
+    if meta.uid != getuid().as_raw() {
+        return Err(io::Error::other(
+            ".rip-staging is not owned by the current user",
+        ));
+    }
+    let id = sys::ident(&fd)?;
+    if id.mnt != t.id.mnt {
+        return Err(io::Error::other(
+            ".rip-staging is not on the trash's own mount",
+        ));
+    }
+    Ok(Some(fd))
+}
+
 /// Opens `t.base` (the topdir) with `O_PATH|O_DIRECTORY`, requiring its
 /// `dev` to equal the trash's own -- used by restore to resolve a topdir
 /// item's original path beneath it with `RESOLVE_BENEATH`. First called by
@@ -922,9 +948,28 @@ impl Report {
 #[allow(dead_code)]
 pub fn delete_batch(t: &Trash, ms: &Mounts, doomed: &[Doomed], clean_staging: bool) -> Report {
     let mut rep = Report::default();
-    let staging_fd = match staging(t) {
-        Ok(s) => s,
-        Err(e) => return rep.fail(t, e),
+    // Nothing doomed here: only bother opening `.rip-staging` -- and only
+    // if it already exists, never creating it -- when there might be a
+    // stale box in it to clean up. A read-only trash dir with nothing
+    // selected must not fail `empty` merely because it cannot create a
+    // directory it does not need (docs/design.md §8.2 "nothing selected:
+    // exit 0").
+    let staging_fd = if doomed.is_empty() {
+        let opened = if clean_staging {
+            open_staging_if_exists(t)
+        } else {
+            Ok(None)
+        };
+        match opened {
+            Ok(Some(fd)) => fd,
+            Ok(None) => return rep,
+            Err(e) => return rep.fail(t, e),
+        }
+    } else {
+        match staging(t) {
+            Ok(s) => s,
+            Err(e) => return rep.fail(t, e),
+        }
     };
     let mut tombs: Vec<OsString> = Vec::new();
     {
