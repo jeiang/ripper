@@ -301,6 +301,41 @@ fn other_fs_topdir_trash() {
 }
 
 #[test]
+fn skipped_half_trash_is_still_refused_not_repaired_and_reused() {
+    // docs/design.md c14: discovery skips a `.Trash-$uid` that is missing
+    // its info/ subdirectory (it warns and moves on), but topdir_trash's own
+    // placement logic would happily repair and reuse that very directory.
+    // An operand already inside it must still be refused, not silently
+    // re-trashed into the trash that holds it.
+    let uid = getuid().as_raw();
+    let sandbox = Sandbox::artemis();
+    let trash_dir = sandbox.host("/mnt/other").join(format!(".Trash-{uid}"));
+    std::fs::create_dir_all(trash_dir.join("files")).unwrap();
+    std::fs::write(trash_dir.join("files/foo"), b"trashed earlier").unwrap();
+    // Deliberately no info/: this is what discovery skips with a warning.
+
+    let out = sandbox.rip("/mnt/other", &["-v", &format!(".Trash-{uid}/files/foo")]);
+    assert_fail(&out);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("it is inside the trash at") && stderr.contains("rip purge"),
+        "{stderr}"
+    );
+    assert!(
+        !trash_dir.join("info").exists(),
+        "must not have repaired the missing info/ while refusing"
+    );
+    assert!(
+        trash_dir.join("files/foo").is_file(),
+        "the original entry must be left exactly where it was"
+    );
+    assert!(
+        !trash_dir.join("files/foo~1").exists(),
+        "must not have been re-trashed into the same directory"
+    );
+}
+
+#[test]
 fn admin_trash_sticky_dir_is_used() {
     let uid = getuid().as_raw();
     let sandbox = Sandbox::artemis();

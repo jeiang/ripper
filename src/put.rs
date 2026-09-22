@@ -101,10 +101,38 @@ fn mkdir_at_path(path: &Path) -> io::Result<()> {
     }
 }
 
+/// A `topdir_trash` failure. `Refuse` is a hard failure for the whole
+/// operand (docs/design.md c14: it is already inside the trash that would
+/// be used or repaired) -- unlike every other reason here, it must never be
+/// treated as "this topdir trash is unusable, fall back to copying
+/// elsewhere instead".
+pub enum TopdirErr {
+    Refuse(String),
+    Unusable(String),
+}
+
+impl From<String> for TopdirErr {
+    fn from(s: String) -> Self {
+        TopdirErr::Unusable(s)
+    }
+}
+
+impl From<&str> for TopdirErr {
+    fn from(s: &str) -> Self {
+        TopdirErr::Unusable(s.to_string())
+    }
+}
+
 /// Opens or creates the topdir trash for `src` (already known, by `choose`,
 /// to need one), reached through mount `own`. Nothing is created until the
 /// mount-id and subvolume checks below pass (docs/design.md §5.4 step 1).
-pub fn topdir_trash(own: &Mount, src: &Meta, uid: u32) -> Result<Trash, String> {
+/// `path` is the operand's own resolved path: `Session::inside_trash` only
+/// refuses a path inside a trash discovery could actually open, so this
+/// checks it again here, against whichever directory is about to be used or
+/// repaired -- catching a trash discovery skipped with a warning (e.g. its
+/// `info/` is missing), which would otherwise get its missing half silently
+/// recreated and reused to re-trash an entry already inside it (c14).
+pub fn topdir_trash(own: &Mount, src: &Meta, uid: u32, path: &Path) -> Result<Trash, TopdirErr> {
     let top = sys::open_path(CWD, &own.point).map_err(|e| e.to_string())?;
     let top_id = sys::ident(&top).map_err(|e| e.to_string())?;
     if top_id.mnt != own.id {
@@ -168,6 +196,13 @@ pub fn topdir_trash(own: &Mount, src: &Meta, uid: u32) -> Result<Trash, String> 
             .map_err(|e| format!("cannot create {}: {e}", trash_path.display()))?;
     }
 
+    if path.starts_with(&trash_path) {
+        return Err(TopdirErr::Refuse(format!(
+            "it is inside the trash at {}; use `rip purge` to delete it",
+            trash_path.display()
+        )));
+    }
+
     mkdir_at_path(&trash_path.join("files")).map_err(|e| e.to_string())?;
     mkdir_at_path(&trash_path.join("info")).map_err(|e| e.to_string())?;
 
@@ -191,7 +226,8 @@ pub fn topdir_trash(own: &Mount, src: &Meta, uid: u32) -> Result<Trash, String> 
         return Err(format!(
             "{}: its trash directory is on another mount",
             trash_path.display()
-        ));
+        )
+        .into());
     }
     Ok(t)
 }
@@ -517,7 +553,7 @@ fn put_one(cx: &Cx, cli: &Cli, s: &mut Session, arg: &Path) -> Result<Done, PutE
                 None => "no mount shows both it and the home trash",
             }
         }
-        Choice::Topdir => match topdir_trash(own, &st, cx.uid) {
+        Choice::Topdir => match topdir_trash(own, &st, cx.uid, &path) {
             Ok(t) => {
                 let t = s.add(t);
                 match move_in(t, &pfd, &name, &t.files, &path, date) {
@@ -528,7 +564,8 @@ fn put_one(cx: &Cx, cli: &Cli, s: &mut Session, arg: &Path) -> Result<Done, PutE
                     Err(e) => return Err(e.into()),
                 }
             }
-            Err(why) => leak(why),
+            Err(TopdirErr::Refuse(msg)) => return Err(msg.into()),
+            Err(TopdirErr::Unusable(msg)) => leak(msg),
         },
         Choice::Fallback(why) => why,
     };
