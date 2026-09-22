@@ -454,16 +454,10 @@ fn load_config(explicit: Option<&Path>, config_dir: &Path) -> Result<Config, Str
 
 fn completions_script(shell: Shell) -> Vec<u8> {
     match shell {
+        Shell::Bash => include_bytes!("../completions/rip.bash").to_vec(),
+        Shell::Zsh => include_bytes!("../completions/_rip").to_vec(),
         Shell::Fish => include_bytes!("../completions/rip.fish").to_vec(),
-        Shell::Bash => generate_completion(clap_complete::aot::Shell::Bash),
-        Shell::Zsh => generate_completion(clap_complete::aot::Shell::Zsh),
     }
-}
-
-fn generate_completion(shell: clap_complete::aot::Shell) -> Vec<u8> {
-    let mut buf = Vec::new();
-    clap_complete::aot::generate(shell, &mut Cli::command(), "rip", &mut buf);
-    buf
 }
 
 // ---------------------------------------------------------------------------
@@ -867,9 +861,15 @@ mod tests {
     // ---- completions ----
 
     #[test]
-    fn completions_bash_and_zsh_nonempty() {
-        assert!(!completions_script(Shell::Bash).is_empty());
-        assert!(!completions_script(Shell::Zsh).is_empty());
+    fn completions_bash_matches_file() {
+        let expected = include_bytes!("../completions/rip.bash").to_vec();
+        assert_eq!(completions_script(Shell::Bash), expected);
+    }
+
+    #[test]
+    fn completions_zsh_matches_file() {
+        let expected = include_bytes!("../completions/_rip").to_vec();
+        assert_eq!(completions_script(Shell::Zsh), expected);
     }
 
     #[test]

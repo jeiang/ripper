@@ -1,0 +1,134 @@
+#compdef rip
+
+# Completions for rip. Written by hand: rip mixes files with subcommands at
+# the first word (docs/design.md §2.1), which a generated completion cannot
+# express. Autoloads from fpath after compinit; the dispatcher at the
+# bottom also lets `source <(rip --completions zsh)` register it directly.
+
+# Sets $state from the words before the cursor: "first" (no word yet),
+# "files" (after a file or an rm-style flag), "--" (after --), or a
+# subcommand name. Mirrors src/main.rs's first_word().
+_rip_state() {
+    local i=2 w
+    state=first
+    while ((i < CURRENT)); do
+        w=$words[i]
+        case $w in
+        --)
+            state=--
+            return
+            ;;
+        --config | --completions)
+            ((i++))
+            ;;
+        --config=* | --completions=* | -h | --help | -V | --version)
+            # inline value, or a flag the parser leaves state unchanged for
+            # (src/main.rs first_word()): keep scanning.
+            ;;
+        -*)
+            # An rm-style flag before a subcommand is a parse error
+            # (src/main.rs first_word()), so from here only files make sense.
+            state=files
+            return
+            ;;
+        *)
+            case " undo list restore empty purge " in
+            *" $w "*) state=$w ;;
+            *) state=files ;;
+            esac
+            return
+            ;;
+        esac
+        ((i++))
+    done
+}
+
+# Trashed original paths under the current directory, with the deletion
+# date shown alongside each one. `compadd -d dates -a paths` (without -l)
+# makes each date the DISPLAY string that *replaces* the match in the
+# listing instead of annotating it (zshcompwid: "display the first element
+# instead of the first word"), so the restore/purge menu would show only
+# dates and no paths. `-l -d displays -a paths` -- what _describe does
+# internally -- shows a full "PATH -- DATE" string per match instead, and
+# needs no colon-escaping the way _describe's own tag syntax would. A
+# record's own embedded newline (from a hostile or oddly named trashed
+# path) survives `read -d ''`'s NUL split, so such a record is skipped
+# whole rather than split into extra candidates (docs/design.md §2.1).
+_rip_trashed() {
+    # `path` (and `PATH`) are tied special parameters (docs/design.md
+    # §2.1): a local named `path` here would shadow the global one for
+    # this whole function, including the `rip` below, which would then
+    # fail to find `rip` on an empty $PATH. `orig` avoids that.
+    local -a paths dates displays
+    local rec date orig i
+    while IFS= read -r -d '' rec; do
+        [[ $rec == *$'\n'* ]] && continue
+        date=${rec%%$'\t'*}
+        orig=${rec#*$'\t'}
+        paths+=("$orig")
+        dates+=("$date")
+    done < <(rip list -0 2>/dev/null)
+    if (( $#paths )); then
+        for ((i = 1; i <= $#paths; i++)); do
+            displays+=("$paths[i] -- $dates[i]")
+        done
+        compadd -l -d displays -a paths
+    fi
+}
+
+_rip() {
+    local state
+    local prev=$words[CURRENT-1]
+    _rip_state
+
+    if [[ $state != -- && $prev == --config ]]; then
+        _files
+        return
+    fi
+    [[ $state != -- ]] && compadd -- --config
+
+    case $state in
+    first)
+        local -a subs=(
+            'undo:Restore the last batch'
+            'list:List trashed items under this directory'
+            'restore:Restore trashed items'
+            'empty:Permanently delete trashed items'
+            'purge:Permanently delete chosen items'
+        )
+        _describe -t commands 'rip subcommand' subs
+        compadd -- -f --force -i -I -v --verbose -r -R --recursive -d --dir -h --help -V --version
+        _files
+        ;;
+    files)
+        compadd -- -f --force -i -I -v --verbose -r -R --recursive -d --dir
+        _files
+        ;;
+    --)
+        _files
+        ;;
+    undo)
+        compadd -- -y --yes
+        ;;
+    list)
+        compadd -- -a --all -0 --null
+        ;;
+    restore)
+        _rip_trashed
+        compadd -- -a --all --rename -y --yes
+        ;;
+    empty)
+        compadd -- --older-than --max-size -y --yes
+        ;;
+    purge)
+        _rip_trashed
+        compadd -- -a --all -y --yes
+        ;;
+    esac
+}
+
+if [ "$funcstack[1]" = "_rip" ]; then
+    _rip "$@"
+else
+    compdef _rip rip
+fi
