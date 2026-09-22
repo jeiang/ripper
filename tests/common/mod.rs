@@ -6,10 +6,8 @@
 //!
 //! This file has no test binary of its own (`tests/common/mod.rs` is the
 //! standard way to share code between the `tests/*.rs` binaries, each of
-//! which pulls it in with `mod common;`). Only `tests/harness.rs` exists so
-//! far, so most of this API is unused from its point of view; the rest is
-//! for `tests/list.rs`, `tests/put.rs`, `tests/restore.rs`, `tests/empty.rs`
-//! and `tests/completions.rs`, added by later checkpoints.
+//! which pulls it in with `mod common;`). Each test binary uses only part of
+//! this API, so `dead_code` is allowed for the module.
 #![allow(dead_code)]
 
 use std::env;

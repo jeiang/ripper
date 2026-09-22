@@ -855,8 +855,8 @@ mod tests {
         // exercises the real "no terminal" path. A developer running `cargo
         // test` interactively has a real stdin, which would make `confirm`
         // block on `read_line`; skip in that case rather than hang. The
-        // sandbox tests (a later checkpoint) cover this path with a `rip`
-        // that genuinely never has a terminal.
+        // sandbox tests cover this path with a `rip` that never has a
+        // terminal.
         if io::stdin().is_terminal() {
             return;
         }
