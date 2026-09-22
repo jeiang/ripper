@@ -9,6 +9,7 @@ use std::io::{self, ErrorKind, Read, Write};
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use jiff::civil;
 use rustix::fs::{AtFlags, CWD, Mode, OFlags, mkdirat, openat, unlinkat};
@@ -685,13 +686,27 @@ fn entry_conflict(t: &Trash, ms: &Mounts, name: &OsStr) -> Option<String> {
     mounts::mount_conflict(ms, own, &path, meta.is_mount_root())
 }
 
+/// Never resets across calls within this process: each tombstone continues
+/// from the last number that succeeded, instead of every `tombstone()`/
+/// `fresh_tombstone()` call restarting at 0 and re-colliding (`EEXIST`) with
+/// every tombstone already in `.rip-staging` from earlier in the same
+/// batch. A batch of N doomed entries would otherwise cost N(N+1)/2 renames,
+/// all under `LOCK_EX`, blocking any concurrent put or restore on this
+/// trash for the whole time (docs/design.md §5.4, invariant 9).
+static NEXT_TOMBSTONE: AtomicU64 = AtomicU64::new(0);
+
+fn next_tombstone_name(pid: u32) -> OsString {
+    let n = NEXT_TOMBSTONE.fetch_add(1, Ordering::Relaxed);
+    OsString::from(format!("del.{pid}.{n}"))
+}
+
 /// `rename_noreplace(files, NAME, staging, "del.<pid>.<n>")`. See
 /// `entry_conflict` above for why this is not yet reachable from `main`.
 #[allow(dead_code)]
 fn tombstone(t: &Trash, staging: &OwnedFd, name: &OsStr) -> io::Result<OsString> {
     let pid = std::process::id();
-    for n in 0u64..1_000_000 {
-        let tomb = OsString::from(format!("del.{pid}.{n}"));
+    for _ in 0u64..1_000_000 {
+        let tomb = next_tombstone_name(pid);
         match sys::rename_noreplace(&t.files, name, staging, &tomb) {
             Ok(()) => return Ok(tomb),
             Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
@@ -709,8 +724,8 @@ fn tombstone(t: &Trash, staging: &OwnedFd, name: &OsStr) -> io::Result<OsString>
 #[allow(dead_code)]
 fn fresh_tombstone(staging: &OwnedFd, name: &OsStr) -> io::Result<OsString> {
     let pid = std::process::id();
-    for n in 0u64..1_000_000 {
-        let tomb = OsString::from(format!("del.{pid}.{n}"));
+    for _ in 0u64..1_000_000 {
+        let tomb = next_tombstone_name(pid);
         match sys::rename_noreplace(staging, name, staging, &tomb) {
             Ok(()) => return Ok(tomb),
             Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,

@@ -555,3 +555,38 @@ fn crash_states() {
         "empty must never touch a file at an original path"
     );
 }
+
+/// c6 (review round, fix-empty.json): tombstone naming must not restart at
+/// `del.<pid>.0` for every item in a batch (quadratic `renameat2` retries
+/// under `LOCK_EX`). With the bug, N items cost N(N+1)/2 renames; fixed,
+/// the cost is linear. 4000 items take tens of seconds under the bug and
+/// well under a second fixed.
+#[test]
+fn empty_of_many_items_is_not_quadratic() {
+    let sandbox = Sandbox::artemis();
+    let n = 4000;
+    for i in 0..n {
+        let name = format!("f{i:05}");
+        sandbox.plant(
+            "/home/u/.local/share/Trash",
+            name.as_bytes(),
+            format!("/home/u/Downloads/{name}").as_bytes(),
+            "2026-01-01T00:00:00",
+            Body::File(b"x".to_vec()),
+        );
+    }
+
+    let start = std::time::Instant::now();
+    let out = sandbox.rip("/", &["empty", "-y"]);
+    let elapsed = start.elapsed();
+    assert_ok(&out);
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "empty of {n} items in one trash dir took {elapsed:?}: tombstone naming must \
+         not restart at 0 for every item (review round, finding c6)"
+    );
+
+    let trash_host = sandbox.host("/home/u/.local/share/Trash");
+    assert!(!trash_host.join("files/f00000").exists());
+    assert!(!trash_host.join(format!("files/f{:05}", n - 1)).exists());
+}
