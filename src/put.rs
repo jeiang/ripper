@@ -477,6 +477,14 @@ fn put_one(cx: &Cx, cli: &Cli, s: &mut Session, arg: &Path) -> Result<Done, PutE
         .mounts
         .by_id(st.id.mnt)
         .ok_or("its mount is not in /proc/self/mountinfo")?;
+    // A read-only mount is refused outright, the way `rm` is (docs/design.md
+    // c3): never routed around through some other, writable alias of the
+    // same subvolume. The copy fallback already refuses the same way
+    // (`removable_top_checks`'s accessat check), so this keeps both
+    // placement paths consistent.
+    if own.ro {
+        return Err("its filesystem is read-only".into());
+    }
     if let Some(why) = mounts::mount_conflict(&cx.mounts, own, &path, st.is_mount_root()) {
         return Err(format!("it {why}; not trashing it").into());
     }

@@ -9,8 +9,8 @@ mod common;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
-use std::path::Path;
-use std::process::Output;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
 
 use common::Sandbox;
 use rustix::process::getuid;
@@ -906,4 +906,115 @@ fn argv_rules() {
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
     assert_eq!(before.len(), after.len(), "the trash must be unchanged");
+}
+
+// ---------------------------------------------------------------------------
+// Read-only mounts (docs/design.md c3): a real read-only MOUNT (mountinfo's
+// `ro` option), not a permission-based restriction, which `Sandbox`'s own
+// `bind`/`without` API cannot express. This mirrors tests/restore.rs's own
+// `base_bwrap`, built locally rather than by editing tests/common/mod.rs.
+// ---------------------------------------------------------------------------
+
+const DEFAULT_BINDS: &[&str] = &[
+    "/persist",
+    "/home",
+    "/home/u/Downloads",
+    "/home/u/Documents",
+    "/home/u/.local/share/Trash",
+    "/mnt/side",
+    "/mnt/pside",
+    "/mnt/other",
+    "/mnt/ro",
+];
+
+/// The same fixed bwrap flags and binds `Sandbox::command` uses, plus `rip`'s
+/// own binary bound at the usual inside path. Callers add any extra binds
+/// (e.g. a genuine `--ro-bind`) and finish the invocation themselves.
+fn base_bwrap(sandbox: &Sandbox) -> Command {
+    let mut c = Command::new("bwrap");
+    c.args([
+        "--unshare-user",
+        "--unshare-pid",
+        "--die-with-parent",
+        "--new-session",
+        "--proc",
+        "/proc",
+        "--dev",
+        "/dev",
+        "--tmpfs",
+        "/tmp",
+        "--ro-bind",
+        "/nix",
+        "/nix",
+        "--ro-bind",
+        "/etc",
+        "/etc",
+    ]);
+    for p in ["/usr", "/bin", "/lib", "/lib64"] {
+        c.args(["--ro-bind-try", p, p]);
+    }
+    c.arg("--ro-bind")
+        .arg(env!("CARGO_BIN_EXE_rip"))
+        .arg("/run/rip/bin/rip");
+    for inside in DEFAULT_BINDS {
+        c.arg("--bind").arg(sandbox.host(inside)).arg(inside);
+    }
+    c
+}
+
+/// Finishes a `base_bwrap` command (env, cwd, argv) and runs it with stdin
+/// `/dev/null`, never a terminal.
+fn run_bwrap(mut c: Command, cwd: &str, args: &[&str]) -> Output {
+    c.args([
+        "--clearenv",
+        "--setenv",
+        "HOME",
+        "/home/u",
+        "--setenv",
+        "XDG_CONFIG_HOME",
+        "/home/u/.config",
+    ]);
+    let mut path_entries = vec![PathBuf::from("/run/rip/bin")];
+    if let Some(host_path) = std::env::var_os("PATH") {
+        path_entries
+            .extend(std::env::split_paths(&host_path).filter(|p| p.starts_with("/nix/store")));
+    }
+    c.arg("--setenv")
+        .arg("PATH")
+        .arg(std::env::join_paths(path_entries).expect("PATH entries must not contain ':' or NUL"));
+    c.arg("--chdir").arg(cwd);
+    c.arg("--").arg("/run/rip/bin/rip").args(args);
+    c.stdin(Stdio::null());
+    c.output().expect("spawn bwrap")
+}
+
+#[test]
+fn read_only_mount_is_refused_not_routed_around() {
+    // A directory on the home trash's own subvolume, exposed through a
+    // genuinely read-only MOUNT (not just permission bits), must be refused
+    // like `rm` would -- not bypassed by renaming through /persist, a
+    // writable alias of the same subvolume (docs/design.md c3).
+    let sandbox = Sandbox::artemis();
+    let ro_host = sandbox.host("/persist").join("u/roview");
+    std::fs::create_dir_all(&ro_host).unwrap();
+    std::fs::write(ro_host.join("x"), b"protected").unwrap();
+
+    let mut c = base_bwrap(&sandbox);
+    c.arg("--ro-bind").arg(&ro_host).arg("/home/u/roview");
+    let out = run_bwrap(c, "/home/u/roview", &["-v", "x"]);
+
+    assert_fail(&out);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("its filesystem is read-only"), "{stderr}");
+    assert!(
+        ro_host.join("x").exists(),
+        "the source must be left in place"
+    );
+    assert!(
+        !sandbox
+            .host("/home/u/.local/share/Trash/files")
+            .join("x")
+            .exists(),
+        "must not have been routed around the read-only view into the trash"
+    );
 }

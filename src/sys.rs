@@ -270,11 +270,11 @@ fn flock_unsupported(e: Errno) -> bool {
 /// Opens directories `a` and `b` through ONE mount that shows both, so a
 /// rename between the fds cannot fail with `EXDEV` at a mount boundary. Each
 /// candidate is checked, not trusted: each opened fd must have that mount's
-/// id and the expected `(dev, ino)`. A covered candidate fails this check.
-///
-/// `mounts::route_candidates` is still a stub as of this checkpoint (C2a), so
-/// this function cannot be exercised by a test here; it is implemented
-/// against its fixed signature and exercised once C2a lands.
+/// id and the expected `(dev, ino)`. A covered candidate fails this check. A
+/// read-only candidate is skipped, not returned: renaming through it would
+/// fail with `EROFS` (or, worse, succeed and silently defeat a read-only
+/// view someone set up on purpose -- docs/design.md c3), and a later
+/// candidate on the same filesystem may still be writable.
 pub fn route(
     ms: &Mounts,
     a: &Path,
@@ -283,6 +283,9 @@ pub fn route(
     b_id: Ident,
 ) -> io::Result<Option<(OwnedFd, OwnedFd)>> {
     for (mnt, pa, pb) in mounts::route_candidates(ms, a_id.mnt, a, b_id.mnt, b) {
+        if ms.by_id(mnt).is_some_and(|m| m.ro) {
+            continue;
+        }
         let (Ok(fa), Ok(fb)) = (open_path(CWD, &pa), open_path(CWD, &pb)) else {
             continue;
         };
@@ -1786,6 +1789,15 @@ mod tests {
         mounts::Mounts::parse(text.as_bytes())
     }
 
+    /// Same as `one_mount`, but marked `ro` in mountinfo field 6.
+    fn one_mount_ro(id: u64, point: &Path) -> Mounts {
+        let text = format!(
+            "{id} 1 77:77 /fake-root {} ro - tmpfs none ro\n",
+            point.display()
+        );
+        mounts::Mounts::parse(text.as_bytes())
+    }
+
     #[test]
     fn route_finds_a_working_candidate_through_its_own_mount() {
         let dir = tempfile::tempdir().unwrap();
@@ -1806,6 +1818,33 @@ mod tests {
             .expect("a same-mount candidate must be found");
         assert!(ident(&fa).unwrap().same_file(&a_id));
         assert!(ident(&fb).unwrap().same_file(&b_id));
+    }
+
+    #[test]
+    fn route_skips_a_read_only_candidate_instead_of_returning_it() {
+        // docs/design.md c3: renaming through a read-only mount either fails
+        // with EROFS (if it is the only candidate, as here) or, worse, would
+        // silently defeat the read-only view if a writable alias were tried
+        // instead without checking it too. Either way, a read-only candidate
+        // must never be the one `route` hands back.
+        let dir = tempfile::tempdir().unwrap();
+        let r = root(&dir);
+        mkdirat(&r, "a", Mode::from_raw_mode(0o700)).unwrap();
+        mkdirat(&r, "b", Mode::from_raw_mode(0o700)).unwrap();
+
+        let real_mnt = ident(&r).unwrap().mnt;
+        let ms = one_mount_ro(real_mnt, dir.path());
+
+        let a_path = dir.path().join("a");
+        let b_path = dir.path().join("b");
+        let a_id = ident(open_dir(&r, "a").unwrap()).unwrap();
+        let b_id = ident(open_dir(&r, "b").unwrap()).unwrap();
+
+        let result = route(&ms, &a_path, a_id, &b_path, b_id).unwrap();
+        assert!(
+            result.is_none(),
+            "the only candidate is read-only; route must not return it"
+        );
     }
 
     #[test]

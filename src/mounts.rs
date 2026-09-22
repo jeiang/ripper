@@ -20,6 +20,10 @@ pub struct Mount {
     pub root: PathBuf,
     /// The mount point in this namespace.
     pub point: PathBuf,
+    /// The `ro` option in mountinfo field 6 (per-mount, independent of
+    /// whether the underlying filesystem is itself writable: a `ro` bind
+    /// mount of an otherwise-writable subvolume reads this way too).
+    pub ro: bool,
     #[allow(dead_code)] // first read by trash::discover's autofs skip (C3, design §0.1 #12)
     pub fstype: OsString,
     /// Where the mount point lies: the parent's filesystem and the path inside it.
@@ -162,6 +166,7 @@ fn parse_line(l: &[u8]) -> Option<Mount> {
         fs: FsId(maj.parse().ok()?, min.parse().ok()?),
         root: bytes_path(unescape(f[3])),
         point: bytes_path(unescape(f[4])),
+        ro: f[5].split(|&b| b == b',').any(|o| o == b"ro"),
         fstype: OsString::from_vec(unescape(f.get(sep + 1)?)),
         under: None,
     })
@@ -242,6 +247,14 @@ mod tests {
 
         let two = parse_line(b"20 1 0:1 / /mnt rw shared:1 master:2 - ext4 /dev/sda1 rw").unwrap();
         assert_eq!(two.fstype, OsString::from("ext4"));
+    }
+
+    #[test]
+    fn parse_line_captures_the_ro_option() {
+        let rw = parse_line(b"20 1 0:1 / /mnt rw,nosuid - ext4 /dev/sda1 rw").unwrap();
+        assert!(!rw.ro);
+        let ro = parse_line(b"20 1 0:1 / /mnt ro,nosuid,nodev - ext4 /dev/sda1 rw").unwrap();
+        assert!(ro.ro);
     }
 
     #[test]
