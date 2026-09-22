@@ -12,6 +12,10 @@ test:
 check:
 	cargo clippy --all-targets -- -D warnings
 	cargo fmt --check
+	# Explicit files, not bare `actionlint`: its default project-root
+	# detection walks up looking for `.git`, which the `artemis` recipe
+	# below deliberately excludes from the synced copy it runs this in.
+	actionlint .github/workflows/*.yml
 
 fmt:
 	cargo fmt

@@ -38,8 +38,31 @@ so neither needs to be installed separately. It also installs the bash, zsh
 and fish completions under `completions/`, all static, hand-written files,
 so this works the same on a native or a cross build.
 
-There is no non-Nix install path today; building from source needs the
-dependencies listed in `Cargo.toml` and a Linux target.
+Each [release](#releases) also publishes a static `x86_64-linux` binary
+(`rip-X.Y.Z-x86_64-linux.tar.gz` on the release's GitHub page), for a non-Nix
+install:
+
+```
+tar xzf rip-X.Y.Z-x86_64-linux.tar.gz
+install -m755 rip-X.Y.Z-x86_64-linux/rip ~/.local/bin/   # or another dir on PATH
+```
+
+Unlike the Nix package, this binary is not wrapped: GNU coreutils' `cp` (the
+cross-filesystem copy fallback) and `fzf` (the interactive picker) must
+already be on `PATH`. The completion files (`completions/rip.bash`,
+`completions/_rip`, `completions/rip.fish`) are in the tarball; install them
+the way your shell expects, or run `rip --completions <shell>` (see
+[Completions](#completions) below).
+
+Building from source needs the dependencies listed in `Cargo.toml` and a
+Linux target.
+
+## Releases
+
+Releases follow [Semantic Versioning](https://semver.org/); `CHANGELOG.md`
+lists what changed in each one, in [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
+form. See the [GitHub releases page](https://github.com/jeiang/ripper/releases)
+for the static binary and its checksum.
 
 ## Usage
 
@@ -195,9 +218,13 @@ for `restore`/`purge`.
 - `just test` -- unit tests and the bwrap sandbox integration tests (Linux
   only; needs unprivileged user namespaces and a btrfs directory, either the
   system temp dir or `$RIP_TEST_BTRFS`).
-- `just check` -- `cargo clippy --all-targets -- -D warnings`, then
-  `cargo fmt --check`.
+- `just check` -- `cargo clippy --all-targets -- -D warnings`, `cargo fmt
+  --check`, then `actionlint` on `.github/workflows/`.
 - `just fmt` -- `cargo fmt`.
+- `just release VERSION` -- bump the version, move `CHANGELOG.md`'s
+  Unreleased section into a dated release, commit and tag locally; see
+  `AGENTS.md`'s release rules for when to run it and what to push
+  afterwards.
 - From macOS: `just artemis check` and `just artemis test` rsync the
   worktree to a configured Linux host and run the same recipe there over
   SSH, since `rip` cannot build or run on macOS.
@@ -205,4 +232,6 @@ for `restore`/`purge`.
 CI (`.github/workflows/ci.yml`) runs `just check` on every push and pull
 request, builds the Nix package (which runs the unit tests) and checks the
 installed completions, and runs the full test suite on a real btrfs loop
-mount.
+mount. Pushing a `vX.Y.Z` tag runs `.github/workflows/release.yml`, which
+builds the static binary, publishes the GitHub release, and pushes the Nix
+package's closure to the `garret` binary cache.

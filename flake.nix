@@ -66,7 +66,7 @@
       # darwin: editing, `cargo fmt` and `cargo generate-lockfile` on zakkart only.
       devShells = forSystems (linux ++ [ "aarch64-darwin" ]) (pkgs: {
         default = pkgs.mkShell {
-          packages = with pkgs; [ cargo rustc clippy rustfmt rust-analyzer just ]
+          packages = with pkgs; [ cargo rustc clippy rustfmt rust-analyzer just actionlint ]
             # Sandbox tests: bwrap, btrfs subvolumes, `script` for terminals,
             # fish, fzf, and bash-completion for tests/completions.rs's
             # bash/zsh sandbox tests (zsh needs zsh/zpty and compinit; bash

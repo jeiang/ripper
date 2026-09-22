@@ -1,0 +1,12 @@
+# garret client config for CI. In GitHub Actions the client mints its own OIDC token;
+# the schema still requires the [oidc] table, whose issuer/client_id go unused on that path.
+endpoint = "https://cache-push.jeiang.dev"
+puller_endpoint = "https://cache.jeiang.dev"
+
+[oidc]
+issuer = "https://token.actions.githubusercontent.com"
+client_id = "github-actions"
+# Must match the `audience` on the github-actions issuer in
+# modules/garret/default.nix; the Pusher rejects a token minted for
+# anything else.
+audience = "https://cache-push.jeiang.dev/"

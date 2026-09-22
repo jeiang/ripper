@@ -1,0 +1,114 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+env:
+  GARRET_SUBSTITUTER: https://cache.jeiang.dev
+  GARRET_PUBLIC_KEY: "cache.jeiang.dev-1:owXJK5/UX9NSf1lhmDDT3QTxMtbVk9YfHhjvOXyPhpA="
+
+jobs:
+  # Fails fast, before either job below does real work, if the tag was
+  # pushed by hand against the wrong commit (AGENTS.md's release rules
+  # expect `just release` to have made tag and Cargo.toml agree).
+  verify:
+    name: verify release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.notes.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Verify the tag and extract release notes
+        id: notes
+        run: |
+          scripts/release-notes.sh > release-notes.md
+          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: release-notes.md
+
+  # Independent of `release`: a cache outage must turn this job red without
+  # blocking the GitHub release itself.
+  garret:
+    name: push to garret
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Exchanged for a short-lived push token; the server only grants push
+      # to the ref_patterns configured for this repo (see below).
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            extra-substituters = ${{ env.GARRET_SUBSTITUTER }}
+            extra-trusted-public-keys = ${{ env.GARRET_PUBLIC_KEY }}
+
+      - name: Build the default package
+        run: nix build .#default --print-build-logs
+
+      # garret grants a GitHub OIDC push by ref_patterns (cornn-flaek
+      # modules/garret's oidc.ref_patterns); that deployed config must
+      # include "refs/tags/v*" (it currently lists only "refs/heads/main"),
+      # or the push below is rejected server-side no matter what runs here.
+      - name: Install the garret client
+        run: nix profile install "github:jeiang/garret/541b395c74596207efe33cc85188f727563b13e2#garret"
+
+      - name: Push the closure to garret
+        run: .ci/garret-push.sh ./result
+
+  release:
+    name: create GitHub release
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            extra-substituters = ${{ env.GARRET_SUBSTITUTER }}
+            extra-trusted-public-keys = ${{ env.GARRET_PUBLIC_KEY }}
+
+      - name: Build the static binary
+        run: nix build .#static --print-build-logs
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-notes
+
+      - name: Package release assets
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          name="rip-$VERSION-x86_64-linux"
+          stage=$(mktemp -d)
+          mkdir -p "$stage/$name/completions"
+          cp result/bin/rip "$stage/$name/rip"
+          cp completions/rip.bash completions/_rip completions/rip.fish "$stage/$name/completions/"
+          cp README.md CHANGELOG.md "$stage/$name/"
+          tar -C "$stage" -czf "$name.tar.gz" "$name"
+          sha256sum "$name.tar.gz" > SHA256SUMS
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          gh release create "v$VERSION" \
+            --title "v$VERSION" \
+            --notes-file release-notes.md \
+            "rip-$VERSION-x86_64-linux.tar.gz" \
+            SHA256SUMS
