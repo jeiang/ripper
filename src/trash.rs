@@ -6,13 +6,13 @@
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::io::{self, ErrorKind, Read, Write};
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use jiff::civil;
-use rustix::fs::{AtFlags, CWD, Mode, OFlags, mkdirat, openat, unlinkat};
+use rustix::fs::{AtFlags, CWD, Mode, OFlags, chmodat, mkdirat, openat, unlinkat};
 use rustix::io::Errno;
 use rustix::process::getuid;
 
@@ -700,10 +700,49 @@ fn next_tombstone_name(pid: u32) -> OsString {
     OsString::from(format!("del.{pid}.{n}"))
 }
 
+/// If `dir/name` is a directory the current user owns but lacks `u+w` on,
+/// adds it. Moving a directory to a different parent needs write permission
+/// on the directory itself, to update `..` -- unlike every other entry
+/// kind, so a top-level entry without it (a copy-based trasher, or a chmod
+/// after trashing) would otherwise never tombstone; `remove_tree`'s own
+/// trash-policy repair runs too late, only on entries already inside a
+/// tombstone. Best-effort and silent: a failure here just means the
+/// rename below reports the real error (docs/design.md §6.7).
+fn add_owner_write_if_needed(dir: &OwnedFd, name: &OsStr) {
+    let Ok(m) = sys::stat_at(dir, name) else {
+        return;
+    };
+    if !m.is_dir() || m.uid != getuid().as_raw() || m.mode & 0o200 != 0 {
+        return;
+    }
+    let Ok(op) = openat(
+        dir,
+        name,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) else {
+        return;
+    };
+    // `fchmod` refuses an `O_PATH` fd, so reopen it through `/proc/self/fd`
+    // (which does accept normal flags) -- only after confirming, via the
+    // `O_PATH` open above (which bypasses the very permission bits being
+    // repaired), that it is still the same directory.
+    if sys::ident(&op).is_ok_and(|id| id.same_file(&m.id)) {
+        let via = format!("/proc/self/fd/{}", op.as_raw_fd());
+        let _ = chmodat(
+            CWD,
+            via.as_str(),
+            Mode::from_raw_mode(m.mode | 0o200),
+            AtFlags::empty(),
+        );
+    }
+}
+
 /// `rename_noreplace(files, NAME, staging, "del.<pid>.<n>")`. See
 /// `entry_conflict` above for why this is not yet reachable from `main`.
 #[allow(dead_code)]
 fn tombstone(t: &Trash, staging: &OwnedFd, name: &OsStr) -> io::Result<OsString> {
+    add_owner_write_if_needed(&t.files, name);
     let pid = std::process::id();
     for _ in 0u64..1_000_000 {
         let tomb = next_tombstone_name(pid);

@@ -590,3 +590,30 @@ fn empty_of_many_items_is_not_quadratic() {
     assert!(!trash_host.join("files/f00000").exists());
     assert!(!trash_host.join(format!("files/f{:05}", n - 1)).exists());
 }
+
+/// c19 (review round, fix-empty.json): a top-level directory item without
+/// owner write permission must still be removable -- unlike renaming any
+/// other entry kind, renaming a directory to a new parent needs write
+/// permission on the directory itself, to update "..".
+#[test]
+fn readonly_top_level_dir_deleted() {
+    let sandbox = Sandbox::artemis();
+    sandbox.plant(
+        "/home/u/.local/share/Trash",
+        b"ro",
+        b"/home/u/Downloads/ro",
+        "2026-01-01T00:00:00",
+        Body::Dir,
+    );
+    let trash_host = sandbox.host("/home/u/.local/share/Trash");
+    let item = trash_host.join("files/ro");
+    fs::write(item.join("f"), b"x").unwrap();
+    fs::set_permissions(&item, fs::Permissions::from_mode(0o555)).unwrap();
+
+    let out = sandbox.rip("/", &["empty", "-y"]);
+    assert_ok(&out);
+    assert!(
+        !item.exists(),
+        "a top-level item without owner write permission must still be removable"
+    );
+}
