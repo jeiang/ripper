@@ -449,6 +449,18 @@ fn strip_info_suffix(info_name: &OsStr) -> Option<&OsStr> {
         .map(OsStr::from_bytes)
 }
 
+/// Whether a `.trashinfo`'s stripped name could never really be a
+/// `files/NAME` directory-entry name: empty, `.`, `..`, or containing `/`.
+/// A hostile or buggy writer can still create the *info* file with such a
+/// name (`...trashinfo` strips to `..`); treated as an ordinary entry name,
+/// `..` resolves to the trash root itself and `.` to `files/` itself
+/// (docs/design.md invariant 6). This must never reach a `files/` lookup,
+/// `still_same`, or `tombstone`.
+fn is_malformed_entry_name(name: &OsStr) -> bool {
+    let b = name.as_bytes();
+    b.is_empty() || b == b"." || b == b".." || b.contains(&b'/')
+}
+
 fn local_ctime(m: &sys::Meta) -> civil::DateTime {
     let (secs, nanos) = m.ctime;
     jiff::Timestamp::new(secs, nanos as i32)
@@ -491,6 +503,23 @@ fn load_one(idx: usize, t: &Trash, c: &mut Contents) {
                 let Some(name) = strip_info_suffix(&info_name) else {
                     continue; // a stray file in info/ that is not a .trashinfo
                 };
+                if is_malformed_entry_name(name) {
+                    // Never resolve this against files/ at all -- record it
+                    // as garbage `delete_dangling` can unlink outright.
+                    if let Ok(lstat) = sys::stat_at(&t.info, &info_name) {
+                        c.warnings.push(format!(
+                            "{}: {}: malformed .trashinfo",
+                            t.path.display(),
+                            crate::escape(name.as_bytes())
+                        ));
+                        c.dangling.push(Dangling {
+                            trash: idx,
+                            name: name.to_owned(),
+                            info: lstat.id,
+                        });
+                    }
+                    continue;
+                }
                 let name = name.to_owned();
                 load_info_entry(idx, t, &name, c, &mut paired);
             }
@@ -555,7 +584,26 @@ fn load_info_entry(
     }
     let entry_meta = files_meta.unwrap();
     let Some((info_id, bytes)) = reread_info(t, name) else {
-        return; // raced away entirely between the lstat above and this read
+        // files/NAME is confirmed present (above), so this is not a race:
+        // the info exists (the lstat above found it) but cannot be opened
+        // at all (ELOOP: a symlink; EACCES: unreadable). Record it as an
+        // orphan with a malformed info, identified by that lstat, so
+        // empty/purge can remove it instead of leaving an entry nothing can
+        // ever delete (docs/design.md §4 "Loading").
+        c.warnings.push(format!(
+            "{}: {}: malformed .trashinfo",
+            t.path.display(),
+            crate::escape(name.as_bytes())
+        ));
+        c.orphans.push(Orphan {
+            trash: idx,
+            name: name.to_owned(),
+            date: local_ctime(&entry_meta),
+            entry: entry_meta.id,
+            info: Some((info_lstat.id, Vec::new())),
+        });
+        paired.insert(name.to_owned());
+        return;
     };
     let parsed = (!bytes.is_empty())
         .then(|| info::parse(&bytes))
@@ -668,9 +716,19 @@ fn orphan_still_same(t: &Trash, o: &Orphan) -> bool {
     match &o.info {
         None => sys::stat_at(&t.info, info_file_name(&o.name))
             .is_err_and(|e| e.kind() == ErrorKind::NotFound),
-        Some((id, bytes)) => {
-            matches!(reread_info(t, &o.name), Some((cid, cbytes)) if cid.same_file(id) && cbytes == *bytes)
-        }
+        Some((id, bytes)) => match reread_info(t, &o.name) {
+            Some((cid, cbytes)) => cid.same_file(id) && cbytes == *bytes,
+            // Still not openable now either. If it could not be read at
+            // load time either (an unopenable symlink or an unreadable
+            // info; `bytes` is then always empty), the lstat identity
+            // recorded then is all "unchanged" ever meant, so compare that
+            // instead of giving up forever (docs/design.md §4 "Loading").
+            None => {
+                bytes.is_empty()
+                    && sys::stat_at(&t.info, info_file_name(&o.name))
+                        .is_ok_and(|m| m.id.same_file(id))
+            }
+        },
     }
 }
 
@@ -970,8 +1028,12 @@ fn delete_orphan(
 #[allow(dead_code)]
 fn delete_dangling(t: &Trash, g: &Dangling, rep: &mut Report) {
     let info_name = info_file_name(&g.name);
-    let still_missing =
-        sys::stat_at(&t.files, &g.name).is_err_and(|e| e.kind() == ErrorKind::NotFound);
+    // A malformed name (`.`, `..`, empty, `/`-containing) is never a real
+    // files/ entry, so it is always "still missing" without ever resolving
+    // it against files/ (docs/design.md invariant 6: `..` would otherwise
+    // resolve to the trash root itself, `.` to files/ itself).
+    let still_missing = is_malformed_entry_name(&g.name)
+        || sys::stat_at(&t.files, &g.name).is_err_and(|e| e.kind() == ErrorKind::NotFound);
     let same_info = sys::stat_at(&t.info, &info_name).is_ok_and(|m| m.id.same_file(&g.info));
     if still_missing && same_info {
         let _ = unlinkat(&t.info, &info_name, AtFlags::empty());

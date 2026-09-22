@@ -617,3 +617,84 @@ fn readonly_top_level_dir_deleted() {
         "a top-level item without owner write permission must still be removable"
     );
 }
+
+/// c17 (review round, fix-empty.json): an info file named `...trashinfo`
+/// strips to `..`. As a directory-entry name, `..` would resolve to the
+/// trash root itself: this must be treated as garbage `empty` can unlink
+/// outright, never resolved against `files/`, so it does not keep failing
+/// every `empty` forever.
+#[test]
+fn dotdot_named_info_is_garbage_not_the_trash_root() {
+    let sandbox = Sandbox::artemis();
+    sandbox.plant(
+        "/home/u/.local/share/Trash",
+        b"keep",
+        b"/home/u/Downloads/keep",
+        "2026-01-01T00:00:00",
+        Body::File(b"data".to_vec()),
+    );
+    let trash_host = sandbox.host("/home/u/.local/share/Trash");
+    fs::write(
+        trash_host.join("info/...trashinfo"),
+        b"[Trash Info]\nPath=phantom\nDeletionDate=2026-01-02T00:00:00\n",
+    )
+    .unwrap();
+
+    let out = sandbox.rip("/", &["empty", "-y"]);
+    assert_ok(&out);
+    assert!(
+        !trash_host.join("info/...trashinfo").exists(),
+        "the malformed info must be removed as garbage"
+    );
+    assert!(!trash_host.join("files/keep").exists());
+
+    // A second empty must not keep failing on the same phantom entry.
+    let out2 = sandbox.rip("/", &["empty", "-y"]);
+    assert_ok(&out2);
+}
+
+/// c18 (review round, fix-empty.json): `files/NAME` exists, but its info
+/// cannot be opened at all (mode `000`; not a race, since `files/NAME` is
+/// present). This must still be removable -- as an orphan with a malformed
+/// info -- instead of an entry nothing can ever delete.
+#[test]
+fn unopenable_info_with_existing_files_entry_is_still_removable() {
+    let sandbox = Sandbox::artemis();
+    sandbox.plant(
+        "/home/u/.local/share/Trash",
+        b"ok",
+        b"/home/u/Downloads/ok",
+        "2026-01-01T00:00:00",
+        Body::File(b"data".to_vec()),
+    );
+    sandbox.plant(
+        "/home/u/.local/share/Trash",
+        b"stuck",
+        b"/home/u/Downloads/stuck",
+        "2026-01-01T00:00:00",
+        Body::File(b"data".to_vec()),
+    );
+    let trash_host = sandbox.host("/home/u/.local/share/Trash");
+    fs::set_permissions(
+        trash_host.join("info/stuck.trashinfo"),
+        fs::Permissions::from_mode(0o000),
+    )
+    .unwrap();
+
+    let list_out = sandbox.rip("/", &["list", "--all"]);
+    assert!(
+        stderr(&list_out).contains("malformed .trashinfo"),
+        "expected a warning about the unopenable info: {}",
+        stderr(&list_out)
+    );
+
+    let out = sandbox.rip("/", &["empty", "-y"]);
+    assert_ok(&out);
+    assert!(!trash_host.join("files/ok").exists());
+    assert!(
+        !trash_host.join("files/stuck").exists(),
+        "an entry whose info exists but cannot be opened must still be removable: {}",
+        stderr(&out)
+    );
+    assert!(!trash_host.join("info/stuck.trashinfo").exists());
+}
