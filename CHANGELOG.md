@@ -7,6 +7,8 @@ and `rip` uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-09-22
+
 ### Added
 
 - Subcommands `undo`, `list`, `restore`, `empty` and `purge`, alongside
