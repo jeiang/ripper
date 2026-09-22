@@ -49,13 +49,15 @@ pub fn list(cx: &Cx, all: bool, null: bool) -> Result<bool, String> {
     }
 }
 
-/// `original`, relative to `cwd` when it lies under `cwd`, absolute
+/// `original`, relative to `cwd` when it lies under `cwd` (as `.` itself
+/// when `original` IS `cwd`, not an empty string -- finding c27), absolute
 /// otherwise (design §11).
 fn display_path(cwd: &Path, original: &Path) -> PathBuf {
-    original
-        .strip_prefix(cwd)
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|_| original.to_path_buf())
+    match original.strip_prefix(cwd) {
+        Ok(rel) if rel.as_os_str().is_empty() => PathBuf::from("."),
+        Ok(rel) => rel.to_path_buf(),
+        Err(_) => original.to_path_buf(),
+    }
 }
 
 /// Writes `-0`'s `DATE<TAB>PATH<NUL>` records, or plain `DATE  PATH\n`
@@ -1104,6 +1106,32 @@ mod tests {
             blocking_ancestor(&blocked, Path::new("/home/u/dir-other/f")),
             None,
             "a name that merely shares a prefix is not \"under\" it"
+        );
+    }
+
+    // ---- display_path (finding c27: "." for original == cwd, not "") ----
+
+    #[test]
+    fn display_path_shows_dot_when_original_is_the_cwd() {
+        let cwd = Path::new("/home/u/Downloads/build");
+        let original = Path::new("/home/u/Downloads/build");
+        assert_eq!(display_path(cwd, original), PathBuf::from("."));
+    }
+
+    #[test]
+    fn display_path_still_shows_a_normal_relative_path() {
+        let cwd = Path::new("/home/u");
+        let original = Path::new("/home/u/Downloads/x");
+        assert_eq!(display_path(cwd, original), PathBuf::from("Downloads/x"));
+    }
+
+    #[test]
+    fn display_path_falls_back_to_absolute_outside_cwd() {
+        let cwd = Path::new("/home/u/Documents");
+        let original = Path::new("/home/u/Downloads/x");
+        assert_eq!(
+            display_path(cwd, original),
+            PathBuf::from("/home/u/Downloads/x")
         );
     }
 }

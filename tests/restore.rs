@@ -1371,6 +1371,54 @@ fn undo_empty() {
 }
 
 // ---------------------------------------------------------------------------
+// display_path (finding c27: "." for an item whose original is the cwd,
+// not an empty path)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn list_and_purge_show_dot_for_an_item_whose_original_is_the_cwd() {
+    let sandbox = Sandbox::artemis();
+    sandbox.plant(
+        "/home/u/.local/share/Trash",
+        b"build",
+        b"/home/u/Downloads/build",
+        "2026-01-01T00:00:00",
+        Body::Dir,
+    );
+    // The trashed directory got recreated at the same path (a build tool,
+    // `mkdir`, ...), which is what makes `original == cwd` reachable.
+    std::fs::create_dir_all(sandbox.host("/home/u/Downloads/build")).unwrap();
+
+    let out = sandbox.rip("/home/u/Downloads/build", &["list"]);
+    assert_ok(&out, "list from the recreated cwd");
+    assert_eq!(
+        stdout_str(&out).trim_end(),
+        "2026-01-01 00:00:00  .",
+        "{}",
+        stdout_str(&out)
+    );
+
+    let out0 = sandbox.rip("/home/u/Downloads/build", &["list", "-0"]);
+    assert_ok(&out0, "list -0 from the recreated cwd");
+    assert_eq!(out0.stdout, b"2026-01-01 00:00:00\t.\0");
+
+    // The purge confirmation must also name the item, not print a blank
+    // line above an irreversible-delete prompt. Selected by its trash
+    // path, so the fake fzf picker (which selects nothing by default) is
+    // never involved.
+    let out = sandbox.rip_tty(
+        "/home/u/Downloads/build",
+        &["purge", "/home/u/.local/share/Trash/files/build"],
+        "n\n",
+    );
+    assert!(
+        stdout_str(&out).contains("2026-01-01 00:00:00  ."),
+        "{}",
+        stdout_str(&out)
+    );
+}
+
+// ---------------------------------------------------------------------------
 // purge
 // ---------------------------------------------------------------------------
 
