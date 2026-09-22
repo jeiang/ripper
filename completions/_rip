@@ -44,17 +44,23 @@ _rip_state() {
 }
 
 # Trashed original paths under the current directory, with the deletion
-# date as the description. A record's own embedded newline (from a hostile
-# or oddly named trashed path) survives `read -d ''`'s NUL split, so such a
-# record is skipped whole rather than split into extra candidates
-# (docs/design.md §2.1).
+# date shown alongside each one. `compadd -d dates -a paths` (without -l)
+# makes each date the DISPLAY string that *replaces* the match in the
+# listing instead of annotating it (zshcompwid: "display the first element
+# instead of the first word"), so the restore/purge menu would show only
+# dates and no paths. `-l -d displays -a paths` -- what _describe does
+# internally -- shows a full "PATH -- DATE" string per match instead, and
+# needs no colon-escaping the way _describe's own tag syntax would. A
+# record's own embedded newline (from a hostile or oddly named trashed
+# path) survives `read -d ''`'s NUL split, so such a record is skipped
+# whole rather than split into extra candidates (docs/design.md §2.1).
 _rip_trashed() {
     # `path` (and `PATH`) are tied special parameters (docs/design.md
     # §2.1): a local named `path` here would shadow the global one for
     # this whole function, including the `rip` below, which would then
     # fail to find `rip` on an empty $PATH. `orig` avoids that.
-    local -a paths dates
-    local rec date orig
+    local -a paths dates displays
+    local rec date orig i
     while IFS= read -r -d '' rec; do
         [[ $rec == *$'\n'* ]] && continue
         date=${rec%%$'\t'*}
@@ -62,7 +68,12 @@ _rip_trashed() {
         paths+=("$orig")
         dates+=("$date")
     done < <(rip list -0 2>/dev/null)
-    (( $#paths )) && compadd -d dates -a paths
+    if (( $#paths )); then
+        for ((i = 1; i <= $#paths; i++)); do
+            displays+=("$paths[i] -- $dates[i]")
+        done
+        compadd -l -d displays -a paths
+    fi
 }
 
 _rip() {

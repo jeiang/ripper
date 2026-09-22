@@ -188,6 +188,12 @@ inserted `My\ Doc`, or a still-open `'My Do`); `_rip_dequote` strips that
 before matching a file or trashed path, since `compgen -f` has the same
 problem matching a raw escaped prefix literally.
 
+zsh's `_rip_trashed` shows the deletion date next to each trashed path with
+`compadd -l -d displays -a paths` (display strings of the form
+`PATH -- DATE`, the same approach `_describe` uses internally): `-d` without
+`-l` makes the description array replace the match in the listing instead of
+annotating it, which would show only dates and no paths.
+
 ### 2.2 Exit codes
 
 | Code | Meaning |

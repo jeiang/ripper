@@ -172,16 +172,18 @@ fn complete_bash(sandbox: &Sandbox, cwd: &str, cmdline: &str) -> Vec<String> {
 /// `_describe` and this crate's own `_rip_trashed`/`_rip` actually pass:
 /// boolean short options (which may be bundled, e.g. `-Qf`), the arg-taking
 /// options, `-a`/`-k` (candidates are the *values* of the array/assoc-array
-/// NAMED by the remaining words, not the words themselves), and `-d`
-/// (per-candidate descriptions, by the same name-array indirection). Writes
-/// `CANDIDATE<TAB>DESCRIPTION` records, one per candidate, to `$RIP_CAPFILE`
-/// (set by the caller before sourcing this).
+/// NAMED by the remaining words, not the words themselves), and `-d` (the
+/// per-candidate DISPLAY string shown in the listing in place of the match,
+/// by the same name-array indirection -- not merely a "description": see
+/// `_rip_trashed` in `completions/_rip`). Writes `CANDIDATE<TAB>DISPLAY`
+/// records, one per candidate, to `$RIP_CAPFILE` (set by the caller before
+/// sourcing this).
 const ZSH_COMPADD_OVERRIDE: &str = r#"
 compadd() {
     local -a bool_chars=(a k q Q f e n U l C 1 2)
     local -a arg_opts=(F P S p s i I W d J X x V r R D O A E M o)
     local -a args=("$@")
-    local i=1 tok c mode=literal descref= is_bool idx
+    local i=1 tok c mode=literal dispref= is_bool idx
     while (( i <= $#args )); do
         tok=$args[i]
         if [[ $tok == -- || $tok == - ]]; then
@@ -200,7 +202,7 @@ compadd() {
                 continue
             fi
             if [[ $#tok -eq 2 && ${arg_opts[(Ie)${tok[2]}]} -ne 0 ]]; then
-                [[ $tok[2] == d ]] && descref=$args[i+1]
+                [[ $tok[2] == d ]] && dispref=$args[i+1]
                 i=$((i + 2))
                 continue
             fi
@@ -214,10 +216,10 @@ compadd() {
     assoc) for tok in $words; do cands+=("${(@k)${(P)tok}}"); done ;;
     *) cands=("$words[@]") ;;
     esac
-    local -a descs=()
-    [[ -n $descref ]] && descs=("${(@P)descref}")
+    local -a disps=()
+    [[ -n $dispref ]] && disps=("${(@P)dispref}")
     for (( idx = 1; idx <= $#cands; idx++ )); do
-        print -r -- "${cands[idx]}"$'\t'"${descs[idx]:-}"
+        print -r -- "${cands[idx]}"$'\t'"${disps[idx]:-}"
     done >> $RIP_CAPFILE
     builtin compadd "$@"
 }
@@ -853,10 +855,17 @@ fn zsh_restore_gives_planted_trashed_paths() {
         entry.is_some(),
         "expected the planted trashed path 'x': {got:?}"
     );
-    assert_eq!(
-        entry.unwrap().1,
-        "2026-01-01 00:00:00",
-        "the deletion date must show as x's description: {got:?}"
+    let display = &entry.unwrap().1;
+    // `compadd -d dates -a paths` (without `-l`) makes each date the
+    // display string that *replaces* the match in the listing, so a person
+    // restoring would see only dates and no paths at all.
+    assert!(
+        display.contains('x'),
+        "the restore menu's display for 'x' must still show its path: {got:?}"
+    );
+    assert!(
+        display.contains("2026-01-01 00:00:00"),
+        "the restore menu's display for 'x' must also show its deletion date: {got:?}"
     );
 }
 
