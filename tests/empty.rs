@@ -893,3 +893,196 @@ fn readonly_topdir_trash_with_nothing_selected_does_not_fail() {
         "the fresh item on the read-only trash must be kept, untouched"
     );
 }
+
+// ---------------------------------------------------------------------------
+// c2, c22 (review round, fix-empty.json)
+// ---------------------------------------------------------------------------
+
+/// c2: a `--max-size` batch is every item sharing one `DeletionDate` (one
+/// `rip` invocation). The newest batch here (`a` + `movie`, planted
+/// together) totals over `--max-size` on its own, so this must fail and
+/// delete nothing, regardless of which of the two sorts first by name.
+#[test]
+fn max_size_newest_batch_over_limit_deletes_nothing() {
+    let sandbox = Sandbox::artemis();
+    sandbox.plant(
+        "/home/u/.local/share/Trash",
+        b"a_notes",
+        b"/home/u/Downloads/a_notes",
+        "2026-09-01T12:00:00",
+        Body::File(file_of(1024)),
+    );
+    sandbox.plant(
+        "/home/u/.local/share/Trash",
+        b"movie.mkv",
+        b"/home/u/Downloads/movie.mkv",
+        "2026-09-01T12:00:00",
+        Body::File(file_of(8192)),
+    );
+    sandbox.plant(
+        "/home/u/.local/share/Trash",
+        b"older",
+        b"/home/u/Downloads/older",
+        "2026-08-01T12:00:00",
+        Body::File(file_of(1024)),
+    );
+
+    let out = sandbox.rip("/", &["empty", "--max-size", "4K", "-y"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+
+    let trash_host = sandbox.host("/home/u/.local/share/Trash");
+    assert!(
+        trash_host.join("files/a_notes").is_file(),
+        "nothing may be deleted: the newest batch alone is over --max-size"
+    );
+    assert!(
+        trash_host.join("files/movie.mkv").is_file(),
+        "movie.mkv must not be singled out just because a_notes sorts before it by name"
+    );
+    assert!(
+        trash_host.join("files/older").is_file(),
+        "an older item must not be deleted either when the newest batch alone overflows"
+    );
+}
+
+/// c2: an older (non-newest) batch of two same-`DeletionDate` items must be
+/// deleted as a whole, never split so that only the one that sorts first by
+/// name goes.
+#[test]
+fn max_size_does_not_split_an_older_batch() {
+    let sandbox = Sandbox::artemis();
+    sandbox.plant(
+        "/home/u/.local/share/Trash",
+        b"newest",
+        b"/home/u/Downloads/newest",
+        "2026-01-03T00:00:00",
+        Body::File(file_of(1024)),
+    );
+    // "b_small" and "c_big" share one DeletionDate: one batch. Together
+    // they overflow --max-size, even though "b_small" alone would not (it
+    // sorts first, so a per-item cascade would wrongly keep it and delete
+    // only "c_big").
+    sandbox.plant(
+        "/home/u/.local/share/Trash",
+        b"b_small",
+        b"/home/u/Downloads/b_small",
+        "2026-01-01T00:00:00",
+        Body::File(file_of(1024)),
+    );
+    sandbox.plant(
+        "/home/u/.local/share/Trash",
+        b"c_big",
+        b"/home/u/Downloads/c_big",
+        "2026-01-01T00:00:00",
+        Body::File(file_of(3072)),
+    );
+
+    let out = sandbox.rip("/", &["empty", "--max-size", "2K", "-y"]);
+    assert_ok(&out);
+
+    let trash_host = sandbox.host("/home/u/.local/share/Trash");
+    assert!(
+        trash_host.join("files/newest").is_file(),
+        "the newest must stay"
+    );
+    assert!(
+        !trash_host.join("files/b_small").exists(),
+        "the whole older batch must go, not just the one that sorts last"
+    );
+    assert!(
+        !trash_host.join("files/c_big").exists(),
+        "the whole older batch must go, not just the one that sorts first"
+    );
+}
+
+/// c22: the prompt must not walk every un-sized doomed entry just to show a
+/// size. Here "old" is doomed only by the cascade past the overflow point
+/// and was never individually sized during selection, so the size must be
+/// left out of the prompt rather than computed for it.
+#[test]
+fn max_size_prompt_omits_size_when_not_fully_known() {
+    let sandbox = Sandbox::artemis();
+    sandbox.plant(
+        "/home/u/.local/share/Trash",
+        b"newest",
+        b"/home/u/Downloads/newest",
+        "2026-01-03T00:00:00",
+        Body::File(file_of(1024)),
+    );
+    sandbox.plant(
+        "/home/u/.local/share/Trash",
+        b"mid",
+        b"/home/u/Downloads/mid",
+        "2026-01-02T00:00:00",
+        Body::File(file_of(2048)),
+    );
+    sandbox.plant(
+        "/home/u/.local/share/Trash",
+        b"old",
+        b"/home/u/Downloads/old",
+        "2026-01-01T00:00:00",
+        Body::File(file_of(4096)),
+    );
+
+    let out = sandbox.rip_tty("/", &["empty", "--max-size", "1500"], "n\n");
+    assert!(out.status.success(), "declined prompt must exit 0: {out:?}");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("permanently delete 2 items"),
+        "expected the doomed count in the prompt: {text}"
+    );
+    assert!(
+        !text.contains('('),
+        "the prompt must not show a size that required walking an un-sized \
+         doomed entry to compute: {text}"
+    );
+
+    let trash_host = sandbox.host("/home/u/.local/share/Trash");
+    assert!(
+        trash_host.join("files/newest").is_file(),
+        "declined, nothing deleted"
+    );
+    assert!(trash_host.join("files/mid").is_file());
+    assert!(trash_host.join("files/old").is_file());
+}
+
+/// c22: when every doomed entry's size was already computed while deciding
+/// the cascade (here, the sole doomed entry is also the one that overflows
+/// `--max-size`), the prompt does show it.
+#[test]
+fn max_size_prompt_shows_size_when_already_known() {
+    let sandbox = Sandbox::artemis();
+    sandbox.plant(
+        "/home/u/.local/share/Trash",
+        b"newest",
+        b"/home/u/Downloads/newest",
+        "2026-01-02T00:00:00",
+        Body::File(file_of(1024)),
+    );
+    sandbox.plant(
+        "/home/u/.local/share/Trash",
+        b"old",
+        b"/home/u/Downloads/old",
+        "2026-01-01T00:00:00",
+        Body::File(file_of(2048)),
+    );
+
+    let out = sandbox.rip_tty("/", &["empty", "--max-size", "1500"], "n\n");
+    assert!(out.status.success(), "declined prompt must exit 0: {out:?}");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("permanently delete 1 items"),
+        "expected the doomed count in the prompt: {text}"
+    );
+    assert!(
+        text.contains("2.0 KiB"),
+        "the prompt must show the size once the only doomed entry was already \
+         sized deciding the cascade: {text}"
+    );
+
+    let trash_host = sandbox.host("/home/u/.local/share/Trash");
+    assert!(
+        trash_host.join("files/old").is_file(),
+        "declined, nothing deleted"
+    );
+}
