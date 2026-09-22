@@ -523,6 +523,19 @@ fn flag_immutable(m: &Meta, rel: &Path, w: &mut Walk) {
     }
 }
 
+/// `accessat(W_OK)` catches an immutable parent (the kernel's
+/// `inode_permission` refuses `MAY_WRITE` for `IS_IMMUTABLE`) but not an
+/// append-only one: `IS_APPEND` is enforced only in `may_delete`, which
+/// `unlinkat`/`rmdir` hit later, after `rip` has already published a copy
+/// and started deleting the source (docs/design.md c12). Checked here, on
+/// the parent `Meta` the caller already fetched, so the whole tree is
+/// refused up front like every other `removable_top_checks` reason.
+fn parent_flags_problem(pm: &Meta) -> Option<String> {
+    pm.attrs
+        .intersects(StatxAttributes::IMMUTABLE | StatxAttributes::APPEND)
+        .then(|| "its parent directory is immutable or append-only".to_string())
+}
+
 /// docs/design.md §6.6 bullets 1-3: unlinking the operand itself needs
 /// write+exec on its parent and, if the parent is sticky, ownership of the
 /// parent or the operand; the operand itself must not be immutable/append;
@@ -543,6 +556,9 @@ fn removable_top_checks(parent: BorrowedFd<'_>, name: &OsStr, top: &Meta, uid: u
         w.problem.get_or_insert(msg);
     }
     if let Ok(pm) = stat_at(parent, ".") {
+        if let Some(msg) = parent_flags_problem(&pm) {
+            w.problem.get_or_insert(msg);
+        }
         if pm.sticky() && pm.uid != uid && top.uid != uid {
             w.problem.get_or_insert_with(|| {
                 format!(
@@ -1058,6 +1074,26 @@ mod tests {
 
         let w = walk(r.as_fd(), OsStr::new("link"), Check::Size).unwrap();
         assert_eq!(w.size, target.len() as u64);
+    }
+
+    #[test]
+    fn parent_flags_problem_catches_append_only_which_accessat_would_miss() {
+        // docs/design.md c12: chattr +a needs CAP_LINUX_IMMUTABLE, which the
+        // bwrap sandbox cannot grant, so this exercises the fixed check
+        // directly on a synthetic parent Meta rather than through a real
+        // chattr'd directory. accessat(W_OK) alone would NOT catch this: the
+        // kernel only enforces IS_APPEND in may_delete (unlink/rmdir), not
+        // in the MAY_WRITE check accessat makes.
+        let mut pm = synthetic_file_meta(Dev(1, 0), 99, 0, (0, 0));
+        pm.mode = S_IFDIR | 0o755;
+        pm.attrs = StatxAttributes::APPEND;
+        assert!(parent_flags_problem(&pm).is_some());
+
+        pm.attrs = StatxAttributes::IMMUTABLE;
+        assert!(parent_flags_problem(&pm).is_some());
+
+        pm.attrs = StatxAttributes::empty();
+        assert!(parent_flags_problem(&pm).is_none());
     }
 
     #[test]
