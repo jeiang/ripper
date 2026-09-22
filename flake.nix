@@ -9,9 +9,19 @@
       linux = [ "x86_64-linux" "aarch64-linux" ];
       forSystems = systems: f: lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
 
+      # Single source of truth for the package version: `cargo` and the
+      # release tooling (`just release`) both read Cargo.toml directly.
+      version = (lib.importTOML ./Cargo.toml).package.version;
+
+      meta = {
+        description = "Move files to the freedesktop.org trash, across btrfs subvolumes and bind mounts";
+        mainProgram = "rip";
+        platforms = lib.platforms.linux;
+      };
+
       ripper = pkgs: pkgs.rustPlatform.buildRustPackage {
         pname = "ripper";
-        version = "0.1.0";
+        inherit version;
         src = ./.;
         cargoLock.lockFile = ./Cargo.lock;
         nativeBuildInputs = [ pkgs.installShellFiles pkgs.makeWrapper ];
@@ -32,15 +42,26 @@
         postFixup = ''
           wrapProgram $out/bin/rip --prefix PATH : ${lib.makeBinPath [ pkgs.coreutils pkgs.fzf ]}
         '';
-        meta = {
-          description = "Move files to the freedesktop.org trash, across btrfs subvolumes and bind mounts";
-          mainProgram = "rip";
-          platforms = lib.platforms.linux;
-        };
+        inherit meta;
+      };
+
+      # A standalone static binary for the GitHub release (.github/workflows/release.yml):
+      # no PATH wrapping (the release tarball needs GNU coreutils and fzf on the
+      # user's own PATH instead, documented in README.md) and no completions
+      # install (the release packs completions/ itself).
+      ripperStatic = pkgs: pkgs.pkgsStatic.rustPlatform.buildRustPackage {
+        pname = "ripper";
+        inherit version;
+        src = ./.;
+        cargoLock.lockFile = ./Cargo.lock;
+        cargoTestFlags = [ "--bins" ];
+        inherit meta;
       };
     in
     {
-      packages = forSystems linux (pkgs: { default = ripper pkgs; ripper = ripper pkgs; });
+      packages = lib.recursiveUpdate
+        (forSystems linux (pkgs: { default = ripper pkgs; ripper = ripper pkgs; }))
+        { x86_64-linux.static = ripperStatic nixpkgs.legacyPackages.x86_64-linux; };
       checks = forSystems linux (pkgs: { build = ripper pkgs; });
       # darwin: editing, `cargo fmt` and `cargo generate-lockfile` on zakkart only.
       devShells = forSystems (linux ++ [ "aarch64-darwin" ]) (pkgs: {
