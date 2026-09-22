@@ -32,6 +32,10 @@ fn main() -> ExitCode {
 /// has no `PartialEq`) so tests can assert on the result directly; `main` is
 /// the only caller that wraps it for the real process exit.
 fn dispatch(cli: Cli) -> u8 {
+    // Best effort; a deep tree can otherwise hit EMFILE in remove_tree/walk
+    // well under 1024 open fds (docs/design.md §6 "RLIMIT_NOFILE raise").
+    sys::raise_nofile();
+
     if let Some(shell) = cli.completions {
         let mut out = io::stdout().lock();
         let _ = out.write_all(&completions_script(shell));
@@ -849,5 +853,40 @@ mod tests {
     fn completions_fish_matches_file() {
         let expected = include_bytes!("../completions/rip.fish").to_vec();
         assert_eq!(completions_script(Shell::Fish), expected);
+    }
+
+    // ---- startup (c5) ----
+
+    // Regression for c5: sys::raise_nofile() was defined but never called
+    // outside its own unit test, so `empty`/`purge`/`put` hit EMFILE on a
+    // tree only about 1000 levels deep under the common default soft limit
+    // of 1024 (docs/design.md §6 "RLIMIT_NOFILE raise"). This drives it
+    // through `dispatch`, the real per-invocation entry point, rather than
+    // calling `sys::raise_nofile` directly, so the test fails if the call in
+    // `dispatch` is ever removed. It lowers and restores the process's own
+    // soft limit; the margin (1 fd) is far too small to affect any other
+    // test running concurrently.
+    #[test]
+    fn dispatch_raises_the_soft_nofile_limit() {
+        use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+
+        let before = getrlimit(Resource::Nofile);
+        let Some(max) = before.maximum else {
+            return; // unlimited hard limit: nothing to raise toward
+        };
+        let lowered = Rlimit {
+            current: Some(max.saturating_sub(1).max(1)),
+            maximum: Some(max),
+        };
+        if setrlimit(Resource::Nofile, lowered).is_err() {
+            return; // no permission to lower it on this host: skip
+        }
+
+        let cli = try_parse(&["rip", "--completions", "bash"]).unwrap();
+        dispatch(cli);
+
+        let after = getrlimit(Resource::Nofile);
+        let _ = setrlimit(Resource::Nofile, before); // best-effort restore
+        assert_eq!(after.current, Some(max), "dispatch did not raise NOFILE");
     }
 }

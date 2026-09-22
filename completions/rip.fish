@@ -16,7 +16,18 @@ function __rip_state
                 return
             case --config --completions
                 set skip 1
-            case '-?*'
+            case '--config=*' '--completions=*' -h --help -V --version
+                # inline value, or a flag the parser leaves state unchanged
+                # for (src/main.rs first_word()): keep scanning.
+            case '-*'
+                # An rm-style flag before a subcommand is a parse error
+                # (src/main.rs first_word()), so from here only files make
+                # sense. NOTE: fish 4's qmark-noglob feature (default since
+                # fish 4.0) makes '?' a literal character in a glob, not a
+                # wildcard, so a `case '-?*'` here would never match a real
+                # option (it matched every one under fish 3). Use '-*'.
+                echo files
+                return
             case '*'
                 if contains -- $t undo list restore empty purge
                     echo $t
@@ -34,9 +45,21 @@ function __rip_is
 end
 
 # Trashed original paths under the current directory, with the deletion date
-# as the description.
+# as the description. `string split0` must be the LAST command of the
+# `(...)` command substitution below: fish then splits its output on NUL and
+# keeps any newline inside a record. Piping that further into `string
+# replace` (as this used to) loses that guarantee -- `string replace` reads
+# its stdin one line at a time, and `complete`'s own `(__rip_trashed)`
+# substitution also splits on newlines -- so a trashed path holding a literal
+# newline forged extra completion candidates out of whatever followed it. A
+# record with a newline is skipped instead: it just does not complete.
 function __rip_trashed
-    rip list -0 2>/dev/null | string split0 | string replace -r '^([^\t]*)\t(.*)$' '$2\t$1'
+    for r in (rip list -0 2>/dev/null | string split0)
+        if string match -qr '\n' -- $r
+            continue
+        end
+        string replace -r '^([^\t]*)\t(.*)$' '$2\t$1' -- $r
+    end
 end
 
 complete -c rip -n '__rip_is first' -a undo -d 'Restore the last batch'

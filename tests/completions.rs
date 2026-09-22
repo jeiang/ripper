@@ -104,3 +104,122 @@ fn restore_gives_planted_trashed_paths() {
         "expected the planted trashed path 'x': {got:?}"
     );
 }
+
+// ---- c29: fish 4's qmark-noglob made `-?*` a dead pattern, so ANY option
+// word (not just `--config=PATH`) fell to `case '*'`, and every one of them
+// -- including `--config=PATH` -- was treated as a non-option, ending the
+// scan and reporting "files". ----
+
+#[test]
+fn config_equals_form_still_gives_subcommands_at_the_first_word() {
+    let sandbox = Sandbox::artemis();
+    std::fs::write(sandbox.host("/home/u/Downloads").join("c.toml"), b"").unwrap();
+
+    let got = complete(&sandbox, "/home/u/Downloads", "rip --config=c.toml ");
+    for sub in SUBCOMMANDS {
+        assert!(
+            got.iter().any(|w| w == sub),
+            "missing subcommand {sub} after --config=PATH: {got:?}"
+        );
+    }
+}
+
+#[test]
+fn config_equals_form_then_restore_gives_trashed_paths_not_cwd_files() {
+    let sandbox = Sandbox::artemis();
+    std::fs::write(sandbox.host("/home/u/Downloads").join("c.toml"), b"").unwrap();
+    sandbox.plant(
+        "/home/u/.local/share/Trash",
+        b"x",
+        b"/home/u/Downloads/x",
+        "2026-01-01T00:00:00",
+        Body::File(b"data".to_vec()),
+    );
+
+    let got = complete(
+        &sandbox,
+        "/home/u/Downloads",
+        "rip --config=c.toml restore ",
+    );
+    assert!(
+        got.iter().any(|w| w == "x"),
+        "expected the planted trashed path 'x' after --config=PATH restore: {got:?}"
+    );
+    assert!(
+        !got.iter().any(|w| w == "c.toml"),
+        "must not fall back to cwd files after --config=PATH restore: {got:?}"
+    );
+}
+
+#[test]
+fn rm_style_flag_before_a_subcommand_gives_files_only() {
+    let sandbox = Sandbox::artemis();
+    std::fs::write(sandbox.host("/home/u/Downloads").join("fixture.txt"), b"x").unwrap();
+
+    let got = complete(&sandbox, "/home/u/Downloads", "rip -f ");
+    for sub in SUBCOMMANDS {
+        assert!(
+            !got.iter().any(|w| w == sub),
+            "unexpected subcommand {sub} after an rm-style flag: {got:?}"
+        );
+    }
+    assert!(
+        got.iter().any(|w| w == "fixture.txt"),
+        "files must still complete after an rm-style flag: {got:?}"
+    );
+}
+
+#[test]
+fn help_flag_does_not_lock_out_subcommands() {
+    // -h is neither an rm-style flag nor a --config/--completions value
+    // (src/main.rs's first_word() leaves the scan state unchanged for it),
+    // so it must not be treated like `-f` and lock the state to "files".
+    let sandbox = Sandbox::artemis();
+    let got = complete(&sandbox, "/home/u/Downloads", "rip -h ");
+    assert!(
+        got.iter().any(|w| w == "list"),
+        "-h must not change the completion state: {got:?}"
+    );
+}
+
+// ---- c28: piping `string split0`'s output further (into `string replace`,
+// then again through `complete`'s own `(__rip_trashed)` command
+// substitution) re-splits on any newline embedded in a trashed path, so a
+// hostile or merely oddly named file forged extra candidates out of
+// whatever text followed the newline. ----
+
+#[test]
+fn restore_skips_a_trashed_path_with_an_embedded_newline() {
+    let sandbox = Sandbox::artemis();
+    // A trashed item whose original path holds a literal newline (e.g. from
+    // an extracted archive) -- no planted/hostile topdir needed.
+    sandbox.plant(
+        "/home/u/.local/share/Trash",
+        b"evil",
+        b"/home/u/Downloads/a\n/etc/attacker-controlled",
+        "2026-01-01T00:00:00",
+        Body::File(b"x".to_vec()),
+    );
+    // An unaffected item must still complete normally.
+    sandbox.plant(
+        "/home/u/.local/share/Trash",
+        b"good",
+        b"/home/u/Downloads/good",
+        "2026-01-02T00:00:00",
+        Body::File(b"y".to_vec()),
+    );
+
+    let got = complete(&sandbox, "/home/u/Downloads", "rip restore ");
+    assert!(
+        !got.iter().any(|w| w == "/etc/attacker-controlled"),
+        "a newline in a trashed path must not forge a completion candidate: {got:?}"
+    );
+    assert!(
+        !got.iter().any(|w| w == "a"),
+        "the newline-bearing record must be skipped whole, not split: {got:?}"
+    );
+    assert!(
+        got.iter().any(|w| w == "good"),
+        "an item unaffected by the newline must still complete: {got:?}"
+    );
+}

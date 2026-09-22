@@ -47,7 +47,9 @@
         default = pkgs.mkShell {
           packages = with pkgs; [ cargo rustc clippy rustfmt rust-analyzer just ]
             # Sandbox tests: bwrap, btrfs subvolumes, `script` for terminals, fish and fzf.
-            ++ lib.optionals stdenv.hostPlatform.isLinux [ bubblewrap btrfs-progs util-linux fish fzf ];
+            # zsh and bash-completion: manually checking the generated bash/zsh
+            # completions (`rip --completions bash|zsh`) in a real shell.
+            ++ lib.optionals stdenv.hostPlatform.isLinux [ bubblewrap btrfs-progs util-linux fish fzf zsh bash-completion ];
         };
       });
     };
