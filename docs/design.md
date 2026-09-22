@@ -155,17 +155,24 @@ clap (see `first_word` in `src/main.rs`):
 | `rip --completions fish foo` | Exit 2: `--completions` is `exclusive`, so combining it with another argument is a clap usage error and nothing is printed. |
 | `rip` / `rip -f` | Exit 2 "missing operand" / exit 0. `main` checks this after parsing. |
 
-Fish's completion script (`completions/rip.fish`) is hand-written, not generated: it
-mirrors `first_word`'s own file-vs-subcommand resolution at completion time, which
-clap's static bash/zsh generators cannot do. Two fixes it needed: fish 4's
-qmark-noglob feature (default since fish 4.0) makes `?` a literal character in a
-glob rather than a wildcard, so its rm-style-flag pattern must be `'-*'`, not
-`'-?*'` (which stopped matching any real flag under fish 4); and trashed-path
-completion (`__rip_trashed`) must iterate `rip list -0`'s NUL-split records
-directly and skip any record containing a newline, since piping the split output
-further into `string replace` (which reads its stdin line by line) lost the NUL
-boundary and let a trashed path with an embedded newline forge extra completion
-candidates out of whatever followed it.
+All three completion scripts (`completions/rip.bash`, `completions/_rip`,
+`completions/rip.fish`) are hand-written, not generated: each mirrors
+`first_word`'s own file-vs-subcommand resolution at completion time (a
+`_rip_state`/`__rip_state` function classifying the words before the cursor
+into `first`, `files`, `--`, or a subcommand name, the same way `first_word`
+classifies argv), which clap's static generators cannot do, and each offers
+trashed original paths for `restore`/`purge` from `rip list -0`, which no
+generated completion can do either. Two correctness fixes recur across them:
+a trashed path's own embedded newline must never forge extra completion
+candidates (each shell's NUL-delimited read keeps such a record's newline
+part of it, and the record is then skipped whole rather than split); and a
+candidate containing a space or another shell metacharacter (a file or a
+trashed path) must be inserted correctly quoted (bash: `compopt -o
+filenames`, collecting each candidate without word-splitting it; zsh:
+`compadd`'s own quoting). Fish also needed a fix specific to it: fish 4's
+qmark-noglob feature (default since fish 4.0) makes `?` a literal character
+in a glob rather than a wildcard, so its rm-style-flag pattern must be
+`'-*'`, not `'-?*'` (which stopped matching any real flag under fish 4).
 
 ### 2.2 Exit codes
 
