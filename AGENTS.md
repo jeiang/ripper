@@ -20,3 +20,13 @@ btrfs subvolumes and bind mounts (NixOS impermanence). Design: docs/design.md.
 - Never run doas or sudo on artemis.
 - Conventional Commits. Commit each working checkpoint; push main after `just check` and
   `just test` pass on Linux.
+
+## Release
+- Every user-facing change (behavior, command line, completions, package, config) adds one
+  line under `## [Unreleased]` in CHANGELOG.md, in the same commit.
+- From 1.0.0, every push to main that changes what users get is a release: patch for fixes,
+  minor for features, major for breaking changes. Make it with `just release VERSION`, push
+  main, wait for CI to go green, then `git push origin vX.Y.Z` (the tag triggers
+  .github/workflows/release.yml).
+- A push that touches only docs, tests or CI keeps its line(s) under `## [Unreleased]` and
+  makes no release.
