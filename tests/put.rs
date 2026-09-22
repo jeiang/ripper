@@ -1145,3 +1145,71 @@ fn read_only_mount_is_refused_not_routed_around() {
         "must not have been routed around the read-only view into the trash"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Hostile output (docs/design.md c7): a name with terminal escapes must
+// never reach a real terminal raw, in any human-facing message put.rs
+// builds. Run on a real pty (`rip_tty`) the same way `list`'s own escaping
+// test does, since a plain pipe does not exercise terminal semantics.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn verbose_rename_destination_escapes_a_hostile_name() {
+    let sandbox = Sandbox::artemis();
+    let base = sandbox.host("/home/u/Downloads");
+    let name = "x\x1b]0;PWNED\x07\x1b[2J";
+    std::fs::write(base.join(name), b"hello").unwrap();
+
+    let out = sandbox.rip_tty("/home/u/Downloads", &["-v", name], "");
+    assert!(out.status.success());
+    let tty = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !tty.contains('\x1b'),
+        "raw ESC reached the terminal: {tty:?}"
+    );
+    assert!(tty.contains("\\x1b"), "{tty:?}");
+}
+
+#[test]
+fn copy_fallback_notice_and_verbose_destination_escape_a_hostile_name() {
+    // Exercises both the "has no usable trash on its filesystem" notice and
+    // -v's "copied 'X' -> DEST" line, both printed from copy_to_home.
+    let sandbox = Sandbox::artemis();
+    let base = sandbox.host("/home/u");
+    std::fs::create_dir_all(&base).unwrap();
+    let name = "y\x1b]0;PWNED\x07";
+    std::fs::write(base.join(name), b"data").unwrap();
+
+    let out = sandbox.rip_tty("/home/u", &["-v", name], "");
+    assert!(out.status.success());
+    let tty = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !tty.contains('\x1b'),
+        "raw ESC reached the terminal: {tty:?}"
+    );
+    assert!(tty.contains("\\x1b"), "{tty:?}");
+}
+
+#[test]
+fn walk_problem_message_escapes_a_hostile_entry_name() {
+    // sys.rs's walk-problem messages (an unreadable entry inside a tree
+    // taking the copy fallback) embed the entry's own name too.
+    let sandbox = Sandbox::artemis();
+    let base = sandbox.host("/home/u");
+    std::fs::create_dir_all(base.join("top")).unwrap();
+    let name = "bad\x1b]0;PWNED\x07";
+    let secret = base.join("top").join(name);
+    std::fs::write(&secret, b"x").unwrap();
+    std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let out = sandbox.rip_tty("/home/u", &["top"], "");
+    std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    assert!(!out.status.success());
+    let tty = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !tty.contains('\x1b'),
+        "raw ESC reached the terminal: {tty:?}"
+    );
+    assert!(tty.contains("\\x1b"), "{tty:?}");
+}

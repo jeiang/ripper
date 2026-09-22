@@ -504,16 +504,22 @@ enum Done {
 }
 
 impl Done {
-    /// `-v` output (design §2.3: goes to stdout).
+    /// `-v` output (design §2.3: goes to stdout). `dest` embeds the item's
+    /// trashed name, which carries the operand's own (possibly hostile)
+    /// bytes verbatim aside from a collision suffix, so it goes through
+    /// `show` the same as `arg` (docs/design.md c7: human output never
+    /// writes an untrusted name raw to the terminal).
     fn print(&self, arg: &Path) {
         match self {
-            Done::Moved(dest) => println!("trashed '{}' -> {}", show(arg), dest.display()),
-            Done::Copied(dest, size) => println!(
-                "copied '{}' ({}) -> {}",
-                show(arg),
-                human(*size),
-                dest.display()
-            ),
+            Done::Moved(dest) => println!("trashed '{}' -> {}", show(arg), show(dest)),
+            Done::Copied(dest, size) => {
+                println!(
+                    "copied '{}' ({}) -> {}",
+                    show(arg),
+                    human(*size),
+                    show(dest)
+                )
+            }
             Done::Declined => {}
         }
     }
@@ -721,7 +727,7 @@ fn move_in(
 fn removal_summary(rm: &Removal) -> String {
     rm.kept
         .iter()
-        .map(|(p, why)| format!("{}: {why}", p.display()))
+        .map(|(p, why)| format!("{}: {why}", show(p)))
         .collect::<Vec<_>>()
         .join("; ")
 }
@@ -754,7 +760,7 @@ fn copy_to_home(
         && !confirm(
             &format!(
                 "'{}' ({}) has no usable trash on its filesystem ({why}). Copy it into {} and delete the original?",
-                path.display(),
+                show(path),
                 human(w.size),
                 s.home().path.display()
             ),
@@ -765,7 +771,7 @@ fn copy_to_home(
     }
     eprintln!(
         "rip: '{}' has no usable trash on its filesystem ({why}); copying {} into the home trash",
-        path.display(),
+        show(path),
         human(w.size)
     );
 
@@ -860,7 +866,7 @@ fn copy_to_home(
     if !rm.kept.is_empty() {
         return Err(format!(
             "the trash holds a complete copy ({}); these source entries were kept: {}",
-            home.path.join("files").join(&n).display(),
+            show(&home.path.join("files").join(&n)),
             removal_summary(&rm)
         )
         .into());
