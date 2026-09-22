@@ -23,12 +23,12 @@ and `rip` uses [Semantic Versioning](https://semver.org/).
   files with no trash reachable by rename, configured by
   `$XDG_CONFIG_HOME/ripper/config.toml` or `--config PATH`.
 - Confirmation prompts before `empty`, `purge` and a large copy fallback,
-  skippable with `-y` (subcommands) or `-f` (root); nothing irreversible
-  happens without a terminal.
+  skippable with `-y` (subcommands) or `-f` (root); without a terminal, a
+  needed prompt fails instead of proceeding.
 - `restore`/`purge` by original path, by a trash `files/` entry, or with no
   arguments through an fzf multi-select picker (`--all`, `--rename`).
-- `empty --older-than DUR` and `--max-size SIZE` filters, plus automatic
-  cleanup of orphaned and dangling trash entries on every `empty`.
+- `empty --older-than DUR` and `--max-size SIZE` filters; every `empty` also
+  removes dangling `.trashinfo` files that have no trashed item.
 - Hand-written completions for fish, bash and zsh
   (`rip --completions bash|zsh|fish`), including trashed-path completion for
   `restore`/`purge`.

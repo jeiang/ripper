@@ -110,9 +110,15 @@ awk -v ver="$VERSION" -v date="$date" '
 ' CHANGELOG.md >"$tmp" && mv "$tmp" CHANGELOG.md
 
 git add Cargo.toml Cargo.lock CHANGELOG.md
-git commit -m "chore(release): v$VERSION
+# RELEASE_TRAILER: an optional trailer line for the commit, such as an
+# agent's Co-Authored-By line.
+msg="chore(release): v$VERSION"
+if [ -n "${RELEASE_TRAILER:-}" ]; then
+  msg="$msg
 
-Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
+$RELEASE_TRAILER"
+fi
+git commit -m "$msg"
 git tag -a "v$VERSION" -m "v$VERSION"
 
 echo "release: committed and tagged v$VERSION locally."
