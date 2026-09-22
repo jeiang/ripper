@@ -294,7 +294,7 @@ pub fn open_trash(path: &Path, kind: Kind, base: &Path, uid: u32) -> io::Result<
         return Ok(None);
     }
     // `missing_ok: false`: rip itself always creates a topdir trash's
-    // `files/` and `info/` together (`topdir_trash`, C4a) before ever
+    // `files/` and `info/` together (`put::topdir_trash`) before ever
     // returning it from discovery, so one existing without them is unusual
     // enough to warn about rather than silently skip.
     finish_open(dir, kind, path.to_path_buf(), base.to_path_buf(), false)
