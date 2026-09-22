@@ -496,7 +496,7 @@ impl Cx {
                 eprintln!(
                     "rip: cannot determine the current directory ({e}); \
                      using {} instead; a relative operand or PATH may fail",
-                    fallback.display()
+                    escape(fallback.as_os_str().as_bytes())
                 );
                 fallback
             }

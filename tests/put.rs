@@ -12,7 +12,7 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-use common::Sandbox;
+use common::{Body, Sandbox};
 use rustix::process::getuid;
 
 fn inode(path: &Path) -> (u64, u64) {
@@ -1212,4 +1212,99 @@ fn walk_problem_message_escapes_a_hostile_entry_name() {
         "raw ESC reached the terminal: {tty:?}"
     );
     assert!(tty.contains("\\x1b"), "{tty:?}");
+}
+
+// ---------------------------------------------------------------------------
+// A deleted cwd (docs/design.md c26): each `Sandbox::rip` call starts a
+// fresh process with a fresh, valid cwd, so reproducing c26 needs one bwrap
+// session that runs several `rip` invocations from a single shell, the
+// first of which trashes the directory that shell is sitting in.
+// ---------------------------------------------------------------------------
+
+/// Like `run_bwrap`, but runs `bash -c script` instead of a single `rip`
+/// invocation: every command in `script` shares this one process's cwd, so
+/// once the script itself trashes that directory (through the copy
+/// fallback, which genuinely unlinks it rather than just renaming it
+/// elsewhere), every later command in the script runs with a cwd `getcwd`
+/// can no longer resolve at all.
+fn run_bwrap_shell(sandbox: &Sandbox, cwd: &str, script: &str) -> Output {
+    let mut c = base_bwrap(sandbox);
+    c.args([
+        "--clearenv",
+        "--setenv",
+        "HOME",
+        "/home/u",
+        "--setenv",
+        "XDG_CONFIG_HOME",
+        "/home/u/.config",
+    ]);
+    let mut path_entries = vec![PathBuf::from("/run/rip/bin")];
+    if let Some(host_path) = std::env::var_os("PATH") {
+        path_entries
+            .extend(std::env::split_paths(&host_path).filter(|p| p.starts_with("/nix/store")));
+    }
+    c.arg("--setenv")
+        .arg("PATH")
+        .arg(std::env::join_paths(path_entries).expect("PATH entries must not contain ':' or NUL"));
+    c.args(["--chdir", cwd, "--", "bash", "-c", script]);
+    c.stdin(Stdio::null());
+    c.output().expect("spawn bwrap for run_bwrap_shell")
+}
+
+#[test]
+fn commands_run_from_a_deleted_cwd_do_not_exit_2() {
+    let sandbox = Sandbox::artemis();
+    // An older item, distinguishable from D by DeletionDate, restorable by
+    // an absolute PATH once the shell's cwd is gone.
+    sandbox.plant(
+        "/home/u/.local/share/Trash",
+        b"old",
+        b"/home/u/Documents/old",
+        "2020-01-01T00:00:00",
+        Body::File(b"OLD ITEM".to_vec()),
+    );
+
+    // "/mnt/side" is another subvolume of the home trash's own filesystem
+    // (docs/design.md §13.2 table): trashing a directory there takes the
+    // copy fallback, which `remove_tree`s the original outright, instead of
+    // a same-subvolume rename that would just leave it reachable under a
+    // new name in files/. A shell sitting in that directory then loses
+    // `getcwd()` entirely, not just its displayed path.
+    let d = sandbox.host("/mnt/side").join("D");
+    std::fs::create_dir(&d).unwrap();
+    std::fs::write(d.join("f"), b"D's own file").unwrap();
+
+    let script = "\
+/run/rip/bin/rip ../D; echo TRASH_EXIT=$?
+/run/rip/bin/rip list --all; echo LIST_EXIT=$?
+/run/rip/bin/rip undo -y; echo UNDO_EXIT=$?
+/run/rip/bin/rip restore -y /home/u/Documents/old; echo RESTORE_EXIT=$?
+";
+    let out = run_bwrap_shell(&sandbox, "/mnt/side/D", script);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "the session's own shell failed: {text} stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for marker in [
+        "TRASH_EXIT=0",
+        "LIST_EXIT=0",
+        "UNDO_EXIT=0",
+        "RESTORE_EXIT=0",
+    ] {
+        assert!(text.contains(marker), "{marker} missing from: {text}");
+    }
+    assert!(
+        !text.contains("EXIT=2"),
+        "a command run from the deleted cwd exited 2: {text}"
+    );
+
+    // D itself came back through `undo` (it is the newest DeletionDate:
+    // just trashed by this same script, versus "old"'s 2020 date).
+    assert_eq!(std::fs::read(d.join("f")).unwrap(), b"D's own file");
+
+    // "old" came back through the absolute-path restore.
+    let old = sandbox.host("/home/u/Documents/old");
+    assert_eq!(std::fs::read(&old).unwrap(), b"OLD ITEM");
 }
