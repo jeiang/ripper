@@ -1,4 +1,4 @@
-//! The bwrap sandbox harness (docs/design.md §13.2). Every integration test
+//! The bwrap sandbox harness (docs/design.md §3.2). Every integration test
 //! that runs `rip` runs it inside `Sandbox`, which gives it a fresh user, PID
 //! and mount namespace and only the listed binds: it cannot see or change the
 //! real home trash, `/mnt/Mumei` or the stray `.Trash-*` dirs on the host that
@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC};
 
-// Matches info.rs's PATH_SET exactly (docs/design.md §3): plant() writes
+// Matches info.rs's PATH_SET exactly: plant() writes
 // .trashinfo bytes itself, because integration tests cannot call the
 // binary's modules, but the encoding must still match what rip will read.
 const PATH_SET: &AsciiSet = &NON_ALPHANUMERIC
@@ -35,14 +35,14 @@ const PATH_SET: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'~')
     .remove(b'/');
 
-/// Where the fake `fzf` records its argv (docs/design.md §13.2), a path
+/// Where the fake `fzf` records its argv, a path
 /// inside the sandbox that resolves onto a host-backed bind (`/home`), so
 /// the harness can still read it back after the sandboxed process exits.
 const FAKE_FZF_ARGS_INSIDE: &str = "/home/u/.fake-fzf-args";
 
 const BTRFS_SUPER_MAGIC: u32 = 0x9123_683E;
 
-/// A fresh bwrap sandbox laid out like artemis (docs/design.md §13.2, table).
+/// A fresh bwrap sandbox laid out like artemis (docs/design.md §3.2).
 pub struct Sandbox {
     base: PathBuf,
     shm: PathBuf,
@@ -66,7 +66,7 @@ pub enum Body {
 }
 
 impl Sandbox {
-    /// The artemis-shaped layout (docs/design.md §13.2 table): a real btrfs
+    /// The artemis-shaped layout (docs/design.md §3.2): a real btrfs
     /// subvolume for `/persist`, the ephemeral root, binds of `/persist` for
     /// Downloads/Documents/the home trash, a same-home-fs/other-subvolume
     /// bind root, a trash-subvolume bind root, and two tmpfs topdirs (one
@@ -277,24 +277,24 @@ impl Sandbox {
         fs::write(&path, toml).unwrap_or_else(|e| panic!("config: write {}: {e}", path.display()));
     }
 
-    /// Makes the fake `fzf` (docs/design.md §13.2) select every NUL-
+    /// Makes the fake `fzf` select every NUL-
     /// delimited stdin record containing `substring`, printed back NUL-
     /// terminated. Cleared by default (a picker that sees no selection
-    /// behaves like a cancel). For `tests/restore.rs`'s picker tests (C4b).
+    /// behaves like a cancel). For `tests/restore.rs`'s picker tests.
     pub fn fzf_pick(&mut self, substring: &str) -> &mut Self {
         self.fzf_pick = Some(substring.to_string());
         self
     }
 
     /// Makes the fake `fzf` exit with `code` instead of 0 (e.g. to simulate
-    /// a cancelled or failed picker). For `tests/restore.rs` (C4b).
+    /// a cancelled or failed picker). For `tests/restore.rs`.
     pub fn fzf_exit(&mut self, code: i32) -> &mut Self {
         self.fzf_exit = Some(code);
         self
     }
 
     /// The argv the fake `fzf` was last invoked with, one entry per line, or
-    /// empty if it was never run. For `tests/restore.rs` (C4b).
+    /// empty if it was never run. For `tests/restore.rs`.
     pub fn fake_fzf_args(&self) -> Vec<String> {
         let path = self.host(FAKE_FZF_ARGS_INSIDE);
         match fs::read_to_string(&path) {
@@ -381,7 +381,7 @@ impl Sandbox {
 impl Drop for Sandbox {
     fn drop(&mut self) {
         // btrfs subvolumes (`P`, `side`) rmdir like any other empty
-        // directory once their contents are gone (docs/design.md §13.2), so
+        // directory once their contents are gone, so
         // a plain recursive removal handles them; it only needs every mode
         // to allow write+search first, since a test may have left behind a
         // read-only directory (e.g. an unwritable topdir fixture).
@@ -404,7 +404,7 @@ fn preflight() {
     static RESULT: OnceLock<Result<(), String>> = OnceLock::new();
     let result = RESULT.get_or_init(|| {
         match Command::new("bwrap")
-            // `--tmpfs /x -- true` (as written in docs/design.md §13.2) makes
+            // `--tmpfs /x -- true` makes
             // bwrap fail at `execvp` (nothing is bound, so `true` can't be
             // found), which looks identical to a namespace failure from the
             // exit code alone [verified on artemis]. Binding the real root
@@ -421,7 +421,7 @@ fn preflight() {
                  true` failed, {}):\n{}\n\
                  fix: allow unprivileged user namespaces, e.g. on a systemd/AppArmor host:\n  \
                  sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0\n\
-                 (docs/design.md §13.2 and §15.2 item 7)",
+                 (see tests/common/mod.rs's `preflight`)",
                 out.status,
                 String::from_utf8_lossy(&out.stderr),
             )),
@@ -448,7 +448,7 @@ fn btrfs_dir() -> PathBuf {
         let dir = PathBuf::from(dir);
         if !is_btrfs(&dir) {
             panic!(
-                "RIP_TEST_BTRFS={} is set but is not a btrfs directory (docs/design.md §13.2)",
+                "RIP_TEST_BTRFS={} is set but is not a btrfs directory",
                 dir.display()
             );
         }
@@ -461,7 +461,7 @@ fn btrfs_dir() -> PathBuf {
     panic!(
         "sandbox tests need a btrfs directory: set RIP_TEST_BTRFS=/path/on/btrfs (CI loop-mounts \
          one), or run where the system temp dir ({}) is btrfs, as it is on artemis's /tmp. \
-         See docs/design.md §13.2.",
+         See `Sandbox::artemis` above.",
         tmp.display()
     );
 }
@@ -501,7 +501,7 @@ fn chmod(path: &Path, mode: u32) {
         .unwrap_or_else(|e| panic!("chmod {mode:o} {}: {e}", path.display()));
 }
 
-/// `chmod -R u+rwX` (docs/design.md §13.2), used only by `Drop` so cleanup
+/// `chmod -R u+rwX`, used only by `Drop` so cleanup
 /// can remove a read-only fixture directory. Best-effort: errors are
 /// returned, not panicked on, since this runs during cleanup, possibly
 /// while another panic is already unwinding.
@@ -568,7 +568,7 @@ fn host_bash() -> PathBuf {
 
 /// A bash script that records its argv to `$FAKE_FZF_ARGS`, and for every
 /// NUL-delimited record on stdin containing `$FAKE_FZF_PICK`, prints it back
-/// NUL-terminated (docs/design.md §13.2). Uses only bash builtins (`read
+/// NUL-terminated. Uses only bash builtins (`read
 /// -d ''`, `case`/`[[ ]]`), so it does not depend on anything else being on
 /// the sandbox's `PATH`.
 fn write_fake_fzf(dir: &Path) {

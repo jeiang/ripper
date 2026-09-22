@@ -833,15 +833,16 @@ mod tests {
         assert_eq!(escape(&[0xff, 0x41]), "\\xffA");
     }
 
-    // Regression for c7: escape() previously let C1 controls (U+0080..=U+009F,
+    // Regression: escape() previously let C1 controls (U+0080..=U+009F,
     // valid as UTF-8) through unescaped, so a terminal in UTF-8 mode (e.g.
     // xterm) could still act on them (CSI is U+009B, OSC is U+009D, ST is
-    // U+009C). char::is_control() catches C0, DEL and C1 alike.
+    // U+009C). char::is_control() catches C0, DEL and C1 alike
+    // (docs/design.md §0 invariant 10).
     #[test]
     fn escape_c1_controls() {
         assert_eq!(escape("a\u{9b}b".as_bytes()), "a\\x9bb");
         assert_eq!(escape("\u{80}\u{9f}".as_bytes()), "\\x80\\x9f");
-        // The full round trip from the finding: CSI 31m RED OSC 0;T ST.
+        // A full hostile round trip: CSI 31m RED OSC 0;T ST.
         assert_eq!(
             escape("a\u{9b}31mRED\u{9d}0;T\u{9c}".as_bytes()),
             "a\\x9b31mRED\\x9d0;T\\x9c"
@@ -877,9 +878,9 @@ mod tests {
         assert_eq!(completions_script(Shell::Fish), expected);
     }
 
-    // ---- startup (c5) ----
+    // ---- startup ----
 
-    // Regression for c5: sys::raise_nofile() was defined but never called
+    // Regression: sys::raise_nofile() was defined but never called
     // outside its own unit test, so `empty`/`purge`/`put` hit EMFILE on a
     // tree only about 1000 levels deep under the common default soft limit
     // of 1024 (docs/design.md §6 "RLIMIT_NOFILE raise"). This drives it
@@ -912,9 +913,9 @@ mod tests {
         assert_eq!(after.current, Some(max), "dispatch did not raise NOFILE");
     }
 
-    // ---- Cx cwd fallback (c26) ----
+    // ---- Cx cwd fallback (docs/design.md §2.2) ----
 
-    // Regression for c26: Cx::new used to propagate getcwd's error outright,
+    // Regression: Cx::new used to propagate getcwd's error outright,
     // so every command exited 2 once the cwd itself had been deleted (e.g. by
     // `rip ../x` run from inside `x`), even `rip undo`, which needs no cwd at
     // all. cwd_fallback is the pure selection Cx::new now falls back to.

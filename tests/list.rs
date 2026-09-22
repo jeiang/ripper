@@ -1,6 +1,5 @@
-//! `rip list` (docs/design.md §11, design.md §13.3 "tests/list.rs"). Every
-//! test runs `rip` inside the bwrap sandbox (tests/common), never against a
-//! real trash.
+//! `rip list`. Every test runs `rip` inside the bwrap sandbox (tests/common),
+//! never against a real trash.
 
 mod common;
 
@@ -124,7 +123,7 @@ fn dedup_bind_aliases() {
         "the same trash dir must be listed once: {records:?}"
     );
     // cwd is "/", so every absolute path is technically "under" it: the
-    // path is shown relative (no leading slash), per design §11.
+    // path is shown relative (no leading slash).
     let path = String::from_utf8_lossy(&records[0].1);
     assert!(
         path == "mnt/other/sub/x" || path == "mnt/other2/sub/x",
@@ -388,7 +387,7 @@ fn escape_on_terminal() {
     );
 }
 
-// c23 (review round, fix-empty.json): a relative Path= in the home trash
+// docs/design.md §1: a relative Path= in the home trash
 // must resolve against $XDG_DATA_HOME, not against a symlinked Trash's
 // target's parent.
 #[test]

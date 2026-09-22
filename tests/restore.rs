@@ -1,8 +1,8 @@
-//! `rip restore`, `rip undo` and `rip purge` (docs/design.md §7, §13.3
-//! "tests/restore.rs"). Every test runs `rip` inside the bwrap sandbox
-//! (tests/common), never against a real trash. Fixtures are planted with
-//! `Sandbox::plant` throughout (put.rs lands in a parallel checkpoint and is
-//! not available here).
+//! `rip restore`, `rip undo` and `rip purge` (docs/design.md §5.3). Every
+//! test runs `rip` inside the bwrap sandbox (tests/common), never against a
+//! real trash. Fixtures are planted with
+//! `Sandbox::plant` throughout, rather than via `rip put`, so these tests
+//! stay independent of put.rs's own behavior.
 
 mod common;
 
@@ -72,7 +72,7 @@ fn trash_host_path(sandbox: &Sandbox, trash_inside: &str, name: &[u8]) -> PathBu
 }
 
 // ---------------------------------------------------------------------------
-// A size-limited tmpfs for a real ENOSPC (design §13.3
+// A size-limited tmpfs for a real ENOSPC (design §6:
 // "copy_back_enospc_keeps_item"), which `Sandbox`'s own `bind`/`without`
 // cannot express (they only add host-directory `--bind`s; bubblewrap's own
 // `--size BYTES --tmpfs DEST` has no equivalent there, and tests/restore.rs
@@ -202,9 +202,9 @@ fn host_bash() -> PathBuf {
 /// Runs `rip` on a real pty (so `pick()`'s own terminal check passes and it
 /// actually tries to run fzf), in a bwrap session whose `PATH` has no `fzf`
 /// at all -- the one environment `Sandbox::rip_tty` can never produce,
-/// since its bwrap invocation always binds the fake `fzf` (design §13.4
-/// "An irreversible action without a terminal" is `Sandbox::rip`'s job; a
-/// genuinely missing `fzf` needs this).
+/// since its bwrap invocation always binds the fake `fzf` (design §0
+/// invariant 7: "an irreversible action without a terminal" is
+/// `Sandbox::rip`'s job; a genuinely missing `fzf` needs this).
 fn rip_without_fzf_tty(sandbox: &Sandbox, cwd: &str, args: &[&str]) -> Output {
     let c = base_bwrap(sandbox);
     let raw: Vec<&OsStr> = c.get_args().collect();
@@ -252,7 +252,7 @@ fn rip_without_fzf_tty(sandbox: &Sandbox, cwd: &str, args: &[&str]) -> Output {
 /// A `rip` invocation on a real pty, held open past the point its output
 /// first contains `until` -- unlike `Sandbox::rip_tty`, which writes its
 /// whole input up front and waits for exit, so it cannot hold a prompt
-/// open. Needed for the finding c0 and c10 regression tests below, which
+/// open. Needed for the docs/design.md §5.3 regression tests below, which
 /// must run other `rip` invocations while a copy-back prompt is still
 /// waiting for an answer. Built the same way `rip_without_fzf_tty` builds
 /// its own quoted `bwrap`/`script` command line.
@@ -352,7 +352,7 @@ fn rip_tty_hold(sandbox: &Sandbox, cwd: &str, args: &[&str], until: &str) -> Pro
 }
 
 // ---------------------------------------------------------------------------
-// by_original_path (design §13.3, §13.4 "Restore overwrites a file" table)
+// by_original_path (design §6: "Restore overwrites a file")
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -404,7 +404,7 @@ fn by_original_path() {
 
 // ---------------------------------------------------------------------------
 // via_persist: the destination is reached through a DIFFERENT bind of the
-// trash's own subvolume (design §5.2's route(), reversed).
+// trash's own subvolume (design §3.1's route(), reversed).
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -468,8 +468,8 @@ fn copy_back() {
 }
 
 // ---------------------------------------------------------------------------
-// copy_back_prompt: terminal y/n, -y, and no terminal (design §7.2, §13.4
-// "An irreversible action without a terminal").
+// copy_back_prompt: terminal y/n, -y, and no terminal (design §5.3; §0
+// invariant 7).
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -512,9 +512,9 @@ fn copy_back_prompt() {
     assert!(sandbox.host("/home/u").join("d").exists());
 }
 
-// finding c10: a copy-back prompt waiting for an answer must not hold the
-// trash's lock, or an unattended `empty`/`purge` (including the planned
-// timer) would block on it with no time limit.
+// docs/design.md §5.3: a copy-back prompt waiting for an answer must not
+// hold the trash's lock, or an unattended `empty`/`purge` (including the
+// planned timer) would block on it with no time limit.
 #[test]
 fn empty_does_not_block_on_a_held_copy_back_prompt() {
     let sandbox = Sandbox::artemis();
@@ -544,8 +544,8 @@ fn empty_does_not_block_on_a_held_copy_back_prompt() {
     let _ = hold.finish("n\n");
 }
 
-// finding c0: a copy-back restore must not discard whatever now holds
-// files/NAME by the time it gets around to it -- only the exact entry it
+// docs/design.md §5.3: a copy-back restore must not discard whatever now
+// holds files/NAME by the time it gets around to it -- only the exact entry it
 // verified. Reproduces the deterministic "prompt window" case: while A
 // waits at its own copy-back prompt, B restores the same item (freeing the
 // name) and C trashes an unrelated file that reuses it; A's stale answer
@@ -685,7 +685,7 @@ fn created_parents_rolled_back() {
     assert!(&trash_deep.exists());
 }
 
-// finding c9: `confirm()` failing with no terminal is an early exit after
+// `confirm()` failing with no terminal is an early exit after
 // `ensure_parent`, the same as the ENOSPC case above, and must roll back
 // the parent directories `ensure_parent` created just as any other one
 // does, not leave them behind empty.
@@ -1080,7 +1080,7 @@ fn non_utf8_round_trip() {
 }
 
 // ---------------------------------------------------------------------------
-// hostile_paths (design §13.4 "A hostile Path= writes outside its topdir")
+// hostile_paths (design §6: "A hostile Path= writes outside its topdir")
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -1149,8 +1149,8 @@ fn hostile_paths() {
     let before = listing(&sandbox);
 
     // All four together: the first orphan aborts selection before any
-    // change (design §7.1 "resolve every PATH before any change"), so even
-    // the syntactically valid but hostile "escape" item is never touched.
+    // change, so even the syntactically valid but hostile "escape" item is
+    // never touched.
     let out = sandbox.rip(
         "/",
         &[
@@ -1188,9 +1188,9 @@ fn hostile_paths() {
     );
 }
 
-// finding c7: an undo/restore error naming a hostile original path (from a
-// planted Path=, or the user's own oddly-named file) must not write raw
-// terminal escapes to stderr.
+// docs/design.md §0 invariant 10: an undo/restore error naming a hostile
+// original path (from a planted Path=, or the user's own oddly-named file)
+// must not write raw terminal escapes to stderr.
 #[test]
 fn undo_conflict_error_escapes_a_hostile_original_path() {
     let sandbox = Sandbox::artemis();
@@ -1228,7 +1228,7 @@ fn undo_conflict_error_escapes_a_hostile_original_path() {
 }
 
 // ---------------------------------------------------------------------------
-// undo (design §7.4)
+// undo (design §5.3)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -1330,8 +1330,9 @@ fn undo_partial_conflict() {
     assert!(!trash_host_path(&sandbox, "/home/u/.local/share/Trash", b"ok_item").exists());
 }
 
-// finding c4: a batch parent whose restore is declined must not leave its
-// child restored into a directory `ensure_parent` fabricates in its place.
+// docs/design.md §6: a batch parent whose restore is declined must not
+// leave its child restored into a directory `ensure_parent` fabricates in
+// its place.
 #[test]
 fn undo_skips_child_when_parent_restore_is_declined() {
     let sandbox = Sandbox::artemis();
@@ -1410,8 +1411,8 @@ fn undo_empty() {
 }
 
 // ---------------------------------------------------------------------------
-// display_path (finding c27: "." for an item whose original is the cwd,
-// not an empty path)
+// display_path (docs/design.md §1: "." for an item whose original is the
+// cwd, not an empty path)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -1542,8 +1543,7 @@ fn purge_orphan_by_trash_path() {
 }
 
 // ---------------------------------------------------------------------------
-// fzf_args_real (design §15.2 U5): real fzf from the dev shell on the host,
-// no sandbox.
+// fzf_args_real: real fzf from the dev shell on the host, no sandbox.
 // ---------------------------------------------------------------------------
 
 #[test]

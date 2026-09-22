@@ -1,4 +1,4 @@
-//! `rip empty` (docs/design.md §8, design.md §13.3 "tests/empty.rs"). Every
+//! `rip empty` (docs/design.md §5.4, §6). Every
 //! test runs `rip` inside the bwrap sandbox (tests/common), never against a
 //! real trash.
 
@@ -27,7 +27,7 @@ fn plant_orphan(sandbox: &Sandbox, trash: &str, name: &[u8], content: &[u8]) {
 }
 
 /// Writes a leftover box directly under `trash`'s `.rip-staging`, as a crash
-/// would leave one (docs/design.md §8.3): `put.*` for an unfinished
+/// would leave one (docs/design.md §4): `put.*` for an unfinished
 /// copy-fallback box, `del.*` for a tombstone `empty` renamed but never
 /// finished removing.
 fn plant_staging_box(sandbox: &Sandbox, trash: &str, name: &str, content: &[u8]) {
@@ -526,9 +526,9 @@ fn crash_states() {
 
     // A completed item whose original path already independently has a
     // file, as a crash right after restore's rename-back but before its
-    // info was unlinked would leave (docs/design.md §5.3 "Restore crash
-    // consistency"). `empty` must delete the trash copy exactly like any
-    // other item, and must never touch the original path.
+    // info was unlinked would leave (docs/design.md §5.3). `empty` must
+    // delete the trash copy exactly like any other item, and must never
+    // touch the original path.
     let original_host = sandbox.host("/home/u/Downloads").join("already-restored");
     fs::write(&original_host, b"the restored copy").unwrap();
     sandbox.plant(
@@ -557,7 +557,7 @@ fn crash_states() {
     );
 }
 
-/// c6 (review round, fix-empty.json): tombstone naming must not restart at
+/// docs/design.md §4: tombstone naming must not restart at
 /// `del.<pid>.0` for every item in a batch (quadratic `renameat2` retries
 /// under `LOCK_EX`). With the bug, N items cost N(N+1)/2 renames; fixed,
 /// the cost is linear. 4000 items take tens of seconds under the bug and
@@ -584,7 +584,7 @@ fn empty_of_many_items_is_not_quadratic() {
     assert!(
         elapsed < Duration::from_secs(5),
         "empty of {n} items in one trash dir took {elapsed:?}: tombstone naming must \
-         not restart at 0 for every item (review round, finding c6)"
+         not restart at 0 for every item (docs/design.md §4)"
     );
 
     let trash_host = sandbox.host("/home/u/.local/share/Trash");
@@ -592,7 +592,7 @@ fn empty_of_many_items_is_not_quadratic() {
     assert!(!trash_host.join(format!("files/f{:05}", n - 1)).exists());
 }
 
-/// c19 (review round, fix-empty.json): a top-level directory item without
+/// docs/design.md §4: a top-level directory item without
 /// owner write permission must still be removable -- unlike renaming any
 /// other entry kind, renaming a directory to a new parent needs write
 /// permission on the directory itself, to update "..".
@@ -619,7 +619,7 @@ fn readonly_top_level_dir_deleted() {
     );
 }
 
-/// c17 (review round, fix-empty.json): an info file named `...trashinfo`
+/// docs/design.md §1: an info file named `...trashinfo`
 /// strips to `..`. As a directory-entry name, `..` would resolve to the
 /// trash root itself: this must be treated as garbage `empty` can unlink
 /// outright, never resolved against `files/`, so it does not keep failing
@@ -654,7 +654,7 @@ fn dotdot_named_info_is_garbage_not_the_trash_root() {
     assert_ok(&out2);
 }
 
-/// c18 (review round, fix-empty.json): `files/NAME` exists, but its info
+/// docs/design.md §1: `files/NAME` exists, but its info
 /// cannot be opened at all (mode `000`; not a race, since `files/NAME` is
 /// present). This must still be removable -- as an orphan with a malformed
 /// info -- instead of an entry nothing can ever delete.
@@ -700,7 +700,7 @@ fn unopenable_info_with_existing_files_entry_is_still_removable() {
     assert!(!trash_host.join("info/stuck.trashinfo").exists());
 }
 
-/// c21 (review round, fix-empty.json): `empty`'s unlocked load can see a
+/// docs/design.md §4: `empty`'s unlocked load can see a
 /// concurrent put's reserved info before its rename lands, classifying it
 /// Dangling; once `empty` gets `LOCK_EX`, the put has finished. This must
 /// be a silent no-op, not a reported failed delete (exit 1) about the file
@@ -709,8 +709,8 @@ fn unopenable_info_with_existing_files_entry_is_still_removable() {
 fn dangling_completed_by_concurrent_put_is_not_a_failure() {
     let sandbox = Sandbox::artemis();
     // An info-only entry, as `put`'s reserve() leaves one while its rename
-    // into files/ is still pending (docs/design.md §5.4): from the outside
-    // this looks dangling.
+    // into files/ is still pending (docs/design.md §0 invariant 3): from the
+    // outside this looks dangling.
     sandbox.plant(
         "/home/u/.local/share/Trash",
         b"inflight",
@@ -764,7 +764,7 @@ fn dangling_completed_by_concurrent_put_is_not_a_failure() {
 }
 
 // ---------------------------------------------------------------------------
-// c20 (review round, fix-empty.json)
+// A genuinely read-only bind
 // ---------------------------------------------------------------------------
 
 /// The inside paths `Sandbox::command` binds by default, in the order it
@@ -786,8 +786,8 @@ const DEFAULT_BINDS: &[&str] = &[
 /// `EROFS`) instead of read-write. `Sandbox`'s own `bind`/`without` cannot
 /// express this -- unlike the sandbox's own always-present `/mnt/ro`, whose
 /// read-only-ness is only a `0555` directory mode (`EACCES`, not `EROFS`) --
-/// and tests/empty.rs may not edit tests/common/mod.rs (review round,
-/// finding c20; pattern copied from tests/restore.rs's own `base_bwrap`).
+/// and tests/empty.rs may not edit tests/common/mod.rs (pattern copied from
+/// tests/restore.rs's own `base_bwrap`).
 fn rip_with_one_bind_readonly(
     sandbox: &Sandbox,
     ro_inside: &str,
@@ -895,10 +895,10 @@ fn readonly_topdir_trash_with_nothing_selected_does_not_fail() {
 }
 
 // ---------------------------------------------------------------------------
-// c2, c22 (review round, fix-empty.json)
+// --max-size batching (docs/design.md §1)
 // ---------------------------------------------------------------------------
 
-/// c2: a `--max-size` batch is every item sharing one `DeletionDate` (one
+/// docs/design.md §1: a `--max-size` batch is every item sharing one `DeletionDate` (one
 /// `rip` invocation). The newest batch here (`a` + `movie`, planted
 /// together) totals over `--max-size` on its own, so this must fail and
 /// delete nothing, regardless of which of the two sorts first by name.
@@ -945,7 +945,7 @@ fn max_size_newest_batch_over_limit_deletes_nothing() {
     );
 }
 
-/// c2: an older (non-newest) batch of two same-`DeletionDate` items must be
+/// docs/design.md §1: an older (non-newest) batch of two same-`DeletionDate` items must be
 /// deleted as a whole, never split so that only the one that sorts first by
 /// name goes.
 #[test]
@@ -995,7 +995,7 @@ fn max_size_does_not_split_an_older_batch() {
     );
 }
 
-/// c22: the prompt must not walk every un-sized doomed entry just to show a
+/// docs/design.md §1: the prompt must not walk every un-sized doomed entry just to show a
 /// size. Here "old" is doomed only by the cascade past the overflow point
 /// and was never individually sized during selection, so the size must be
 /// left out of the prompt rather than computed for it.
@@ -1046,7 +1046,7 @@ fn max_size_prompt_omits_size_when_not_fully_known() {
     assert!(trash_host.join("files/old").is_file());
 }
 
-/// c22: when every doomed entry's size was already computed while deciding
+/// docs/design.md §1: when every doomed entry's size was already computed while deciding
 /// the cascade (here, the sole doomed entry is also the one that overflows
 /// `--max-size`), the prompt does show it.
 #[test]

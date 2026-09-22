@@ -1,6 +1,7 @@
 //! `rip FILE...`: operand splitting, refusals, trash placement (`choose`,
 //! `choose_topdir`, `topdir_trash`), the rename path and the cross-filesystem
-//! copy fallback. See docs/design.md §5 (placement for put) and §6 (put).
+//! copy fallback. See docs/design.md §3 (placement for put) and §5 (crash
+//! consistency).
 
 use std::ffi::{OsStr, OsString};
 use std::io;
@@ -19,7 +20,7 @@ use crate::trash::{self, Trash};
 use crate::{Cli, Cx, Fallback, confirm, escape, human};
 
 // ---------------------------------------------------------------------------
-// Placement (docs/design.md §5.4, pure)
+// Placement (docs/design.md §3.1, pure)
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
@@ -32,7 +33,7 @@ pub enum Choice {
 /// `Dev` is statx `st_dev` (one per btrfs subvolume). `FsId` is mountinfo
 /// major:minor (one per filesystem). This is the only rule of the candidates
 /// considered during design that never creates `.Trash-$uid` on the home
-/// trash's own filesystem (docs/design.md §0.1 #2).
+/// trash's own filesystem (docs/design.md §3.1).
 pub fn choose(src_dev: Dev, src_fs: FsId, home_dev: Dev, home_fs: FsId) -> Choice {
     if src_dev == home_dev {
         Choice::Home
@@ -123,7 +124,7 @@ fn found_entry(f: &Found) -> Entry {
 /// `mkdirat(dir, name, 0700)` (`EEXIST` ignored), then `open_dir` with
 /// `O_NOFOLLOW`: fd-relative throughout, so an entry a concurrent writer
 /// swaps for a symlink between the two calls is refused by `O_NOFOLLOW` on
-/// the reopen, never followed (docs/design.md c15).
+/// the reopen, never followed (docs/design.md §3.1).
 fn mkdir_and_open(dir: impl AsFd, name: &OsStr) -> io::Result<OwnedFd> {
     match mkdirat(&dir, name, Mode::from_raw_mode(0o700)) {
         Ok(()) | Err(Errno::EXIST) => {}
@@ -133,7 +134,7 @@ fn mkdir_and_open(dir: impl AsFd, name: &OsStr) -> io::Result<OwnedFd> {
 }
 
 /// A `topdir_trash` failure. `Refuse` is a hard failure for the whole
-/// operand (docs/design.md c14: it is already inside the trash that would
+/// operand (docs/design.md §1: it is already inside the trash that would
 /// be used or repaired) -- unlike every other reason here, it must never be
 /// treated as "this topdir trash is unusable, fall back to copying
 /// elsewhere instead".
@@ -156,13 +157,14 @@ impl From<&str> for TopdirErr {
 
 /// Opens or creates the topdir trash for `src` (already known, by `choose`,
 /// to need one), reached through mount `own`. Nothing is created until the
-/// mount-id and subvolume checks below pass (docs/design.md §5.4 step 1).
+/// mount-id and subvolume checks below pass (docs/design.md §3.1).
 /// `path` is the operand's own resolved path: `Session::inside_trash` only
 /// refuses a path inside a trash discovery could actually open, so this
 /// checks it again here, against whichever directory is about to be used or
 /// repaired -- catching a trash discovery skipped with a warning (e.g. its
 /// `info/` is missing), which would otherwise get its missing half silently
-/// recreated and reused to re-trash an entry already inside it (c14).
+/// recreated and reused to re-trash an entry already inside it (docs/design.md
+/// §1).
 ///
 /// Every lookup and creation below is relative to `top` (a verified fd on
 /// the right mount and subvolume) or to a further fd opened with
@@ -172,7 +174,7 @@ impl From<&str> for TopdirErr {
 /// nothing re-opens through them. That way a symlink a concurrent writer
 /// swaps in for `.Trash`, `.Trash-$uid`, the uid subdir, `files/` or `info/`
 /// after this function has already looked at it is refused by `O_NOFOLLOW`,
-/// never followed (docs/design.md c15).
+/// never followed (docs/design.md §3.1).
 pub fn topdir_trash(own: &Mount, src: &Meta, uid: u32, path: &Path) -> Result<Trash, TopdirErr> {
     let top = sys::open_path(CWD, &own.point).map_err(|e| e.to_string())?;
     let top_id = sys::ident(&top).map_err(|e| e.to_string())?;
@@ -237,7 +239,7 @@ pub fn topdir_trash(own: &Mount, src: &Meta, uid: u32, path: &Path) -> Result<Tr
         // Method 1 ("mkdirat(.Trash, uid, 0700)") can still fail even though
         // .Trash itself passed the sticky/ownership checks above (e.g. a
         // quota or an ACL); fall back to method 2 rather than failing the
-        // whole operand (docs/design.md §5.4 step 2).
+        // whole operand.
         let admin_fd = admin_fd
             .as_ref()
             .expect("choose_topdir only picks Admin when .Trash is a sticky dir");
@@ -326,7 +328,7 @@ pub fn topdir_trash(own: &Mount, src: &Meta, uid: u32, path: &Path) -> Result<Tr
 }
 
 // ---------------------------------------------------------------------------
-// Session (docs/design.md §6.1)
+// Session
 // ---------------------------------------------------------------------------
 
 /// One `rip FILE...` invocation: the home trash (always `trashes[0]`) plus
@@ -390,7 +392,7 @@ impl Session {
 
     /// A trash dir whose own (dev, ino) matches `path` itself or one of its
     /// ancestors -- `path` is the trash dir itself, or lies inside it
-    /// (docs/design.md §6.1, §5.3 "inside a trash").
+    /// (docs/design.md §1).
     fn inside_trash(&self, path: &Path) -> Option<&Path> {
         let leaf = sys::stat_at(CWD, path).ok().map(|m| m.id);
         let ancestor_ids = path
@@ -409,7 +411,7 @@ impl Session {
     /// A trash dir found under `path`, comparing filesystem-internal paths
     /// (via `own`'s `FsId`) as well as the plain namespace view, so a trash
     /// reached through an alias mount (e.g. `/persist` vs `/mnt/root`) is
-    /// still caught (docs/design.md §5.3, §6.1).
+    /// still caught (docs/design.md §1).
     fn contains_trash<'a>(&'a self, ms: &Mounts, own: &Mount, path: &Path) -> Option<&'a Path> {
         let own_inside = mounts::inside(own, path);
         self.trashes
@@ -428,7 +430,7 @@ impl Session {
 }
 
 // ---------------------------------------------------------------------------
-// Errors and the per-item result (docs/design.md §2.3, §6.1)
+// Errors and the per-item result (docs/design.md §2.2)
 // ---------------------------------------------------------------------------
 
 /// A `put_one` failure. `not_found` marks "the operand does not exist",
@@ -466,11 +468,11 @@ impl From<String> for PutErr {
 impl From<io::Error> for PutErr {
     fn from(e: io::Error) -> Self {
         PutErr {
-            // `-f` ignores a missing operand the way `rm -f` does (docs
-            // brief item 4). GNU rm's `nonexistent_file_errno` treats
+            // `-f` ignores a missing operand the way `rm -f` does
+            // (docs/design.md §1). GNU rm's `nonexistent_file_errno` treats
             // ENOTDIR the same as ENOENT: a path whose parent component
             // turned out not to be a directory is just as gone as one that
-            // never existed (c25). This does not cover the trailing-slash
+            // never existed (docs/design.md §1). This does not cover the trailing-slash
             // refusals in `put_one` (`'X/' names a symbolic link`, `Not a
             // directory` for a non-directory operand itself): those are
             // rip's own deliberate refusals, not this conversion.
@@ -504,11 +506,11 @@ enum Done {
 }
 
 impl Done {
-    /// `-v` output (design §2.3: goes to stdout). `dest` embeds the item's
+    /// `-v` output (design §2.2: goes to stdout). `dest` embeds the item's
     /// trashed name, which carries the operand's own (possibly hostile)
     /// bytes verbatim aside from a collision suffix, so it goes through
-    /// `show` the same as `arg` (docs/design.md c7: human output never
-    /// writes an untrusted name raw to the terminal).
+    /// `show` the same as `arg` (docs/design.md §0 invariant 10: human output
+    /// never writes an untrusted name raw to the terminal).
     fn print(&self, arg: &Path) {
         match self {
             Done::Moved(dest) => println!("trashed '{}' -> {}", show(arg), show(dest)),
@@ -530,7 +532,7 @@ fn show(p: &Path) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Flow (docs/design.md §6.1)
+// Flow
 // ---------------------------------------------------------------------------
 
 pub fn run(cx: &Cx, cli: &Cli) -> Result<bool, String> {
@@ -568,9 +570,9 @@ pub fn run(cx: &Cx, cli: &Cli) -> Result<bool, String> {
 
 /// Splits `arg` (raw bytes, so a non-UTF-8 operand works) into
 /// `(parent, last_component, had_trailing_slash)`. An empty operand is
-/// treated as missing (`ENOENT`); `/`, `.`, `..` and `foo/.` are refused
-/// (docs/design.md §6.1: `Path::file_name` would hide the `foo/.` case, so
-/// this works on the raw bytes instead).
+/// treated as missing (`ENOENT`); `/`, `.`, `..` and `foo/.` are refused:
+/// `Path::file_name` would hide the `foo/.` case, so this works on the raw
+/// bytes instead.
 fn split_arg(arg: &Path) -> Result<(PathBuf, OsString, bool), PutErr> {
     let bytes = arg.as_os_str().as_bytes();
     if bytes.is_empty() {
@@ -624,7 +626,7 @@ fn put_one(cx: &Cx, cli: &Cli, s: &mut Session, arg: &Path) -> Result<Done, PutE
         .by_id(st.id.mnt)
         .ok_or("its mount is not in /proc/self/mountinfo")?;
     // A read-only mount is refused outright, the way `rm` is (docs/design.md
-    // c3): never routed around through some other, writable alias of the
+    // §3): never routed around through some other, writable alias of the
     // same subvolume. The copy fallback already refuses the same way
     // (`removable_top_checks`'s accessat check), so this keeps both
     // placement paths consistent.
@@ -683,7 +685,7 @@ fn put_one(cx: &Cx, cli: &Cli, s: &mut Session, arg: &Path) -> Result<Done, PutE
 }
 
 // ---------------------------------------------------------------------------
-// Reservation and the rename path (docs/design.md §6.3)
+// Reservation and the rename path (docs/design.md §5.1)
 // ---------------------------------------------------------------------------
 
 /// The raw bytes a `.trashinfo`'s `Path=` should hold for `path`, landing in
@@ -721,7 +723,7 @@ fn move_in(
 }
 
 // ---------------------------------------------------------------------------
-// Cross-filesystem copy into the home trash (docs/design.md §6.5-§6.7)
+// Cross-filesystem copy into the home trash (docs/design.md §5.2)
 // ---------------------------------------------------------------------------
 
 fn removal_summary(rm: &Removal) -> String {
@@ -802,7 +804,7 @@ fn copy_to_home(
     // a source entry only where the trash demonstrably holds a copy of it at
     // the same relative path -- not merely one whose inode, size and mtime
     // still match something the pre-copy walk saw somewhere in the tree
-    // (docs/design.md c1: a concurrent rename during the copy must not
+    // (docs/design.md §5.2: a concurrent rename during the copy must not
     // authorize deleting an entry `cp` never actually copied).
     if let Err(e) = w.manifest.verify_copy(bfd.as_fd(), OsStr::new("item")) {
         drop_box(&bx);
@@ -840,8 +842,9 @@ fn copy_to_home(
     // The entry's own identity, captured immediately after publishing it:
     // if the source turns out not to be removable below, the rollback must
     // discard exactly this entry, not whatever a concurrent restore or put
-    // has since done with the name `n` (docs/design.md c0 -- the same race
-    // restore.rs's own copy-back rollback closes with `discard_verified`).
+    // has since done with the name `n` (docs/design.md §5.2 -- the same race
+    // restore.rs's own copy-back rollback closes with `discard_verified`,
+    // docs/design.md §5.3).
     let published = sys::stat_at(&home.files, &n)
         .ok()
         .map(|m| m.id)
@@ -866,7 +869,7 @@ fn copy_to_home(
     if !rm.removed_any {
         // Nothing gone: no duplicate stays behind. Tied to `published` so a
         // name reused by someone else in the meantime is never deleted in
-        // this entry's place (c0); if identity could not even be captured
+        // this entry's place; if identity could not even be captured
         // right after commit, there is nothing safe to discard by name.
         if let Some((entry, info)) = &published {
             trash::discard_verified(home, &cx.mounts, &n, Some((*entry, info)))?;
@@ -896,7 +899,7 @@ fn copy_to_home(
 mod tests {
     use super::*;
 
-    // ---- choose() (docs/design.md §5.4) ----
+    // ---- choose() (docs/design.md §3.1) ----
 
     #[test]
     fn choose_same_dev_is_home() {
@@ -929,7 +932,7 @@ mod tests {
         ));
     }
 
-    // ---- choose_topdir() (docs/design.md §5.4, §13.1) ----
+    // ---- choose_topdir() (docs/design.md §3.1) ----
 
     fn is_sticky_dir(e: Entry) -> bool {
         matches!(e, Entry::Dir { sticky: true, .. })
@@ -1056,7 +1059,7 @@ mod tests {
         }
     }
 
-    // ---- split_arg (docs/design.md §6.1, §13.1) ----
+    // ---- split_arg ----
 
     #[test]
     fn split_arg_root_is_refused() {

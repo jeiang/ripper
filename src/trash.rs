@@ -188,8 +188,8 @@ fn info_file_name(name: &OsStr) -> OsString {
 // ---------------------------------------------------------------------------
 
 /// `ENOENT`, `EACCES`, `ENOTDIR`, `ELOOP` and a foreign owner all mean "not a
-/// usable trash directory here", skipped without a warning (docs/design.md
-/// §4 "Errors"). Anything else is worth telling the user about.
+/// usable trash directory here", skipped without a warning. Anything else is
+/// worth telling the user about.
 fn silent_skip(e: &io::Error) -> bool {
     matches!(
         Errno::from_io_error(e),
@@ -247,7 +247,7 @@ pub fn open_home(path: &Path, create: bool, uid: u32) -> io::Result<Option<Trash
     // regardless of where `Trash` itself points. When `Trash` is a symlink
     // (e.g. impermanence's "symlink" method), `canonical.parent()` would be
     // the *target*'s parent instead, misplacing `restore`/`undo`'s output
-    // for any relative `Path=` (docs/design.md §5's Home row).
+    // for any relative `Path=` (docs/design.md §1).
     let base = path
         .parent()
         .map(Path::to_path_buf)
@@ -282,7 +282,7 @@ fn mkdir_ignore_exists(d: impl AsFd, n: impl rustix::path::Arg) -> io::Result<()
 }
 
 /// Opens a topdir trash (`Kind::Admin` or `Kind::User`) at `path`, checking
-/// it the way docs/design.md §4/§0 invariant 5 require: `O_NOFOLLOW`, owner
+/// it the way docs/design.md §0 invariant 5 requires: `O_NOFOLLOW`, owner
 /// `uid`, `files/`+`info/` present and on the same mount.
 pub fn open_trash(path: &Path, kind: Kind, base: &Path, uid: u32) -> io::Result<Option<Trash>> {
     let dir = match sys::open_dir(CWD, path) {
@@ -552,7 +552,7 @@ fn load_one(idx: usize, t: &Trash, c: &mut Contents) {
 
 /// One `info/NAME.trashinfo`: decides Item / Orphan / Dangling and pushes
 /// it, marking `name` as `paired` so the files/ scan does not double-count
-/// it (docs/design.md §4 "Loading"). `files/NAME` is lstat'd first: whether
+/// it (docs/design.md §4). `files/NAME` is lstat'd first: whether
 /// it is missing decides Dangling regardless of the info's own content or
 /// type, matching what `delete_batch`'s later recheck of a Dangling entry
 /// does (an lstat of the info path, not a re-read of its content).
@@ -587,7 +587,7 @@ fn load_info_entry(
         // at all (ELOOP: a symlink; EACCES: unreadable). Record it as an
         // orphan with a malformed info, identified by that lstat, so
         // empty/purge can remove it instead of leaving an entry nothing can
-        // ever delete (docs/design.md §4 "Loading").
+        // ever delete (docs/design.md §1).
         c.warnings.push(format!(
             "{}: {}: malformed .trashinfo",
             t.path.display(),
@@ -671,7 +671,7 @@ pub fn staging(t: &Trash) -> io::Result<OwnedFd> {
 /// `delete_batch` uses this instead of `staging()` when a trash dir has
 /// nothing doomed, so a trash on a read-only mount that has never held a
 /// staging box does not fail `empty` merely because there is nothing there
-/// to clean up (docs/design.md §8.2).
+/// to clean up (docs/design.md §4).
 fn open_staging_if_exists(t: &Trash) -> io::Result<Option<OwnedFd>> {
     let fd = match sys::open_dir(&t.dir, STAGING_NAME) {
         Ok(fd) => fd,
@@ -737,7 +737,7 @@ fn orphan_still_same(t: &Trash, o: &Orphan) -> bool {
             // load time either (an unopenable symlink or an unreadable
             // info; `bytes` is then always empty), the lstat identity
             // recorded then is all "unchanged" ever meant, so compare that
-            // instead of giving up forever (docs/design.md §4 "Loading").
+            // instead of giving up forever (docs/design.md §1).
             None => {
                 bytes.is_empty()
                     && sys::stat_at(&t.info, info_file_name(&o.name))
@@ -754,7 +754,7 @@ pub fn unlink_info(t: &Trash, name: &OsStr) {
 
 /// Whether `t.files/NAME` must not be touched right now: it has become a
 /// mount point, a bind source, or a directory containing one, since it was
-/// trashed (docs/design.md §5.3 "Mount refusals", reused here for both
+/// trashed (docs/design.md §5.4, reused here for both
 /// `delete_batch` and `discard`'s own-item cleanup).
 fn entry_conflict(t: &Trash, ms: &Mounts, name: &OsStr) -> Option<String> {
     let meta = sys::stat_at(&t.files, name).ok()?;
@@ -769,7 +769,7 @@ fn entry_conflict(t: &Trash, ms: &Mounts, name: &OsStr) -> Option<String> {
 /// every tombstone already in `.rip-staging` from earlier in the same
 /// batch. A batch of N doomed entries would otherwise cost N(N+1)/2 renames,
 /// all under `LOCK_EX`, blocking any concurrent put or restore on this
-/// trash for the whole time (docs/design.md §5.4, invariant 9).
+/// trash for the whole time (docs/design.md §4; §0 invariant 9).
 static NEXT_TOMBSTONE: AtomicU64 = AtomicU64::new(0);
 
 fn next_tombstone_name(pid: u32) -> OsString {
@@ -784,7 +784,7 @@ fn next_tombstone_name(pid: u32) -> OsString {
 /// after trashing) would otherwise never tombstone; `remove_tree`'s own
 /// trash-policy repair runs too late, only on entries already inside a
 /// tombstone. Best-effort and silent: a failure here just means the
-/// rename below reports the real error (docs/design.md §6.7).
+/// rename below reports the real error (docs/design.md §4).
 fn add_owner_write_if_needed(dir: &OwnedFd, name: &OsStr) {
     let Ok(m) = sys::stat_at(dir, name) else {
         return;
@@ -852,7 +852,7 @@ fn fresh_tombstone(staging: &OwnedFd, name: &OsStr) -> io::Result<OsString> {
 /// path (which moves `files/NAME` out on its own, with no tombstone, so it
 /// must check this itself before unlinking the info it left behind) --
 /// both close the same name-reuse race a plain-by-name unlink cannot
-/// (docs/design.md §5.4, finding c0).
+/// (docs/design.md §5.3).
 pub fn info_matches(t: &Trash, name: &OsStr, info: &(Ident, Vec<u8>)) -> bool {
     matches!(reread_info(t, name), Some((id, bytes)) if id.same_file(&info.0) && bytes == info.1)
 }
@@ -861,17 +861,17 @@ pub fn info_matches(t: &Trash, name: &OsStr, info: &(Ident, Vec<u8>)) -> bool {
 /// item's now-unneeded trash copy, or put's own fresh copy after a failed
 /// rollback): tombstone, unlink the info, `remove_tree` the tombstone.
 /// Holds no lock of its own -- the caller already holds `LOCK_SH` across the
-/// whole put or restore that created this entry (docs/design.md §5.4).
+/// whole put or restore that created this entry (docs/design.md §5.3).
 /// `expected`, when given, ties the removal to a specific entry: after the
 /// tombstone rename, the tombstoned file must still be `entry` -- otherwise
 /// something else (a restore plus a new put reusing the freed name,
-/// docs/design.md §5.4) now holds `files/NAME`, and it is renamed back with
+/// docs/design.md §5.3) now holds `files/NAME`, and it is renamed back with
 /// `NOREPLACE` instead of being deleted. The info is unlinked only when it
 /// still matches `info`'s identity and bytes, so a `.trashinfo` a different
-/// item just published under the freed name survives too. This is the fix
-/// for finding c0 (a copy-back restore, or put's own copy-fallback
-/// rollback, that discards whatever now holds the name, not necessarily
-/// what it wrote). Called by restore.rs's `restore_item` and put.rs's
+/// item just published under the freed name survives too. This closes the
+/// gap (docs/design.md §5.3) where a copy-back restore, or put's own
+/// copy-fallback rollback, would otherwise discard whatever now holds the
+/// name, not necessarily what it wrote. Called by restore.rs's `restore_item` and put.rs's
 /// copy-fallback rollback, both always with `Some`; `None` stays supported
 /// for a caller that genuinely cannot know the name of what it is
 /// discarding.
@@ -963,8 +963,7 @@ pub fn delete_batch(t: &Trash, ms: &Mounts, doomed: &[Doomed], clean_staging: bo
     // if it already exists, never creating it -- when there might be a
     // stale box in it to clean up. A read-only trash dir with nothing
     // selected must not fail `empty` merely because it cannot create a
-    // directory it does not need (docs/design.md §8.2 "nothing selected:
-    // exit 0").
+    // directory it does not need (docs/design.md §4).
     let staging_fd = if doomed.is_empty() {
         let opened = if clean_staging {
             open_staging_if_exists(t)
@@ -1093,7 +1092,7 @@ fn delete_dangling(t: &Trash, g: &Dangling, rep: &mut Report) {
     // concurrent empty/restore already resolved this info (its identity no
     // longer matches). Either way this is no longer dangling, so there is
     // nothing wrong to report -- only a genuinely removed dangling info
-    // counts (docs/design.md §8.3's Dangling arm never skips one).
+    // counts (docs/design.md §4).
 }
 
 // ---------------------------------------------------------------------------
@@ -1176,7 +1175,7 @@ mod tests {
         assert!(dir.path().join("info/x~1.trashinfo").is_file());
     }
 
-    // ---- load (docs/design.md §4 "Loading") ----
+    // ---- load (docs/design.md §4) ----
 
     #[test]
     fn load_classifies_items_both_orphan_kinds_and_dangling() {
@@ -1310,13 +1309,13 @@ mod tests {
         assert!(remaining.is_empty(), "{remaining:?}");
     }
 
-    // ---- Review round (fix-empty.json) ----
+    // ---- reread_info ----
 
-    /// c16: `reread_info`'s fstat check is only a fast path -- a writer with
-    /// access to this trash's info/ can grow the file between that fstat
-    /// and the read that follows. The read itself must stay capped, so a
-    /// growing (or lying) info can never make rip read or allocate past
-    /// `MAX_INFO_SIZE`, no matter how the race lands.
+    /// docs/design.md §0 invariant 6: `reread_info`'s fstat check is only a
+    /// fast path -- a writer with access to this trash's info/ can grow the
+    /// file between that fstat and the read that follows. The read itself
+    /// must stay capped, so a growing (or lying) info can never make rip
+    /// read or allocate past `MAX_INFO_SIZE`, no matter how the race lands.
     #[test]
     fn reread_info_never_exceeds_the_cap_even_if_the_file_grows_after_fstat() {
         let dir = tempfile::tempdir().unwrap();
@@ -1359,11 +1358,11 @@ mod tests {
         );
     }
 
-    // ---- Review round (fix-common.json): discard_verified ----
+    // ---- discard_verified ----
 
     /// The core mechanism put.rs's copy-fallback rollback now relies on
-    /// (§C5 finding: it used to call the unverified `discard`, which could
-    /// delete whatever now held the name instead of the copy it made). This
+    /// (docs/design.md §5.3: it used to call the unverified `discard`, which
+    /// could delete whatever now held the name instead of the copy it made). This
     /// exercises `discard_verified` directly with the exact identity a
     /// caller captures right after publishing its own entry.
     #[test]
@@ -1389,7 +1388,7 @@ mod tests {
     /// `purge`'s own path, but for `discard_verified`: a caller's identity,
     /// captured right after it published its own entry, must not authorize
     /// deleting whatever a concurrent restore-plus-put has since put under
-    /// the same freed name (docs/design.md c0).
+    /// the same freed name (docs/design.md §5.3).
     #[test]
     fn discard_verified_puts_back_an_entry_that_changed_identity() {
         let dir = tempfile::tempdir().unwrap();

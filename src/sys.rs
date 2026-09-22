@@ -1,7 +1,7 @@
 //! Fd-based system primitives: identity (`Dev`/`Ident`/`Meta`), open/stat/rename
 //! helpers, `flock`, mount routing, the preflight walk and its manifest,
 //! `remove_tree`, and the `cp -a` copy fallback. See docs/design.md §4
-//! (on-disk names), §5 (crash consistency) and §6.5-§6.7 for the invariants
+//! (on-disk names), §5 (crash consistency) and §0 for the invariants
 //! these primitives back: every rename is `NOREPLACE`, removal never follows
 //! a symlink or crosses a mount, and a copy only ever reads its source.
 
@@ -72,9 +72,9 @@ impl Meta {
         self.mode & S_IFMT == S_IFREG
     }
 
-    /// `STATX_ATTR_MOUNT_ROOT`, already masked by `stx_attributes_mask`
-    /// (docs/design.md §5.3): absent on a kernel that does not report it,
-    /// never a false positive from an unmasked bit.
+    /// `STATX_ATTR_MOUNT_ROOT`, already masked by `stx_attributes_mask`:
+    /// absent on a kernel that does not report it, never a false positive
+    /// from an unmasked bit.
     pub fn is_mount_root(&self) -> bool {
         self.attrs.contains(StatxAttributes::MOUNT_ROOT)
     }
@@ -112,7 +112,7 @@ pub fn stat(p: &Path) -> io::Result<Meta> {
 }
 
 /// `lstat`: never follows a symlink in the final component (docs/design.md
-/// §0.3 invariant 4 and §3).
+/// §0 invariant 4).
 pub fn stat_at(d: impl AsFd, n: impl Arg) -> io::Result<Meta> {
     let x = fs::statx(d, n, AtFlags::SYMLINK_NOFOLLOW, statx_mask())?;
     Ok(to_meta(x))
@@ -222,7 +222,7 @@ impl Drop for LockGuard<'_> {
 
 /// `Ok(None)`: the filesystem does not support `flock` (e.g. some FUSE
 /// mounts). Tries `LOCK_NB` first; if that would block, prints the waiting
-/// message once and then blocks (docs/design.md §0.2 "Waiting").
+/// message once and then blocks (docs/design.md §1 "Waiting").
 pub fn lock(dir: &OwnedFd, l: Lock) -> io::Result<Option<LockGuard<'_>>> {
     let fd = dir.as_fd();
     let (nb, blocking) = match l {
@@ -262,7 +262,7 @@ fn flock_unsupported(e: Errno) -> bool {
 /// id and the expected `(dev, ino)`. A covered candidate fails this check. A
 /// read-only candidate is skipped, not returned: renaming through it would
 /// fail with `EROFS` (or, worse, succeed and silently defeat a read-only
-/// view someone set up on purpose -- docs/design.md c3), and a later
+/// view someone set up on purpose -- docs/design.md §1), and a later
 /// candidate on the same filesystem may still be writable.
 pub fn route(
     ms: &Mounts,
@@ -318,13 +318,13 @@ struct PreEntry {
 /// by `manifest_key`: the entry's path relative to the tree's own top, not
 /// by `(dev, ino)` alone. A bare inode number is only unique within one
 /// `st_dev` (nested btrfs subvolumes routinely reuse low inode numbers,
-/// docs/design.md §1), and worse, an inode that a concurrent writer renamed
+/// docs/design.md §5.2), and worse, an inode that a concurrent writer renamed
 /// into a path the walk visited keeps its inode number, size and mtime, so
 /// an identity-only manifest would match it there even though `cp` never
 /// copied it at that path. Keying by path, and requiring a verified copy at
 /// that same path, closes both holes: a source entry is removable only where
 /// the walk saw it AND the trash demonstrably holds a copy of it, at the
-/// same relative location (docs/design.md c1).
+/// same relative location (docs/design.md §5.2).
 ///
 /// mtime, not ctime, for the content check: unlinking one name of a
 /// hard-linked inode changes the inode's ctime, so a ctime-based check would
@@ -395,7 +395,7 @@ impl Manifest {
     /// walk keys its own entries (relative to ITS OWN top), so the two line
     /// up regardless of what the copy's top-level entry is called. Until
     /// this runs, `unchanged`/`dir_ok` authorize no removal (docs/design.md
-    /// c1: the source may be deleted only where the trash holds a verified
+    /// §5.2: the source may be deleted only where the trash holds a verified
     /// copy of that exact entry).
     pub fn verify_copy(&mut self, box_fd: BorrowedFd, copy_name: &OsStr) -> io::Result<()> {
         let w = walk(box_fd, copy_name, Check::Size)?;
@@ -416,7 +416,7 @@ struct WalkFrame {
     todo: Vec<OsString>,
     /// The directory's own sticky bit and owner, needed to judge whether a
     /// *child* entry found inside it belongs to someone else (docs/design.md
-    /// §6.6, "a sticky directory ... contains an entry that is not ours").
+    /// §6, "Copy complete but the source half-deleted").
     sticky: bool,
     owner: u32,
 }
@@ -426,7 +426,7 @@ struct WalkFrame {
 /// depth, not its width; never follows a symlink). `Check::Removable` also
 /// records the first reason `rm` (and, since this walk gates a copy, `cp`)
 /// would fail partway through, so rip refuses the item before it copies a
-/// byte (docs/design.md §6.6).
+/// byte (docs/design.md §6).
 pub fn walk(parent: BorrowedFd, name: &OsStr, check: Check) -> io::Result<Walk> {
     let uid = match check {
         Check::Removable { uid } => Some(uid),
@@ -503,8 +503,8 @@ fn count_leaf(rel: &Path, m: &Meta, w: &mut Walk) {
     );
 }
 
-/// Escapes a path or name for a `Walk::problem` message (docs/design.md
-/// c7): every one of these embeds an entry's own name from inside the tree
+/// Escapes a path or name for a `Walk::problem` message (docs/design.md §0
+/// invariant 10): every one of these embeds an entry's own name from inside the tree
 /// being walked, which can be hostile, and `Display` for `Path`/`OsStr`
 /// writes it raw. `problem` strings end up in put's stderr/prompt output by
 /// way of `PutErr`, never a `Path::display()`.
@@ -525,7 +525,7 @@ fn flag_immutable(m: &Meta, rel: &Path, w: &mut Walk) {
 /// `inode_permission` refuses `MAY_WRITE` for `IS_IMMUTABLE`) but not an
 /// append-only one: `IS_APPEND` is enforced only in `may_delete`, which
 /// `unlinkat`/`rmdir` hit later, after `rip` has already published a copy
-/// and started deleting the source (docs/design.md c12). Checked here, on
+/// and started deleting the source (docs/design.md §1). Checked here, on
 /// the parent `Meta` the caller already fetched, so the whole tree is
 /// refused up front like every other `removable_top_checks` reason.
 fn parent_flags_problem(pm: &Meta) -> Option<String> {
@@ -534,7 +534,7 @@ fn parent_flags_problem(pm: &Meta) -> Option<String> {
         .then(|| "its parent directory is immutable or append-only".to_string())
 }
 
-/// docs/design.md §6.6 bullets 1-3: unlinking the operand itself needs
+/// docs/design.md §6: unlinking the operand itself needs
 /// write+exec on its parent and, if the parent is sticky, ownership of the
 /// parent or the operand; the operand itself must not be immutable/append;
 /// and (since this walk gates a copy, not a bare `rm`) a regular file must be
@@ -571,7 +571,7 @@ fn removable_top_checks(parent: BorrowedFd<'_>, name: &OsStr, top: &Meta, uid: u
 }
 
 /// A directory found during the walk: descend into it, recording problems for
-/// docs/design.md §6.6 bullets 4-6. `None` means there is nothing to push
+/// docs/design.md §6. `None` means there is nothing to push
 /// (accounted for, or could not be entered).
 fn walk_open_dir(
     dir: BorrowedFd<'_>,
@@ -844,9 +844,9 @@ fn chmod_via_opath(dir: BorrowedFd<'_>, n: &OsStr, m: &Meta) -> io::Result<()> {
 }
 
 /// Clears `FD_CLOEXEC` on `fd` for the lifetime of the guard, restoring it on
-/// drop. Used only around a single, synchronous `cp` spawn (docs/design.md
-/// §1, decision 9): rip is single-threaded and spawns nothing else while a
-/// guard is alive, so no other process can inherit the fd.
+/// drop. Used only around a single, synchronous `cp` spawn: rip is
+/// single-threaded and spawns nothing else while a guard is alive, so no
+/// other process can inherit the fd.
 struct Inherit<'a> {
     fd: BorrowedFd<'a>,
 }
@@ -868,7 +868,7 @@ impl Drop for Inherit<'_> {
 /// `cp` reaches both through `/proc/self/fd`, so it copies exactly the
 /// directory rip walked, even if a path changes meanwhile. `dst` is expected
 /// not to exist (a fresh box), though `cp -a -T` onto an existing directory
-/// merges into it rather than erroring (docs/design.md §0.3 invariant 1).
+/// merges into it rather than erroring (docs/design.md §0 invariant 1).
 pub fn cp_archive(
     src_dir: BorrowedFd,
     src: &OsStr,
@@ -961,7 +961,7 @@ mod tests {
 
     /// A `Meta` for a regular file, without touching the filesystem: used to
     /// simulate an inode-number collision across two devices (as two nested
-    /// btrfs subvolumes commonly produce, docs/design.md §1) without needing
+    /// btrfs subvolumes commonly produce, docs/design.md §5.2) without needing
     /// a real multi-device test filesystem.
     fn synthetic_file_meta(dev: Dev, ino: u64, size: u64, mtime: (i64, u32)) -> Meta {
         Meta {
@@ -975,7 +975,7 @@ mod tests {
         }
     }
 
-    // ---- noreplace_with (docs/design.md §6.3) ----
+    // ---- noreplace_with (docs/design.md §5.1) ----
 
     #[test]
     fn noreplace_with_einval_and_exists_gives_eexist_without_plain_rename() {
@@ -1072,7 +1072,7 @@ mod tests {
 
     #[test]
     fn parent_flags_problem_catches_append_only_which_accessat_would_miss() {
-        // docs/design.md c12: chattr +a needs CAP_LINUX_IMMUTABLE, which the
+        // docs/design.md §1: chattr +a needs CAP_LINUX_IMMUTABLE, which the
         // bwrap sandbox cannot grant, so this exercises the fixed check
         // directly on a synthetic parent Meta rather than through a real
         // chattr'd directory. accessat(W_OK) alone would NOT catch this: the
@@ -1346,7 +1346,7 @@ mod tests {
 
     #[test]
     fn remove_tree_manifest_dir_does_not_match_colliding_ino_on_a_different_dev() {
-        // Simulates the nested-btrfs-subvolume case (docs/design.md §1):
+        // Simulates the nested-btrfs-subvolume case (docs/design.md §5.2):
         // a manifest entry recorded on one device (`foreign_dev`) shares an
         // inode number with a real, *different* directory on this test's
         // own device. `victim/sub` was never actually walked, so it must
@@ -1412,8 +1412,9 @@ mod tests {
         );
     }
 
-    // ---- c1: the manifest must key on path, and require a verified copy,
-    // not just a matching (dev, ino, size, mtime) found anywhere ----
+    // ---- docs/design.md §5.2: the manifest must key on path, and require a
+    // verified copy, not just a matching (dev, ino, size, mtime) found
+    // anywhere ----
 
     #[test]
     fn remove_tree_verified_copy_removes_only_what_it_confirms() {
@@ -1477,7 +1478,7 @@ mod tests {
 
     #[test]
     fn remove_tree_keeps_an_entry_renamed_to_a_path_the_walk_never_saw() {
-        // Reproduces the c1 finding: `t/b/f` is renamed to `t/a/f` between
+        // Reproduces the docs/design.md §5.2 race: `t/b/f` is renamed to `t/a/f` between
         // the preflight walk and the copy (simulated here directly, since
         // the underlying bug is a data-modeling one, not a timing one: the
         // manifest must refuse a path it never walked, regardless of
@@ -1552,8 +1553,8 @@ mod tests {
 
     #[test]
     fn remove_tree_keeps_an_entry_the_verified_copy_does_not_actually_hold() {
-        // The path-keyed identity check alone is not enough (a verifier's
-        // correction to the c1 finding): a file that moves away and back to
+        // The path-keyed identity check alone is not enough (docs/design.md
+        // §5.2): a file that moves away and back to
         // its original path during the copy window keeps its (dev, ino,
         // size, mtime) match at that same path, yet `cp` may never have
         // copied it there. Only a copy that `verify_copy` actually confirms
@@ -1711,7 +1712,7 @@ mod tests {
         );
     }
 
-    // ---- design §15.2 U1/U2: verify before route()/mount_conflict() rely on them ----
+    // ---- verify before route()/mount_conflict() rely on them ----
 
     #[test]
     fn mnt_id_matches_mountinfo() {
@@ -1739,7 +1740,7 @@ mod tests {
         assert!(
             m.is_mount_root(),
             "STATX_ATTR_MOUNT_ROOT was not reported for /; mount_conflict would need \
-             `path == own.point` alone (docs/design.md §5.3, §15.2 item 3)"
+             `path == own.point` alone (docs/design.md §1)"
         );
     }
 
@@ -1758,7 +1759,7 @@ mod tests {
         assert!(g2.is_some());
 
         // A separate open file description: LOCK_EX|LOCK_NB must not block
-        // while a shared lock is held elsewhere (design §13.1 "lock").
+        // while a shared lock is held elsewhere.
         let err = rustix::fs::flock(&fd3, rustix::fs::FlockOperation::NonBlockingLockExclusive)
             .unwrap_err();
         assert_eq!(err, Errno::WOULDBLOCK);
@@ -1792,7 +1793,7 @@ mod tests {
         assert!(start.elapsed() >= std::time::Duration::from_millis(100));
     }
 
-    // ---- route (docs/design.md §5.2) ----
+    // ---- route (docs/design.md §3.1) ----
     //
     // `Mounts` has no public constructor from `Mount` values directly (its
     // inner `Vec` field is private), so these go through the real mountinfo
@@ -1852,7 +1853,7 @@ mod tests {
 
     #[test]
     fn route_skips_a_read_only_candidate_instead_of_returning_it() {
-        // docs/design.md c3: renaming through a read-only mount either fails
+        // docs/design.md §3.1: renaming through a read-only mount either fails
         // with EROFS (if it is the only candidate, as here) or, worse, would
         // silently defeat the read-only view if a writable alias were tried
         // instead without checking it too. Either way, a read-only candidate
@@ -1879,7 +1880,7 @@ mod tests {
 
     #[test]
     fn route_rejects_a_candidate_whose_identity_does_not_match() {
-        // "Each candidate is checked, not trusted" (docs/design.md §5.2):
+        // "Each candidate is checked, not trusted" (docs/design.md §3.1):
         // the translated path for `b` opens fine here (it is a real
         // directory), but the caller's expected identity does not match it
         // -- as if something else were mounted over it since `b_id` was

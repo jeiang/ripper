@@ -45,7 +45,7 @@ Every review and test checks a change against these:
     hostile name cannot smuggle a terminal escape sequence through as "plain
     text".
 
-## 1. Behavior beyond the freedesktop.org spec and the brief
+## 1. Behavior beyond the freedesktop.org spec
 
 Each item here is a deliberate choice, reversible if it causes trouble:
 
@@ -121,7 +121,7 @@ Each item here is a deliberate choice, reversible if it causes trouble:
 
 ### 2.1 The argv pre-scan
 
-clap alone cannot give the brief's parsing rules. Flags and option values
+clap alone cannot give rip's own parsing rules. Flags and option values
 reset clap's parse state, and the next word is checked against subcommand
 names again (clap 4.6.7 `parser.rs`), so without a fix `rip foo -f empty`
 would run the `empty` subcommand instead of trashing files named `foo` and
@@ -347,7 +347,7 @@ now-unneeded trash copy is removed with `trash::discard_verified`, tied to
 the entry's own identity and info rather than deleted by name alone: if a
 concurrent restore-plus-new-put has already reused the freed name for
 something else, `discard_verified` renames it back untouched and refuses,
-instead of destroying an unrelated item (finding c0). `put.rs`'s own
+instead of destroying an unrelated item. `put.rs`'s own
 copy-fallback rollback calls the same `discard_verified`, tied to the
 identity it captured right after publishing its own entry, for the same
 reason.
@@ -383,7 +383,7 @@ is mid-deletion through an open fd.
 | Data-loss path | Protection | Tests |
 |---|---|---|
 | A rename overwrites an entry in `files/` | NOREPLACE; `files/` lstat in `reserve` | `collisions_and_name_max`; `noreplace_with` table |
-| NOREPLACE unsupported on FUSE (`EINVAL`) | `noreplace_with`: absent check, then plain rename | `noreplace_with` table; §15.2 item 1 on Mumei |
+| NOREPLACE unsupported on FUSE (`EINVAL`) | `noreplace_with`: absent check, then plain rename | `noreplace_with` table; §5.1 (verified on Mumei) |
 | A rename through a wrong or covered mount | fd verification (mount id and `(dev, ino)`) | `covered_persist_not_used`; mounts fixture tests |
 | `.Trash-$uid` created on the home trash's filesystem | the `choose()` FsId rule | `side_bind_root_copies_no_topdir_trash`, `pside_bind_root_uses_home_trash`; `choose` table |
 | A live bind source, a trash, or a dir holding mounts moved | `mount_conflict`, `inside_trash`, `contains_trash` | `refusals`; `mount_conflict` units |
@@ -418,7 +418,7 @@ Power loss cannot be tested; the `syncfs` placement is a standing review item.
 
 ## 7. Accepted residual risks
 
-Identified during the review round and deliberately left unfixed, each
+Identified and deliberately left unfixed, each
 because closing it needs either real-time coordination rip has no way to do
 from a single process, or a scope well beyond "small and direct":
 

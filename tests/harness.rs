@@ -1,4 +1,4 @@
-//! Verifies the sandbox itself (docs/design.md §13.3), before any test
+//! Verifies the sandbox itself (docs/design.md §3.1), before any test
 //! trusts it to isolate `rip` from the real trash.
 
 mod common;

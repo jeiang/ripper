@@ -1,6 +1,7 @@
 //! `/proc/self/mountinfo` parsing and path translation between mounts of the
-//! same filesystem (docs/design.md §5.1-5.3). Pure: nothing here touches the
-//! filesystem except `Mounts::read`, which just reads one file.
+//! same filesystem (docs/design.md §1, mount refusals; §3.1, mount routing).
+//! Pure: nothing here touches the filesystem except `Mounts::read`, which
+//! just reads one file.
 
 use std::collections::HashMap;
 use std::ffi::OsString;

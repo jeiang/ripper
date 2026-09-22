@@ -1,6 +1,6 @@
 //! `.trashinfo` encode/parse, `Path=` percent-encoding, `DeletionDate` parsing,
 //! trash `Kind`, `Path=` -> absolute path resolution, and `NAME_MAX`-safe
-//! collision names. See docs/design.md §3 (data model) and §4 (on-disk names).
+//! collision names. See docs/design.md §4 (on-disk names).
 
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};

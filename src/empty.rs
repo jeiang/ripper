@@ -1,8 +1,8 @@
 //! `rip empty`: permanently deletes trash entries, optionally filtered by
 //! age and total size. `select_for_empty` is the pure decision (docs/design.md
-//! §8.1); `run` discovers and loads every trash dir, selects candidates,
+//! §6); `run` discovers and loads every trash dir, selects candidates,
 //! prompts, and hands each trash dir's doomed entries to `trash::delete_batch`
-//! (docs/design.md §8.2, §8.3).
+//! (docs/design.md §5.4).
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
@@ -45,7 +45,7 @@ impl<'a> From<Entry<'a>> for Doomed<'a> {
     }
 }
 
-/// One candidate for deletion: an item or an orphan (docs/design.md §8.1;
+/// One candidate for deletion: an item or an orphan (docs/design.md §4;
 /// dangling infos are not candidates -- every `empty` removes them
 /// unconditionally, see `run` below). `key` is `(trash index, files/ name)`,
 /// which is unique per candidate and lets a caller look the real `Item`/
@@ -59,7 +59,7 @@ pub struct Cand {
     /// is that same batch). An orphan is dated by its files/ entry's local
     /// ctime, an unrelated clock, so it is always its own single-item
     /// batch even if that ctime happens to equal a neighboring item's
-    /// `DeletionDate` (coordinator decision, review round).
+    /// `DeletionDate` (docs/design.md §1).
     pub batchable: bool,
 }
 
@@ -72,7 +72,7 @@ pub struct Cand {
 /// older batch whole (never splitting a batch by size). Both filters
 /// together delete their union. The newest batch alone over `max` is an
 /// error carrying (its total, `max`): nothing is deleted (docs/design.md
-/// §8.1, the brief's `--max-size`, coordinator decision on batches).
+/// §1).
 pub fn select_for_empty(
     c: &mut [Cand],
     cutoff: Option<civil::DateTime>,
@@ -125,7 +125,7 @@ pub fn select_for_empty(
 }
 
 /// `files/NAME`'s apparent size, computed lazily by walking just that one
-/// entry (docs/design.md §8.1: never the whole trash). A walk error (the
+/// entry (docs/design.md §1: never the whole trash). A walk error (the
 /// entry raced away, an unreadable subdirectory, ...) contributes 0 rather
 /// than aborting `empty` over a size estimate; the actual deletion recheck
 /// happens later, inside `delete_batch` itself.
@@ -174,8 +174,7 @@ pub fn run(
     };
 
     // Items and orphans are candidates; each is keyed by (trash index,
-    // name), which `lookup` maps back to the real entry after selection
-    // (docs/design.md §8.1).
+    // name), which `lookup` maps back to the real entry after selection.
     let mut cands: Vec<Cand> = Vec::with_capacity(contents.items.len() + contents.orphans.len());
     let mut lookup: HashMap<(usize, OsString), Entry<'_>> = HashMap::new();
     for it in &contents.items {
@@ -215,7 +214,7 @@ pub fn run(
     };
 
     // Group the selected items/orphans by trash dir, oldest first within
-    // each (docs/design.md §8.3 "Empty flow"); count for the prompt.
+    // each; count for the prompt.
     let mut by_trash: Vec<Vec<Entry<'_>>> = trashes.iter().map(|_| Vec::new()).collect();
     let mut touched: HashSet<usize> = HashSet::new();
     let mut n_items = 0u64;
@@ -241,7 +240,7 @@ pub fn run(
             touched.len()
         );
         // A size is shown only when every doomed entry's size is already
-        // known from selection's own lazy walk (docs/design.md §8.1: it
+        // known from selection's own lazy walk (docs/design.md §1: it
         // sizes only as far as `--max-size` needs, up to the batch that
         // overflows). Walking the rest here just to fill in the prompt
         // would measure the whole older part of the trash before asking
@@ -268,7 +267,7 @@ pub fn run(
             Ok(true) => {}
             Ok(false) => return Ok(true),
             // confirm()'s own message names the question; empty's refusal is
-            // this fixed line instead (docs/design.md §8.2).
+            // this fixed line instead (docs/design.md §0 invariant 7).
             Err(_) if !io::stdin().is_terminal() => {
                 return Err("refusing to delete without confirmation (use -y)".into());
             }
@@ -277,8 +276,8 @@ pub fn run(
     }
 
     // Every trash dir found gets a delete_batch call: its selected items and
-    // orphans (possibly none), plus its dangling infos (always -- brief item
-    // 9), plus staging cleanup (docs/design.md §8.3 "Empty flow").
+    // orphans (possibly none), plus its dangling infos (always, docs/design.md
+    // §4), plus staging cleanup (docs/design.md §5.4).
     let mut dangling_by_trash: Vec<Vec<&trash::Dangling>> =
         trashes.iter().map(|_| Vec::new()).collect();
     for g in &contents.dangling {
@@ -309,7 +308,7 @@ pub fn run(
 }
 
 // ---------------------------------------------------------------------------
-// Tests (docs/design.md §13.1 "empty.rs / restore.rs": select_for_empty)
+// Tests (docs/design.md §6: select_for_empty table)
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -442,7 +441,7 @@ mod tests {
         );
     }
 
-    // ---- --max-size batching (review round, finding c2) ----
+    // ---- --max-size batching ----
 
     /// Two items sharing one `DeletionDate` -- one `rip` invocation -- are
     /// the newest batch. Its total alone is over `max`, so this must error
@@ -501,7 +500,7 @@ mod tests {
 
     /// An orphan never joins a batch, even when its (ctime-derived) date
     /// exactly equals a neighboring item's `DeletionDate`: it is always its
-    /// own single-item batch (coordinator decision, review round).
+    /// own single-item batch (docs/design.md §1).
     #[test]
     fn max_size_orphan_with_same_date_as_an_item_does_not_join_its_batch() {
         let mut c = vec![

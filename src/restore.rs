@@ -1,6 +1,5 @@
 //! `list`, selection (shared by `restore` and `purge`), the fzf picker,
-//! `restore`, `undo` and `purge`. See docs/design.md §7 (restore, undo, and
-//! purge selection) and §9 (fzf integration).
+//! `restore`, `undo` and `purge`. See docs/design.md §5.3 (restore).
 
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
@@ -50,8 +49,8 @@ pub fn list(cx: &Cx, all: bool, null: bool) -> Result<bool, String> {
 }
 
 /// `original`, relative to `cwd` when it lies under `cwd` (as `.` itself
-/// when `original` IS `cwd`, not an empty string -- finding c27), absolute
-/// otherwise (design §11).
+/// when `original` IS `cwd`, not an empty string), absolute otherwise
+/// (design §1).
 fn display_path(cwd: &Path, original: &Path) -> PathBuf {
     match original.strip_prefix(cwd) {
         Ok(rel) if rel.as_os_str().is_empty() => PathBuf::from("."),
@@ -63,7 +62,7 @@ fn display_path(cwd: &Path, original: &Path) -> PathBuf {
 /// Escapes a path the way `escape()` escapes any other name, for the error,
 /// prompt and report messages below whose path can come straight from a
 /// hostile `Path=` (or an entry name in a shared topdir trash) and must not
-/// reach the terminal raw (design §2.4, §11, finding c7).
+/// reach the terminal raw (design §0 invariant 10).
 fn esc_path(p: &Path) -> String {
     escape(p.as_os_str().as_bytes())
 }
@@ -73,7 +72,7 @@ fn esc_path(p: &Path) -> String {
 /// written as raw bytes throughout, except that it is passed through
 /// `escape()` for a plain listing to an actual terminal, so a hostile name
 /// on a shared filesystem cannot inject terminal escape sequences (design
-/// §2.4, §11).
+/// §0 invariant 10).
 fn write_items(
     out: &mut impl Write,
     items: &[&Item],
@@ -106,9 +105,9 @@ fn print_warnings(warnings: &[String]) {
 }
 
 /// Writes a restored path to stdout, relative to `cwd` when it lies under
-/// it (the same display rule as `list`, design §7.2 "Restored paths print
-/// to stdout, relative to cwd where possible"). Escaped only when stdout is
-/// an actual terminal, matching `list`'s own escaping rule (design §2.4).
+/// it (the same display rule as `list`; design §2.2: restored paths go to
+/// stdout). Escaped only when stdout is an actual terminal, matching
+/// `list`'s own escaping rule (design §0 invariant 10).
 fn print_path(cwd: &Path, path: &Path) {
     let rel = display_path(cwd, path);
     let stdout = io::stdout();
@@ -122,7 +121,7 @@ fn print_path(cwd: &Path, path: &Path) {
 }
 
 // ---------------------------------------------------------------------------
-// Selection (design §7.1), shared by restore and purge
+// Selection (design §5.3), shared by restore and purge
 // ---------------------------------------------------------------------------
 
 /// A selected trash entry: an `Item` for restore or purge, or an `Orphan`
@@ -162,7 +161,7 @@ fn dedup(targets: &mut Vec<Target<'_>>) {
 /// in it, which also collapses a bind-mount alias to whatever `original`
 /// was written against); the leaf name is then joined lexically. When even
 /// the parent does not exist, the whole path is normalized lexically
-/// instead (design §7.1 "resolve every PATH before any change").
+/// instead.
 fn resolve(cwd: &Path, p: &Path) -> PathBuf {
     let joined = if p.is_absolute() {
         p.to_path_buf()
@@ -198,7 +197,7 @@ fn lexical_normalize(p: &Path) -> PathBuf {
 /// Whether `abs` names a trash entry directly: its parent (or an ancestor)
 /// is some trash's `files/` directory. A direct child (`files/NAME`) names
 /// that entry; anything deeper (`files/NAME/sub`) is refused, since only
-/// the whole item can be restored or purged (design §7.1 "Trash paths").
+/// the whole item can be restored or purged.
 fn by_trash_path<'a>(
     ts: &'a [Trash],
     c: &'a Contents,
@@ -255,9 +254,7 @@ fn by_trash_path<'a>(
     Ok(None)
 }
 
-/// One line per variant, plus a hint, for the no-terminal case (design §7.1
-/// "several variants ... without a terminal fail and list DATE and
-/// TRASHPATH per variant with a hint").
+/// One line per variant, plus a hint, for the no-terminal case.
 fn variants_message(ts: &[Trash], abs: &Path, matches: &[&Item]) -> String {
     let mut msg = format!(
         "{} names {} trashed items; pass one of these trash paths instead:",
@@ -328,7 +325,7 @@ fn select<'a>(
 }
 
 // ---------------------------------------------------------------------------
-// fzf integration (design §9)
+// fzf integration
 // ---------------------------------------------------------------------------
 
 fn fzf_args(verb: &str) -> Vec<String> {
@@ -346,7 +343,7 @@ fn fzf_args(verb: &str) -> Vec<String> {
     .collect()
 }
 
-/// One `INDEX<TAB>DATE<TAB>PATH<NUL>` record (design §9). The display path
+/// One `INDEX<TAB>DATE<TAB>PATH<NUL>` record. The display path
 /// is escaped, so no record holds a raw tab or newline in PATH; a selection
 /// is mapped back only by the leading index, never by parsing PATH.
 fn fzf_record(index: usize, it: &Item, cwd: &Path) -> Vec<u8> {
@@ -386,7 +383,7 @@ fn pick<'a>(items: &[&'a Item], verb: &str, cwd: &Path) -> Result<Vec<&'a Item>,
     let mut child = Command::new("fzf")
         .args(fzf_args(verb))
         // The output format must not change under the person's own fzf
-        // config (design §9).
+        // config.
         .env_remove("FZF_DEFAULT_OPTS")
         .env_remove("FZF_DEFAULT_OPTS_FILE")
         .stdin(Stdio::piped())
@@ -413,7 +410,7 @@ fn pick<'a>(items: &[&'a Item], verb: &str, cwd: &Path) -> Result<Vec<&'a Item>,
     let out = child.wait_with_output().map_err(|e| e.to_string())?;
     match out.status.code() {
         Some(0) => {}
-        // No match, or cancelled: nothing happens, exit 0 (design §9).
+        // No match, or cancelled: nothing happens, exit 0 (design §2.2).
         Some(1) | Some(130) => return Ok(Vec::new()),
         _ => return Err("fzf failed".into()),
     }
@@ -422,7 +419,7 @@ fn pick<'a>(items: &[&'a Item], verb: &str, cwd: &Path) -> Result<Vec<&'a Item>,
 }
 
 // ---------------------------------------------------------------------------
-// Restoring one item (design §7.2)
+// Restoring one item (design §5.3)
 // ---------------------------------------------------------------------------
 
 /// `restore_item`'s failure. `Conflict` is specifically "the destination
@@ -451,7 +448,7 @@ impl From<io::Error> for RestoreError {
 /// Resolves each prefix of `rel` under `base`, creating any missing
 /// directory component (mode 0o777, subject to umask). `beneath` requires
 /// every step to stay under `base` and never cross a magic link
-/// (`RESOLVE_BENEATH|RESOLVE_NO_MAGICLINKS`, design §7.2), which is what
+/// (`RESOLVE_BENEATH|RESOLVE_NO_MAGICLINKS`, design §6), which is what
 /// makes a hostile `Path=` (or a planted symlink inside a topdir trash)
 /// unable to write outside `base` even though ordinary symlinks inside it
 /// still resolve normally. Returns the final parent's fd (always a plain
@@ -507,7 +504,7 @@ fn rmdir_reverse(created: &[(OwnedFd, OsString)]) {
 /// Rolls back `ensure_parent`'s created directories on drop, unless
 /// `disarm`ed. Every `?` between `ensure_parent` and a successful publish
 /// then undoes them on its own -- including the no-terminal `confirm` error
-/// and the other early exits after it (finding c9) -- without each one
+/// and the other early exits after it -- without each one
 /// having to remember to call `rmdir_reverse` itself.
 struct ParentGuard(Vec<(OwnedFd, OsString)>);
 
@@ -549,7 +546,7 @@ fn rename_free(
 }
 
 /// `it.entry`/`it.info` still match `t`'s on-disk state right now (a
-/// shorthand for the recheck finding c0 asks for at several points: right
+/// shorthand for the recheck docs/design.md §5.3 asks for at several points: right
 /// after the lock, again immediately before the rename-back, and again
 /// immediately before the copy -- the entry can be renamed or replaced by
 /// another `rip` at any point up to the moment we actually act on it, since
@@ -566,12 +563,12 @@ fn recheck(t: &Trash, it: &Item) -> Result<(), RestoreError> {
 
 /// Restores one item: renames it back when its destination shares the
 /// trash's subvolume and a mount shows both, otherwise copies it back
-/// (design §7.2). `Ok(None)` means the person declined the copy-back size
+/// (design §5.3). `Ok(None)` means the person declined the copy-back size
 /// prompt; the item stays in the trash, and that is not a failure.
 ///
 /// Every step after the lock is tied to the verified entry, not just its
-/// name (finding c0): the size prompt is asked *before* the lock is taken
-/// at all (so `empty`/`purge` never wait on a human answer, finding c10),
+/// name: the size prompt is asked *before* the lock is taken
+/// at all (so `empty`/`purge` never wait on a human answer, design §5.3),
 /// then the lock is taken and `still_same` is rechecked immediately before
 /// each point that actually touches `files/NAME` -- the rename-back, and
 /// the copy. `trash::discard_verified` gets the entry's own identity and
@@ -641,7 +638,7 @@ fn restore_item(
     // The copy-back size prompt is asked before any lock is taken, the same
     // way put's own copy-fallback prompt is: otherwise `empty`/`purge`
     // (including the unattended timer) wait on a human answer with no time
-    // limit (finding c10).
+    // limit (design §5.3).
     if route.is_none() {
         let size = sys::walk(t.files.as_fd(), &it.name, Check::Size)?.size;
         if !yes && size > cx.cfg.copy_threshold {
@@ -660,13 +657,13 @@ fn restore_item(
     recheck(t, it)?;
 
     if let Some((from, to)) = route {
-        // Recheck immediately before the rename-back (finding c0): a
+        // Recheck immediately before the rename-back (design §5.3): a
         // concurrent restore/put sharing the same LOCK_SH could have taken
         // the name since the check above.
         recheck(t, it)?;
         match rename_free(&from, &it.name, &to, name, rename) {
             Ok(n) => {
-                // Also verify before unlinking the info (finding c0): a put
+                // Also verify before unlinking the info (design §5.3): a put
                 // that reused the freed name in the meantime keeps its own
                 // info file, rather than losing it to this unlink.
                 if trash::info_matches(t, &it.name, &it.info) {
@@ -684,8 +681,8 @@ fn restore_item(
 
     if had_route && !yes {
         // A route looked usable before the lock but needs a copy after
-        // all: asking now would hold the lock across the prompt (c10)
-        // again, so ask the person to retry instead of silently skipping
+        // all: asking now would hold the lock across the prompt (design
+        // §5.3) again, so ask the person to retry instead of silently skipping
         // the confirmation this rare race would otherwise cause.
         let size = sys::walk(t.files.as_fd(), &it.name, Check::Size)?.size;
         if size > cx.cfg.copy_threshold {
@@ -696,7 +693,7 @@ fn restore_item(
     }
 
     // Copy back. The destination is complete and durable before the trash
-    // copy goes (design §0.3 invariant 2).
+    // copy goes (design §0 invariant 2).
     let (bx, bfd) = sys::make_box(pfd.as_fd(), ".rip-restore")?;
     let discard_box = |bx: &OsStr| {
         sys::remove_tree(
@@ -709,7 +706,7 @@ fn restore_item(
             },
         );
     };
-    // Recheck immediately before the copy (finding c0).
+    // Recheck immediately before the copy (design §5.3).
     if let Err(e) = recheck(t, it) {
         discard_box(&bx);
         return Err(e);
@@ -731,7 +728,7 @@ fn restore_item(
     // Recheck immediately before discard is `discard_verified`'s own job:
     // it tombstones by name, then verifies the tombstoned file really is
     // `it.entry` before treating it as ours to delete, and puts it back
-    // (rather than destroying it) if not (finding c0).
+    // (rather than destroying it) if not (design §5.3).
     if let Err(e) = trash::discard_verified(t, &cx.mounts, &it.name, Some((it.entry, &it.info))) {
         eprintln!("rip: restored, but the trash copy remains: {e}");
     }
@@ -744,8 +741,7 @@ fn restore_item(
 
 /// Sorts by original-path component count, then by raw path bytes, so a
 /// batch that includes both a directory and something inside it restores
-/// the directory first (design §7.1 "Restore and undo sort their batch
-/// parents first").
+/// the directory first (design §5.3).
 fn sort_parents_first(items: &mut [&Item]) {
     items.sort_by(|a, b| {
         a.original
@@ -762,10 +758,9 @@ fn sort_parents_first(items: &mut [&Item]) {
 }
 
 /// The first path in `blocked` that `original` is (or is under), if any
-/// (design §7.1 "Restore and undo sort their batch parents first", finding
-/// c4): once a batch parent's own restore is declined, refused or fails, a
-/// child of it must not be restored into a directory `ensure_parent` then
-/// has to fabricate in its place.
+/// (design §5.3): once a batch parent's own restore is declined, refused
+/// or fails, a child of it must not be restored into a directory
+/// `ensure_parent` then has to fabricate in its place.
 fn blocking_ancestor<'a>(blocked: &'a [PathBuf], original: &Path) -> Option<&'a Path> {
     blocked
         .iter()
@@ -820,7 +815,7 @@ pub fn restore(
 }
 
 // ---------------------------------------------------------------------------
-// undo (design §7.4)
+// undo (design §5.3)
 // ---------------------------------------------------------------------------
 
 /// The newest `DeletionDate` across every trashed item, or `None` when the
@@ -881,7 +876,7 @@ pub fn undo(cx: &Cx, yes: bool) -> Result<bool, String> {
 }
 
 // ---------------------------------------------------------------------------
-// purge (design §7.4)
+// purge (design §5.4)
 // ---------------------------------------------------------------------------
 
 fn purge_line(cwd: &Path, trashes: &[Trash], t: &Target<'_>) -> String {
@@ -977,8 +972,8 @@ mod tests {
         }
     }
 
-    // ---- fzf_record / decode_fzf_output (design §13.1 "fzf record encode
-    // and index decode") ----
+    // ---- fzf_record / decode_fzf_output (fzf record encode and index
+    // decode) ----
 
     #[test]
     fn fzf_record_is_index_tab_date_tab_path_nul() {
@@ -1012,8 +1007,8 @@ mod tests {
         );
     }
 
-    // ---- undo selection (design §13.1 "Undo batch across trash dirs.
-    // Parents-first ordering.") ----
+    // ---- undo selection (design §5.3: undo batch across trash dirs,
+    // parents-first ordering) ----
 
     #[test]
     fn newest_date_across_trash_dirs() {
@@ -1070,7 +1065,7 @@ mod tests {
         );
     }
 
-    // ---- resolve / lexical_normalize (design §7.1) ----
+    // ---- resolve / lexical_normalize ----
 
     #[test]
     fn lexical_normalize_collapses_dot_and_dot_dot() {
@@ -1095,7 +1090,7 @@ mod tests {
         assert_eq!(got, PathBuf::from("/no/such/also-gone"));
     }
 
-    // ---- blocking_ancestor (finding c4: skip a child whose batch parent
+    // ---- blocking_ancestor (design §5.3: skip a child whose batch parent
     // was declined, refused or failed) ----
 
     #[test]
@@ -1117,7 +1112,7 @@ mod tests {
         );
     }
 
-    // ---- display_path (finding c27: "." for original == cwd, not "") ----
+    // ---- display_path (design §1: "." for original == cwd, not "") ----
 
     #[test]
     fn display_path_shows_dot_when_original_is_the_cwd() {

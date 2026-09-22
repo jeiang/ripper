@@ -1,4 +1,4 @@
-//! `rip FILE...` (docs/design.md §13.3 "tests/put.rs"). Every test runs
+//! `rip FILE...` (docs/design.md §3, §5.1, §5.2). Every test runs
 //! `rip` inside the bwrap sandbox (tests/common), never against a real trash.
 //! "Same inode" (`inode()` equal) proves a rename; a different inode proves
 //! a copy. `inode()` includes the device: inode numbers on two different
@@ -49,14 +49,14 @@ fn empty_dir(path: &Path) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Placement: rename vs. copy, per source (docs/design.md §3.2, §13.3)
+// Placement: rename vs. copy, per source (docs/design.md §3.2)
 // ---------------------------------------------------------------------------
 
 #[test]
 fn same_bind_renames() {
     // A layout variant where the trash and the file being trashed share one
     // single bind, so the rename needs no routing through another mount at
-    // all (docs/design.md §13.3).
+    // all.
     let mut sandbox = Sandbox::artemis();
     let local_share_host = sandbox.host("/persist").join("u/.local/share");
     sandbox.without("/home/u/.local/share/Trash");
@@ -302,7 +302,7 @@ fn other_fs_topdir_trash() {
 
 #[test]
 fn skipped_half_trash_is_still_refused_not_repaired_and_reused() {
-    // docs/design.md c14: discovery skips a `.Trash-$uid` that is missing
+    // docs/design.md §1: discovery skips a `.Trash-$uid` that is missing
     // its info/ subdirectory (it warns and moves on), but topdir_trash's own
     // placement logic would happily repair and reuse that very directory.
     // An operand already inside it must still be refused, not silently
@@ -410,7 +410,7 @@ fn invalid_user_trash_symlink_falls_back() {
 
 #[test]
 fn topdir_trash_swap_race_never_creates_outside_the_trash() {
-    // docs/design.md c15: topdir_trash must open/create `.Trash-$uid` (and
+    // docs/design.md §3.1: topdir_trash must open/create `.Trash-$uid` (and
     // files/, info/) fd-relative, never by re-resolving a path, so a symlink
     // a concurrent writer swaps in for it is refused by O_NOFOLLOW on the
     // reopen, never followed. A host thread races a tight
@@ -523,7 +523,7 @@ fn bind_over_topdir_trash_exdev() {
 }
 
 // ---------------------------------------------------------------------------
-// Fallback config, copy threshold, copy rollback (docs/design.md §5.5, §6.5)
+// Fallback config, copy threshold, copy rollback (docs/design.md §3.1, §5.2)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -627,7 +627,7 @@ fn copy_refused_unwritable_subdir() {
 }
 
 // ---------------------------------------------------------------------------
-// Collisions, non-UTF-8, symlinks (docs/design.md §4, §6.1, §13.3)
+// Collisions, non-UTF-8, symlinks (docs/design.md §4)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -743,8 +743,7 @@ fn symlinks() {
 }
 
 // ---------------------------------------------------------------------------
-// Refusals, resolution order, force/verbose, prompts (docs/design.md §5.3,
-// §6.1, §6.2)
+// Refusals, resolution order, force/verbose, prompts (docs/design.md §1)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -832,7 +831,7 @@ fn missing_and_force() {
 
 #[test]
 fn force_ignores_enotdir_like_rm_but_still_refuses_trailing_slash() {
-    // docs/design.md c25: `rip -f f/x`, where `f` is a regular file, fails
+    // docs/design.md §1: `rip -f f/x`, where `f` is a regular file, fails
     // to resolve with ENOTDIR. GNU `rm -f` treats that the same as a
     // missing path (its own nonexistent_file_errno list includes ENOTDIR)
     // and exits 0 silently; `-f` must do the same. The trailing-slash
@@ -1036,7 +1035,7 @@ fn argv_rules() {
 }
 
 // ---------------------------------------------------------------------------
-// Read-only mounts (docs/design.md c3): a real read-only MOUNT (mountinfo's
+// Read-only mounts (docs/design.md §1): a real read-only MOUNT (mountinfo's
 // `ro` option), not a permission-based restriction, which `Sandbox`'s own
 // `bind`/`without` API cannot express. This mirrors tests/restore.rs's own
 // `base_bwrap`, built locally rather than by editing tests/common/mod.rs.
@@ -1120,7 +1119,7 @@ fn read_only_mount_is_refused_not_routed_around() {
     // A directory on the home trash's own subvolume, exposed through a
     // genuinely read-only MOUNT (not just permission bits), must be refused
     // like `rm` would -- not bypassed by renaming through /persist, a
-    // writable alias of the same subvolume (docs/design.md c3).
+    // writable alias of the same subvolume (docs/design.md §1).
     let sandbox = Sandbox::artemis();
     let ro_host = sandbox.host("/persist").join("u/roview");
     std::fs::create_dir_all(&ro_host).unwrap();
@@ -1147,7 +1146,7 @@ fn read_only_mount_is_refused_not_routed_around() {
 }
 
 // ---------------------------------------------------------------------------
-// Hostile output (docs/design.md c7): a name with terminal escapes must
+// Hostile output (docs/design.md §0 invariant 10): a name with terminal escapes must
 // never reach a real terminal raw, in any human-facing message put.rs
 // builds. Run on a real pty (`rip_tty`) the same way `list`'s own escaping
 // test does, since a plain pipe does not exercise terminal semantics.
@@ -1215,8 +1214,8 @@ fn walk_problem_message_escapes_a_hostile_entry_name() {
 }
 
 // ---------------------------------------------------------------------------
-// A deleted cwd (docs/design.md c26): each `Sandbox::rip` call starts a
-// fresh process with a fresh, valid cwd, so reproducing c26 needs one bwrap
+// A deleted cwd (docs/design.md §2.2): each `Sandbox::rip` call starts a
+// fresh process with a fresh, valid cwd, so reproducing this needs one bwrap
 // session that runs several `rip` invocations from a single shell, the
 // first of which trashes the directory that shell is sitting in.
 // ---------------------------------------------------------------------------
@@ -1265,7 +1264,7 @@ fn commands_run_from_a_deleted_cwd_do_not_exit_2() {
     );
 
     // "/mnt/side" is another subvolume of the home trash's own filesystem
-    // (docs/design.md §13.2 table): trashing a directory there takes the
+    // (docs/design.md §3.2): trashing a directory there takes the
     // copy fallback, which `remove_tree`s the original outright, instead of
     // a same-subvolume rename that would just leave it reachable under a
     // new name in files/. A shell sitting in that directory then loses
