@@ -83,28 +83,97 @@ pub fn choose_topdir(
     }
 }
 
-fn lstat_entry(path: &Path) -> Entry {
-    match sys::stat_at(CWD, path) {
-        Ok(m) if m.is_dir() => Entry::Dir {
-            uid: m.uid,
-            sticky: m.sticky(),
+/// `dir/name`, opened as a real directory (`O_NOFOLLOW`: never follows a
+/// symlink there), or why it is not usable as one: `Missing` (`ENOENT`, or
+/// any other unexpected error -- matching the pre-fix `lstat`-based check's
+/// "anything unexpected means not usable here" default) or `Other`
+/// (something exists but is not a directory rip can use; `O_NOFOLLOW` turns
+/// a symlink there into `ELOOP`, the fd-relative equivalent of a bare
+/// `lstat` reporting it as not-a-directory).
+enum Found {
+    Missing,
+    Dir(OwnedFd, Meta),
+    Other,
+}
+
+fn find_dir(dir: impl AsFd, name: &OsStr) -> Found {
+    match sys::open_dir(dir, name) {
+        Ok(fd) => match sys::stat_at(&fd, ".") {
+            Ok(m) => Found::Dir(fd, m),
+            Err(_) => Found::Missing,
         },
-        Ok(_) => Entry::Other,
-        Err(_) => Entry::Missing,
+        Err(e) if matches!(Errno::from_io_error(&e), Some(Errno::NOTDIR | Errno::LOOP)) => {
+            Found::Other
+        }
+        Err(_) => Found::Missing,
     }
 }
 
-fn mkdir_at_path(path: &Path) -> io::Result<()> {
-    match mkdirat(CWD, path, Mode::from_raw_mode(0o700)) {
-        Ok(()) | Err(Errno::EXIST) => Ok(()),
-        Err(e) => Err(e.into()),
+fn found_entry(f: &Found) -> Entry {
+    match f {
+        Found::Missing => Entry::Missing,
+        Found::Dir(_, m) => Entry::Dir {
+            uid: m.uid,
+            sticky: m.sticky(),
+        },
+        Found::Other => Entry::Other,
+    }
+}
+
+/// `mkdirat(dir, name, 0700)` (`EEXIST` ignored), then `open_dir` with
+/// `O_NOFOLLOW`: fd-relative throughout, so an entry a concurrent writer
+/// swaps for a symlink between the two calls is refused by `O_NOFOLLOW` on
+/// the reopen, never followed (docs/design.md c15).
+fn mkdir_and_open(dir: impl AsFd, name: &OsStr) -> io::Result<OwnedFd> {
+    match mkdirat(&dir, name, Mode::from_raw_mode(0o700)) {
+        Ok(()) | Err(Errno::EXIST) => {}
+        Err(e) => return Err(e.into()),
+    }
+    sys::open_dir(dir, name)
+}
+
+/// A `topdir_trash` failure. `Refuse` is a hard failure for the whole
+/// operand (docs/design.md c14: it is already inside the trash that would
+/// be used or repaired) -- unlike every other reason here, it must never be
+/// treated as "this topdir trash is unusable, fall back to copying
+/// elsewhere instead".
+pub enum TopdirErr {
+    Refuse(String),
+    Unusable(String),
+}
+
+impl From<String> for TopdirErr {
+    fn from(s: String) -> Self {
+        TopdirErr::Unusable(s)
+    }
+}
+
+impl From<&str> for TopdirErr {
+    fn from(s: &str) -> Self {
+        TopdirErr::Unusable(s.to_string())
     }
 }
 
 /// Opens or creates the topdir trash for `src` (already known, by `choose`,
 /// to need one), reached through mount `own`. Nothing is created until the
 /// mount-id and subvolume checks below pass (docs/design.md §5.4 step 1).
-pub fn topdir_trash(own: &Mount, src: &Meta, uid: u32) -> Result<Trash, String> {
+/// `path` is the operand's own resolved path: `Session::inside_trash` only
+/// refuses a path inside a trash discovery could actually open, so this
+/// checks it again here, against whichever directory is about to be used or
+/// repaired -- catching a trash discovery skipped with a warning (e.g. its
+/// `info/` is missing), which would otherwise get its missing half silently
+/// recreated and reused to re-trash an entry already inside it (c14).
+///
+/// Every lookup and creation below is relative to `top` (a verified fd on
+/// the right mount and subvolume) or to a further fd opened with
+/// `O_NOFOLLOW` under it -- never a fresh multi-component path walk from
+/// `own.point`. `admin_path`/`admin_uid_path`/`user_path`/`trash_path` are
+/// kept only for messages and for the returned `Trash`'s own `path` field;
+/// nothing re-opens through them. That way a symlink a concurrent writer
+/// swaps in for `.Trash`, `.Trash-$uid`, the uid subdir, `files/` or `info/`
+/// after this function has already looked at it is refused by `O_NOFOLLOW`,
+/// never followed (docs/design.md c15).
+pub fn topdir_trash(own: &Mount, src: &Meta, uid: u32, path: &Path) -> Result<Trash, TopdirErr> {
     let top = sys::open_path(CWD, &own.point).map_err(|e| e.to_string())?;
     let top_id = sys::ident(&top).map_err(|e| e.to_string())?;
     if top_id.mnt != own.id {
@@ -115,85 +184,145 @@ pub fn topdir_trash(own: &Mount, src: &Meta, uid: u32) -> Result<Trash, String> 
     }
 
     let admin_path = own.point.join(".Trash");
-    let admin = lstat_entry(&admin_path);
-    let admin_uid_path = admin_path.join(uid.to_string());
-    let admin_uid = if matches!(admin, Entry::Dir { sticky: true, .. }) {
-        lstat_entry(&admin_uid_path)
-    } else {
-        Entry::Missing
-    };
-    let user_path = own.point.join(format!(".Trash-{uid}"));
-    let user = lstat_entry(&user_path);
+    let uid_s = uid.to_string();
+    let admin_uid_path = admin_path.join(&uid_s);
+    let user_name = format!(".Trash-{uid}");
+    let user_path = own.point.join(&user_name);
 
-    if matches!(admin, Entry::Dir { sticky: false, .. } | Entry::Other) {
+    let admin = find_dir(&top, OsStr::new(".Trash"));
+    let admin_entry = found_entry(&admin);
+    let (admin_fd, admin_sticky) = match admin {
+        Found::Dir(fd, m) => (Some(fd), m.sticky()),
+        _ => (None, false),
+    };
+    let admin_uid = if admin_sticky {
+        // `admin_fd` is always `Some` here: `admin_sticky` is only true when
+        // `admin` matched `Found::Dir`, which is exactly when `admin_fd` was
+        // set from that same match.
+        find_dir(admin_fd.as_ref().unwrap(), OsStr::new(&uid_s))
+    } else {
+        Found::Missing
+    };
+    let admin_uid_entry = found_entry(&admin_uid);
+    let mut admin_uid_fd = match admin_uid {
+        Found::Dir(fd, _) => Some(fd),
+        _ => None,
+    };
+
+    let user = find_dir(&top, OsStr::new(&user_name));
+    let user_entry = found_entry(&user);
+    let mut user_fd = match user {
+        Found::Dir(fd, _) => Some(fd),
+        _ => None,
+    };
+
+    if matches!(admin_entry, Entry::Dir { sticky: false, .. } | Entry::Other) {
         eprintln!(
             "rip: {} is not a sticky directory; not using it",
             admin_path.display()
         );
     }
 
-    let mut pick = choose_topdir(admin, admin_uid, user, uid)?;
+    let pick = choose_topdir(admin_entry, admin_uid_entry, user_entry, uid)?;
     let mut kind = match pick {
         Pick::Admin { .. } => Kind::Admin,
         Pick::User { .. } => Kind::User,
     };
     let mut trash_path = match kind {
-        Kind::Admin => admin_uid_path,
+        Kind::Admin => admin_uid_path.clone(),
         _ => user_path.clone(),
     };
 
-    // Method 1 ("mkdirat(.Trash, uid, 0700)") can still fail even though
-    // .Trash itself passed the sticky/ownership checks above (e.g. a quota
-    // or an ACL); fall back to method 2 rather than failing the whole
-    // operand (docs/design.md §5.4 step 2).
-    if let Pick::Admin { create: true } = pick {
-        if let Err(e) = mkdir_at_path(&trash_path) {
-            eprintln!(
-                "rip: cannot create {}: {e}; using {}",
-                trash_path.display(),
-                user_path.display()
-            );
-            pick = match user {
-                Entry::Dir { uid: u, .. } if u == uid => Pick::User { create: false },
-                Entry::Missing => Pick::User { create: true },
-                Entry::Dir { .. } => return Err("its .Trash-UID belongs to another user".into()),
-                Entry::Other => return Err("its .Trash-UID is not a directory".into()),
-            };
-            kind = Kind::User;
-            trash_path = user_path;
+    let trash_fd: OwnedFd = if let Pick::Admin { create: true } = pick {
+        // Method 1 ("mkdirat(.Trash, uid, 0700)") can still fail even though
+        // .Trash itself passed the sticky/ownership checks above (e.g. a
+        // quota or an ACL); fall back to method 2 rather than failing the
+        // whole operand (docs/design.md §5.4 step 2).
+        let admin_fd = admin_fd
+            .as_ref()
+            .expect("choose_topdir only picks Admin when .Trash is a sticky dir");
+        match mkdir_and_open(admin_fd, OsStr::new(&uid_s)) {
+            Ok(fd) => fd,
+            Err(e) => {
+                eprintln!(
+                    "rip: cannot create {}: {e}; using {}",
+                    admin_uid_path.display(),
+                    user_path.display()
+                );
+                match user_entry {
+                    Entry::Dir { uid: u, .. } if u == uid => {}
+                    Entry::Missing => {}
+                    Entry::Dir { .. } => {
+                        return Err("its .Trash-UID belongs to another user".into());
+                    }
+                    Entry::Other => return Err("its .Trash-UID is not a directory".into()),
+                }
+                kind = Kind::User;
+                trash_path = user_path.clone();
+                match user_fd.take() {
+                    Some(fd) => fd,
+                    None => mkdir_and_open(&top, OsStr::new(&user_name))
+                        .map_err(|e| format!("cannot create {}: {e}", user_path.display()))?,
+                }
+            }
         }
+    } else if let Pick::Admin { create: false } = pick {
+        admin_uid_fd
+            .take()
+            .expect("choose_topdir Admin{create:false} means admin_uid already opened as a dir")
+    } else if let Pick::User { create: false } = pick {
+        user_fd
+            .take()
+            .expect("choose_topdir User{create:false} means user already opened as a dir")
+    } else {
+        mkdir_and_open(&top, OsStr::new(&user_name))
+            .map_err(|e| format!("cannot create {}: {e}", user_path.display()))?
+    };
+
+    if path.starts_with(&trash_path) {
+        return Err(TopdirErr::Refuse(format!(
+            "it is inside the trash at {}; use `rip purge` to delete it",
+            trash_path.display()
+        )));
     }
-    if let Pick::User { create: true } = pick {
-        mkdir_at_path(&trash_path)
-            .map_err(|e| format!("cannot create {}: {e}", trash_path.display()))?;
-    }
 
-    mkdir_at_path(&trash_path.join("files")).map_err(|e| e.to_string())?;
-    mkdir_at_path(&trash_path.join("info")).map_err(|e| e.to_string())?;
+    let files_fd = mkdir_and_open(&trash_fd, OsStr::new("files"))
+        .map_err(|e| format!("{}/files: {e}", trash_path.display()))?;
+    let info_fd = mkdir_and_open(&trash_fd, OsStr::new("info"))
+        .map_err(|e| format!("{}/info: {e}", trash_path.display()))?;
 
-    let t = trash::open_trash(&trash_path, kind, &own.point, uid)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| {
-            format!(
-                "{}: could not open the trash directory",
-                trash_path.display()
-            )
-        })?;
+    let id = sys::ident(&trash_fd).map_err(|e| e.to_string())?;
+    let files_id = sys::ident(&files_fd).map_err(|e| e.to_string())?;
+    let info_id = sys::ident(&info_fd).map_err(|e| e.to_string())?;
 
-    // Step 4: the trash dir, its files/, and top must all still share the
-    // source's mount and subvolume -- a race since step 1 is caught here,
-    // never trusted (docs/design.md invariant 5).
-    if t.id.mnt != own.id
-        || t.id.dev != src.id.dev
-        || t.files_id.mnt != own.id
-        || t.files_id.dev != src.id.dev
+    // Step 4: the trash dir, its files/ and info/ must all still share
+    // `own`'s mount and the source's subvolume -- a race since step 1 is
+    // caught here, on what was actually opened, never trusted from a path
+    // (docs/design.md invariant 5).
+    if id.mnt != own.id
+        || id.dev != src.id.dev
+        || files_id.mnt != own.id
+        || files_id.dev != src.id.dev
+        || info_id.mnt != own.id
+        || info_id.dev != src.id.dev
     {
         return Err(format!(
             "{}: its trash directory is on another mount",
             trash_path.display()
-        ));
+        )
+        .into());
     }
-    Ok(t)
+
+    Ok(Trash {
+        kind,
+        path: trash_path,
+        base: own.point.clone(),
+        dir: trash_fd,
+        files: files_fd,
+        info: info_fd,
+        id,
+        files_id,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -337,7 +466,18 @@ impl From<String> for PutErr {
 impl From<io::Error> for PutErr {
     fn from(e: io::Error) -> Self {
         PutErr {
-            not_found: e.kind() == io::ErrorKind::NotFound,
+            // `-f` ignores a missing operand the way `rm -f` does (docs
+            // brief item 4). GNU rm's `nonexistent_file_errno` treats
+            // ENOTDIR the same as ENOENT: a path whose parent component
+            // turned out not to be a directory is just as gone as one that
+            // never existed (c25). This does not cover the trailing-slash
+            // refusals in `put_one` (`'X/' names a symbolic link`, `Not a
+            // directory` for a non-directory operand itself): those are
+            // rip's own deliberate refusals, not this conversion.
+            not_found: matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ),
             msg: e.to_string(),
         }
     }
@@ -364,16 +504,22 @@ enum Done {
 }
 
 impl Done {
-    /// `-v` output (design §2.3: goes to stdout).
+    /// `-v` output (design §2.3: goes to stdout). `dest` embeds the item's
+    /// trashed name, which carries the operand's own (possibly hostile)
+    /// bytes verbatim aside from a collision suffix, so it goes through
+    /// `show` the same as `arg` (docs/design.md c7: human output never
+    /// writes an untrusted name raw to the terminal).
     fn print(&self, arg: &Path) {
         match self {
-            Done::Moved(dest) => println!("trashed '{}' -> {}", show(arg), dest.display()),
-            Done::Copied(dest, size) => println!(
-                "copied '{}' ({}) -> {}",
-                show(arg),
-                human(*size),
-                dest.display()
-            ),
+            Done::Moved(dest) => println!("trashed '{}' -> {}", show(arg), show(dest)),
+            Done::Copied(dest, size) => {
+                println!(
+                    "copied '{}' ({}) -> {}",
+                    show(arg),
+                    human(*size),
+                    show(dest)
+                )
+            }
             Done::Declined => {}
         }
     }
@@ -477,6 +623,14 @@ fn put_one(cx: &Cx, cli: &Cli, s: &mut Session, arg: &Path) -> Result<Done, PutE
         .mounts
         .by_id(st.id.mnt)
         .ok_or("its mount is not in /proc/self/mountinfo")?;
+    // A read-only mount is refused outright, the way `rm` is (docs/design.md
+    // c3): never routed around through some other, writable alias of the
+    // same subvolume. The copy fallback already refuses the same way
+    // (`removable_top_checks`'s accessat check), so this keeps both
+    // placement paths consistent.
+    if own.ro {
+        return Err("its filesystem is read-only".into());
+    }
     if let Some(why) = mounts::mount_conflict(&cx.mounts, own, &path, st.is_mount_root()) {
         return Err(format!("it {why}; not trashing it").into());
     }
@@ -509,7 +663,7 @@ fn put_one(cx: &Cx, cli: &Cli, s: &mut Session, arg: &Path) -> Result<Done, PutE
                 None => "no mount shows both it and the home trash",
             }
         }
-        Choice::Topdir => match topdir_trash(own, &st, cx.uid) {
+        Choice::Topdir => match topdir_trash(own, &st, cx.uid, &path) {
             Ok(t) => {
                 let t = s.add(t);
                 match move_in(t, &pfd, &name, &t.files, &path, date) {
@@ -520,7 +674,8 @@ fn put_one(cx: &Cx, cli: &Cli, s: &mut Session, arg: &Path) -> Result<Done, PutE
                     Err(e) => return Err(e.into()),
                 }
             }
-            Err(why) => leak(why),
+            Err(TopdirErr::Refuse(msg)) => return Err(msg.into()),
+            Err(TopdirErr::Unusable(msg)) => leak(msg),
         },
         Choice::Fallback(why) => why,
     };
@@ -572,7 +727,7 @@ fn move_in(
 fn removal_summary(rm: &Removal) -> String {
     rm.kept
         .iter()
-        .map(|(p, why)| format!("{}: {why}", p.display()))
+        .map(|(p, why)| format!("{}: {why}", show(p)))
         .collect::<Vec<_>>()
         .join("; ")
 }
@@ -596,7 +751,7 @@ fn copy_to_home(
         .into());
     }
 
-    let w = sys::walk(pfd.as_fd(), name, Check::Removable { uid: cx.uid })?; // one pass, before any write
+    let mut w = sys::walk(pfd.as_fd(), name, Check::Removable { uid: cx.uid })?; // one pass, before any write
     if let Some(p) = w.problem {
         return Err(format!("{p}; not copying it").into());
     }
@@ -605,7 +760,7 @@ fn copy_to_home(
         && !confirm(
             &format!(
                 "'{}' ({}) has no usable trash on its filesystem ({why}). Copy it into {} and delete the original?",
-                path.display(),
+                show(path),
                 human(w.size),
                 s.home().path.display()
             ),
@@ -616,7 +771,7 @@ fn copy_to_home(
     }
     eprintln!(
         "rip: '{}' has no usable trash on its filesystem ({why}); copying {} into the home trash",
-        path.display(),
+        show(path),
         human(w.size)
     );
 
@@ -641,6 +796,17 @@ fn copy_to_home(
     if let Err(e) = sys::cp_archive(pfd.as_fd(), name, bfd.as_fd(), OsStr::new("item")) {
         drop_box(&bx);
         return Err(format!("copying into the home trash failed: {e}; left it untouched").into());
+    }
+
+    // 1b. Verify: walk what `cp` actually produced, so step 5 below deletes
+    // a source entry only where the trash demonstrably holds a copy of it at
+    // the same relative path -- not merely one whose inode, size and mtime
+    // still match something the pre-copy walk saw somewhere in the tree
+    // (docs/design.md c1: a concurrent rename during the copy must not
+    // authorize deleting an entry `cp` never actually copied).
+    if let Err(e) = w.manifest.verify_copy(bfd.as_fd(), OsStr::new("item")) {
+        drop_box(&bx);
+        return Err(format!("could not verify the copy: {e}; left it untouched").into());
     }
 
     // 2. Reserve, 3. publish with NOREPLACE.
@@ -700,7 +866,7 @@ fn copy_to_home(
     if !rm.kept.is_empty() {
         return Err(format!(
             "the trash holds a complete copy ({}); these source entries were kept: {}",
-            home.path.join("files").join(&n).display(),
+            show(&home.path.join("files").join(&n)),
             removal_summary(&rm)
         )
         .into());

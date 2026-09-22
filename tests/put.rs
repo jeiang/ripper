@@ -9,8 +9,8 @@ mod common;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
-use std::path::Path;
-use std::process::Output;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
 
 use common::Sandbox;
 use rustix::process::getuid;
@@ -301,6 +301,41 @@ fn other_fs_topdir_trash() {
 }
 
 #[test]
+fn skipped_half_trash_is_still_refused_not_repaired_and_reused() {
+    // docs/design.md c14: discovery skips a `.Trash-$uid` that is missing
+    // its info/ subdirectory (it warns and moves on), but topdir_trash's own
+    // placement logic would happily repair and reuse that very directory.
+    // An operand already inside it must still be refused, not silently
+    // re-trashed into the trash that holds it.
+    let uid = getuid().as_raw();
+    let sandbox = Sandbox::artemis();
+    let trash_dir = sandbox.host("/mnt/other").join(format!(".Trash-{uid}"));
+    std::fs::create_dir_all(trash_dir.join("files")).unwrap();
+    std::fs::write(trash_dir.join("files/foo"), b"trashed earlier").unwrap();
+    // Deliberately no info/: this is what discovery skips with a warning.
+
+    let out = sandbox.rip("/mnt/other", &["-v", &format!(".Trash-{uid}/files/foo")]);
+    assert_fail(&out);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("it is inside the trash at") && stderr.contains("rip purge"),
+        "{stderr}"
+    );
+    assert!(
+        !trash_dir.join("info").exists(),
+        "must not have repaired the missing info/ while refusing"
+    );
+    assert!(
+        trash_dir.join("files/foo").is_file(),
+        "the original entry must be left exactly where it was"
+    );
+    assert!(
+        !trash_dir.join("files/foo~1").exists(),
+        "must not have been re-trashed into the same directory"
+    );
+}
+
+#[test]
 fn admin_trash_sticky_dir_is_used() {
     let uid = getuid().as_raw();
     let sandbox = Sandbox::artemis();
@@ -370,6 +405,66 @@ fn invalid_user_trash_symlink_falls_back() {
             .next()
             .is_none(),
         "a symlinked .Trash-U must never be followed into"
+    );
+}
+
+#[test]
+fn topdir_trash_swap_race_never_creates_outside_the_trash() {
+    // docs/design.md c15: topdir_trash must open/create `.Trash-$uid` (and
+    // files/, info/) fd-relative, never by re-resolving a path, so a symlink
+    // a concurrent writer swaps in for it is refused by O_NOFOLLOW on the
+    // reopen, never followed. A host thread races a tight
+    // renameat2(RENAME_EXCHANGE) loop, swapping a real (used) `.Trash-$uid`
+    // for a symlink to `victim`, against many `rip` invocations; whichever
+    // way each one lands, `victim` (reachable only through the symlink) must
+    // never receive a files/info subdirectory.
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let uid = getuid().as_raw();
+    let sandbox = Sandbox::artemis();
+    let other = sandbox.host("/mnt/other");
+    let real_trash = other.join(format!(".Trash-{uid}"));
+    std::fs::create_dir_all(real_trash.join("files")).unwrap();
+    std::fs::create_dir_all(real_trash.join("info")).unwrap();
+    let victim = other.join("victim");
+    std::fs::create_dir_all(&victim).unwrap();
+    let swap_name = other.join(format!(".Trash-{uid}.swap"));
+    // A relative target ("victim", a sibling of `swap_name` in the same
+    // directory): it resolves the same way whether dereferenced from the
+    // host (this process, running the swap loop) or from inside the bwrap
+    // sandbox (where `rip` actually runs), unlike an absolute host path,
+    // which would not exist inside the sandbox's own mount namespace at all.
+    std::os::unix::fs::symlink("victim", &swap_name).unwrap();
+
+    const ROUNDS: usize = 400;
+    for i in 0..ROUNDS {
+        std::fs::write(other.join(format!("x{i}")), b"hello").unwrap();
+    }
+
+    let racing = AtomicBool::new(true);
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            while racing.load(Ordering::Relaxed) {
+                let _ = rustix::fs::renameat_with(
+                    rustix::fs::CWD,
+                    &real_trash,
+                    rustix::fs::CWD,
+                    &swap_name,
+                    rustix::fs::RenameFlags::EXCHANGE,
+                );
+            }
+        });
+        for i in 0..ROUNDS {
+            let _ = sandbox.rip("/mnt/other", &["-v", &format!("x{i}")]);
+        }
+        racing.store(false, Ordering::Relaxed);
+    });
+
+    assert!(
+        std::fs::read_dir(&victim).unwrap().next().is_none(),
+        "a directory reached only through the swapped-in symlink must never \
+         receive files/info: topdir_trash must never re-resolve a path after \
+         checking it"
     );
 }
 
@@ -736,6 +831,38 @@ fn missing_and_force() {
 }
 
 #[test]
+fn force_ignores_enotdir_like_rm_but_still_refuses_trailing_slash() {
+    // docs/design.md c25: `rip -f f/x`, where `f` is a regular file, fails
+    // to resolve with ENOTDIR. GNU `rm -f` treats that the same as a
+    // missing path (its own nonexistent_file_errno list includes ENOTDIR)
+    // and exits 0 silently; `-f` must do the same. The trailing-slash
+    // refusal (`f/`, a deliberate rip-specific extra refusal, docs/design.md
+    // §1) is a different case and must still fail even under `-f`.
+    let sandbox = Sandbox::artemis();
+    let base = sandbox.host("/home/u/Downloads");
+    std::fs::write(base.join("f"), b"x").unwrap();
+
+    let out = sandbox.rip("/home/u/Downloads", &["-f", "f/x"]);
+    assert_ok(&out);
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(base.join("f").is_file(), "f itself must be untouched");
+
+    let out = sandbox.rip("/home/u/Downloads", &["-f", "f/x/y"]);
+    assert_ok(&out);
+
+    let out = sandbox.rip("/home/u/Downloads", &["-f", "f/"]);
+    assert_fail(&out);
+    assert!(
+        base.join("f").is_file(),
+        "the trailing-slash refusal must still leave f untouched"
+    );
+}
+
+#[test]
 fn interactive() {
     let sandbox = Sandbox::artemis();
     let base = sandbox.host("/home/u/Downloads");
@@ -906,4 +1033,183 @@ fn argv_rules() {
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
     assert_eq!(before.len(), after.len(), "the trash must be unchanged");
+}
+
+// ---------------------------------------------------------------------------
+// Read-only mounts (docs/design.md c3): a real read-only MOUNT (mountinfo's
+// `ro` option), not a permission-based restriction, which `Sandbox`'s own
+// `bind`/`without` API cannot express. This mirrors tests/restore.rs's own
+// `base_bwrap`, built locally rather than by editing tests/common/mod.rs.
+// ---------------------------------------------------------------------------
+
+const DEFAULT_BINDS: &[&str] = &[
+    "/persist",
+    "/home",
+    "/home/u/Downloads",
+    "/home/u/Documents",
+    "/home/u/.local/share/Trash",
+    "/mnt/side",
+    "/mnt/pside",
+    "/mnt/other",
+    "/mnt/ro",
+];
+
+/// The same fixed bwrap flags and binds `Sandbox::command` uses, plus `rip`'s
+/// own binary bound at the usual inside path. Callers add any extra binds
+/// (e.g. a genuine `--ro-bind`) and finish the invocation themselves.
+fn base_bwrap(sandbox: &Sandbox) -> Command {
+    let mut c = Command::new("bwrap");
+    c.args([
+        "--unshare-user",
+        "--unshare-pid",
+        "--die-with-parent",
+        "--new-session",
+        "--proc",
+        "/proc",
+        "--dev",
+        "/dev",
+        "--tmpfs",
+        "/tmp",
+        "--ro-bind",
+        "/nix",
+        "/nix",
+        "--ro-bind",
+        "/etc",
+        "/etc",
+    ]);
+    for p in ["/usr", "/bin", "/lib", "/lib64"] {
+        c.args(["--ro-bind-try", p, p]);
+    }
+    c.arg("--ro-bind")
+        .arg(env!("CARGO_BIN_EXE_rip"))
+        .arg("/run/rip/bin/rip");
+    for inside in DEFAULT_BINDS {
+        c.arg("--bind").arg(sandbox.host(inside)).arg(inside);
+    }
+    c
+}
+
+/// Finishes a `base_bwrap` command (env, cwd, argv) and runs it with stdin
+/// `/dev/null`, never a terminal.
+fn run_bwrap(mut c: Command, cwd: &str, args: &[&str]) -> Output {
+    c.args([
+        "--clearenv",
+        "--setenv",
+        "HOME",
+        "/home/u",
+        "--setenv",
+        "XDG_CONFIG_HOME",
+        "/home/u/.config",
+    ]);
+    let mut path_entries = vec![PathBuf::from("/run/rip/bin")];
+    if let Some(host_path) = std::env::var_os("PATH") {
+        path_entries
+            .extend(std::env::split_paths(&host_path).filter(|p| p.starts_with("/nix/store")));
+    }
+    c.arg("--setenv")
+        .arg("PATH")
+        .arg(std::env::join_paths(path_entries).expect("PATH entries must not contain ':' or NUL"));
+    c.arg("--chdir").arg(cwd);
+    c.arg("--").arg("/run/rip/bin/rip").args(args);
+    c.stdin(Stdio::null());
+    c.output().expect("spawn bwrap")
+}
+
+#[test]
+fn read_only_mount_is_refused_not_routed_around() {
+    // A directory on the home trash's own subvolume, exposed through a
+    // genuinely read-only MOUNT (not just permission bits), must be refused
+    // like `rm` would -- not bypassed by renaming through /persist, a
+    // writable alias of the same subvolume (docs/design.md c3).
+    let sandbox = Sandbox::artemis();
+    let ro_host = sandbox.host("/persist").join("u/roview");
+    std::fs::create_dir_all(&ro_host).unwrap();
+    std::fs::write(ro_host.join("x"), b"protected").unwrap();
+
+    let mut c = base_bwrap(&sandbox);
+    c.arg("--ro-bind").arg(&ro_host).arg("/home/u/roview");
+    let out = run_bwrap(c, "/home/u/roview", &["-v", "x"]);
+
+    assert_fail(&out);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("its filesystem is read-only"), "{stderr}");
+    assert!(
+        ro_host.join("x").exists(),
+        "the source must be left in place"
+    );
+    assert!(
+        !sandbox
+            .host("/home/u/.local/share/Trash/files")
+            .join("x")
+            .exists(),
+        "must not have been routed around the read-only view into the trash"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Hostile output (docs/design.md c7): a name with terminal escapes must
+// never reach a real terminal raw, in any human-facing message put.rs
+// builds. Run on a real pty (`rip_tty`) the same way `list`'s own escaping
+// test does, since a plain pipe does not exercise terminal semantics.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn verbose_rename_destination_escapes_a_hostile_name() {
+    let sandbox = Sandbox::artemis();
+    let base = sandbox.host("/home/u/Downloads");
+    let name = "x\x1b]0;PWNED\x07\x1b[2J";
+    std::fs::write(base.join(name), b"hello").unwrap();
+
+    let out = sandbox.rip_tty("/home/u/Downloads", &["-v", name], "");
+    assert!(out.status.success());
+    let tty = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !tty.contains('\x1b'),
+        "raw ESC reached the terminal: {tty:?}"
+    );
+    assert!(tty.contains("\\x1b"), "{tty:?}");
+}
+
+#[test]
+fn copy_fallback_notice_and_verbose_destination_escape_a_hostile_name() {
+    // Exercises both the "has no usable trash on its filesystem" notice and
+    // -v's "copied 'X' -> DEST" line, both printed from copy_to_home.
+    let sandbox = Sandbox::artemis();
+    let base = sandbox.host("/home/u");
+    std::fs::create_dir_all(&base).unwrap();
+    let name = "y\x1b]0;PWNED\x07";
+    std::fs::write(base.join(name), b"data").unwrap();
+
+    let out = sandbox.rip_tty("/home/u", &["-v", name], "");
+    assert!(out.status.success());
+    let tty = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !tty.contains('\x1b'),
+        "raw ESC reached the terminal: {tty:?}"
+    );
+    assert!(tty.contains("\\x1b"), "{tty:?}");
+}
+
+#[test]
+fn walk_problem_message_escapes_a_hostile_entry_name() {
+    // sys.rs's walk-problem messages (an unreadable entry inside a tree
+    // taking the copy fallback) embed the entry's own name too.
+    let sandbox = Sandbox::artemis();
+    let base = sandbox.host("/home/u");
+    std::fs::create_dir_all(base.join("top")).unwrap();
+    let name = "bad\x1b]0;PWNED\x07";
+    let secret = base.join("top").join(name);
+    std::fs::write(&secret, b"x").unwrap();
+    std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let out = sandbox.rip_tty("/home/u", &["top"], "");
+    std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    assert!(!out.status.success());
+    let tty = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !tty.contains('\x1b'),
+        "raw ESC reached the terminal: {tty:?}"
+    );
+    assert!(tty.contains("\\x1b"), "{tty:?}");
 }

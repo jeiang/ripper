@@ -6,12 +6,13 @@
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::io::{self, ErrorKind, Read, Write};
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use jiff::civil;
-use rustix::fs::{AtFlags, CWD, Mode, OFlags, mkdirat, openat, unlinkat};
+use rustix::fs::{AtFlags, CWD, Mode, OFlags, chmodat, mkdirat, openat, unlinkat};
 use rustix::io::Errno;
 use rustix::process::getuid;
 
@@ -252,7 +253,13 @@ pub fn open_home(path: &Path, create: bool, uid: u32) -> io::Result<Option<Trash
     if sys::stat_at(&dir, ".")?.uid != uid {
         return Ok(None);
     }
-    let base = canonical
+    // `path`'s own parent (`$XDG_DATA_HOME`), not `canonical`'s: the spec
+    // resolves a relative `Path=` in the home trash against `$XDG_DATA_HOME`
+    // regardless of where `Trash` itself points. When `Trash` is a symlink
+    // (e.g. impermanence's "symlink" method), `canonical.parent()` would be
+    // the *target*'s parent instead, misplacing `restore`/`undo`'s output
+    // for any relative `Path=` (docs/design.md §5's Home row).
+    let base = path
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| canonical.clone());
@@ -426,8 +433,18 @@ fn reread_info(t: &Trash, name: &OsStr) -> Option<(Ident, Vec<u8>)> {
     if !meta.is_file() || meta.len() > MAX_INFO_SIZE {
         return Some((id, Vec::new()));
     }
+    // `meta.len()` above is only a fast path: a writer with access to this
+    // topdir's info/ can grow the file between that fstat and the read
+    // below (docs/design.md invariant 6), so the read itself stays capped
+    // too, rather than trusting the size fstat reported.
     let mut buf = Vec::new();
-    file.read_to_end(&mut buf).ok()?;
+    (&mut file)
+        .take(MAX_INFO_SIZE + 1)
+        .read_to_end(&mut buf)
+        .ok()?;
+    if buf.len() as u64 > MAX_INFO_SIZE {
+        return Some((id, Vec::new()));
+    }
     Some((id, buf))
 }
 
@@ -436,6 +453,18 @@ fn strip_info_suffix(info_name: &OsStr) -> Option<&OsStr> {
         .as_bytes()
         .strip_suffix(info::INFO_SUFFIX.as_bytes())
         .map(OsStr::from_bytes)
+}
+
+/// Whether a `.trashinfo`'s stripped name could never really be a
+/// `files/NAME` directory-entry name: empty, `.`, `..`, or containing `/`.
+/// A hostile or buggy writer can still create the *info* file with such a
+/// name (`...trashinfo` strips to `..`); treated as an ordinary entry name,
+/// `..` resolves to the trash root itself and `.` to `files/` itself
+/// (docs/design.md invariant 6). This must never reach a `files/` lookup,
+/// `still_same`, or `tombstone`.
+fn is_malformed_entry_name(name: &OsStr) -> bool {
+    let b = name.as_bytes();
+    b.is_empty() || b == b"." || b == b".." || b.contains(&b'/')
 }
 
 fn local_ctime(m: &sys::Meta) -> civil::DateTime {
@@ -480,6 +509,23 @@ fn load_one(idx: usize, t: &Trash, c: &mut Contents) {
                 let Some(name) = strip_info_suffix(&info_name) else {
                     continue; // a stray file in info/ that is not a .trashinfo
                 };
+                if is_malformed_entry_name(name) {
+                    // Never resolve this against files/ at all -- record it
+                    // as garbage `delete_dangling` can unlink outright.
+                    if let Ok(lstat) = sys::stat_at(&t.info, &info_name) {
+                        c.warnings.push(format!(
+                            "{}: {}: malformed .trashinfo",
+                            t.path.display(),
+                            crate::escape(name.as_bytes())
+                        ));
+                        c.dangling.push(Dangling {
+                            trash: idx,
+                            name: name.to_owned(),
+                            info: lstat.id,
+                        });
+                    }
+                    continue;
+                }
                 let name = name.to_owned();
                 load_info_entry(idx, t, &name, c, &mut paired);
             }
@@ -544,7 +590,26 @@ fn load_info_entry(
     }
     let entry_meta = files_meta.unwrap();
     let Some((info_id, bytes)) = reread_info(t, name) else {
-        return; // raced away entirely between the lstat above and this read
+        // files/NAME is confirmed present (above), so this is not a race:
+        // the info exists (the lstat above found it) but cannot be opened
+        // at all (ELOOP: a symlink; EACCES: unreadable). Record it as an
+        // orphan with a malformed info, identified by that lstat, so
+        // empty/purge can remove it instead of leaving an entry nothing can
+        // ever delete (docs/design.md §4 "Loading").
+        c.warnings.push(format!(
+            "{}: {}: malformed .trashinfo",
+            t.path.display(),
+            crate::escape(name.as_bytes())
+        ));
+        c.orphans.push(Orphan {
+            trash: idx,
+            name: name.to_owned(),
+            date: local_ctime(&entry_meta),
+            entry: entry_meta.id,
+            info: Some((info_lstat.id, Vec::new())),
+        });
+        paired.insert(name.to_owned());
+        return;
     };
     let parsed = (!bytes.is_empty())
         .then(|| info::parse(&bytes))
@@ -614,6 +679,32 @@ pub fn staging(t: &Trash) -> io::Result<OwnedFd> {
     Ok(fd)
 }
 
+/// `.rip-staging`, opened only if it already exists -- never created.
+/// `delete_batch` uses this instead of `staging()` when a trash dir has
+/// nothing doomed, so a trash on a read-only mount that has never held a
+/// staging box does not fail `empty` merely because there is nothing there
+/// to clean up (docs/design.md §8.2).
+fn open_staging_if_exists(t: &Trash) -> io::Result<Option<OwnedFd>> {
+    let fd = match sys::open_dir(&t.dir, STAGING_NAME) {
+        Ok(fd) => fd,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let meta = sys::stat_at(&t.dir, STAGING_NAME)?;
+    if meta.uid != getuid().as_raw() {
+        return Err(io::Error::other(
+            ".rip-staging is not owned by the current user",
+        ));
+    }
+    let id = sys::ident(&fd)?;
+    if id.mnt != t.id.mnt {
+        return Err(io::Error::other(
+            ".rip-staging is not on the trash's own mount",
+        ));
+    }
+    Ok(Some(fd))
+}
+
 /// Opens `t.base` (the topdir) with `O_PATH|O_DIRECTORY`, requiring its
 /// `dev` to equal the trash's own -- used by restore to resolve a topdir
 /// item's original path beneath it with `RESOLVE_BENEATH`. First called by
@@ -657,9 +748,19 @@ fn orphan_still_same(t: &Trash, o: &Orphan) -> bool {
     match &o.info {
         None => sys::stat_at(&t.info, info_file_name(&o.name))
             .is_err_and(|e| e.kind() == ErrorKind::NotFound),
-        Some((id, bytes)) => {
-            matches!(reread_info(t, &o.name), Some((cid, cbytes)) if cid.same_file(id) && cbytes == *bytes)
-        }
+        Some((id, bytes)) => match reread_info(t, &o.name) {
+            Some((cid, cbytes)) => cid.same_file(id) && cbytes == *bytes,
+            // Still not openable now either. If it could not be read at
+            // load time either (an unopenable symlink or an unreadable
+            // info; `bytes` is then always empty), the lstat identity
+            // recorded then is all "unchanged" ever meant, so compare that
+            // instead of giving up forever (docs/design.md §4 "Loading").
+            None => {
+                bytes.is_empty()
+                    && sys::stat_at(&t.info, info_file_name(&o.name))
+                        .is_ok_and(|m| m.id.same_file(id))
+            }
+        },
     }
 }
 
@@ -685,13 +786,66 @@ fn entry_conflict(t: &Trash, ms: &Mounts, name: &OsStr) -> Option<String> {
     mounts::mount_conflict(ms, own, &path, meta.is_mount_root())
 }
 
+/// Never resets across calls within this process: each tombstone continues
+/// from the last number that succeeded, instead of every `tombstone()`/
+/// `fresh_tombstone()` call restarting at 0 and re-colliding (`EEXIST`) with
+/// every tombstone already in `.rip-staging` from earlier in the same
+/// batch. A batch of N doomed entries would otherwise cost N(N+1)/2 renames,
+/// all under `LOCK_EX`, blocking any concurrent put or restore on this
+/// trash for the whole time (docs/design.md §5.4, invariant 9).
+static NEXT_TOMBSTONE: AtomicU64 = AtomicU64::new(0);
+
+fn next_tombstone_name(pid: u32) -> OsString {
+    let n = NEXT_TOMBSTONE.fetch_add(1, Ordering::Relaxed);
+    OsString::from(format!("del.{pid}.{n}"))
+}
+
+/// If `dir/name` is a directory the current user owns but lacks `u+w` on,
+/// adds it. Moving a directory to a different parent needs write permission
+/// on the directory itself, to update `..` -- unlike every other entry
+/// kind, so a top-level entry without it (a copy-based trasher, or a chmod
+/// after trashing) would otherwise never tombstone; `remove_tree`'s own
+/// trash-policy repair runs too late, only on entries already inside a
+/// tombstone. Best-effort and silent: a failure here just means the
+/// rename below reports the real error (docs/design.md §6.7).
+fn add_owner_write_if_needed(dir: &OwnedFd, name: &OsStr) {
+    let Ok(m) = sys::stat_at(dir, name) else {
+        return;
+    };
+    if !m.is_dir() || m.uid != getuid().as_raw() || m.mode & 0o200 != 0 {
+        return;
+    }
+    let Ok(op) = openat(
+        dir,
+        name,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) else {
+        return;
+    };
+    // `fchmod` refuses an `O_PATH` fd, so reopen it through `/proc/self/fd`
+    // (which does accept normal flags) -- only after confirming, via the
+    // `O_PATH` open above (which bypasses the very permission bits being
+    // repaired), that it is still the same directory.
+    if sys::ident(&op).is_ok_and(|id| id.same_file(&m.id)) {
+        let via = format!("/proc/self/fd/{}", op.as_raw_fd());
+        let _ = chmodat(
+            CWD,
+            via.as_str(),
+            Mode::from_raw_mode(m.mode | 0o200),
+            AtFlags::empty(),
+        );
+    }
+}
+
 /// `rename_noreplace(files, NAME, staging, "del.<pid>.<n>")`. See
 /// `entry_conflict` above for why this is not yet reachable from `main`.
 #[allow(dead_code)]
 fn tombstone(t: &Trash, staging: &OwnedFd, name: &OsStr) -> io::Result<OsString> {
+    add_owner_write_if_needed(&t.files, name);
     let pid = std::process::id();
-    for n in 0u64..1_000_000 {
-        let tomb = OsString::from(format!("del.{pid}.{n}"));
+    for _ in 0u64..1_000_000 {
+        let tomb = next_tombstone_name(pid);
         match sys::rename_noreplace(&t.files, name, staging, &tomb) {
             Ok(()) => return Ok(tomb),
             Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
@@ -709,8 +863,8 @@ fn tombstone(t: &Trash, staging: &OwnedFd, name: &OsStr) -> io::Result<OsString>
 #[allow(dead_code)]
 fn fresh_tombstone(staging: &OwnedFd, name: &OsStr) -> io::Result<OsString> {
     let pid = std::process::id();
-    for n in 0u64..1_000_000 {
-        let tomb = OsString::from(format!("del.{pid}.{n}"));
+    for _ in 0u64..1_000_000 {
+        let tomb = next_tombstone_name(pid);
         match sys::rename_noreplace(staging, name, staging, &tomb) {
             Ok(()) => return Ok(tomb),
             Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
@@ -720,15 +874,49 @@ fn fresh_tombstone(staging: &OwnedFd, name: &OsStr) -> io::Result<OsString> {
     Err(io::Error::other("could not create a tombstone name"))
 }
 
+/// Whether `info/NAME.trashinfo` is still exactly `info`: same identity and
+/// bytes. Used by `discard_verified` below, and by restore.rs's rename-back
+/// path (which moves `files/NAME` out on its own, with no tombstone, so it
+/// must check this itself before unlinking the info it left behind) --
+/// both close the same name-reuse race a plain-by-name unlink cannot
+/// (docs/design.md §5.4, finding c0).
+#[allow(dead_code)]
+pub fn info_matches(t: &Trash, name: &OsStr, info: &(Ident, Vec<u8>)) -> bool {
+    matches!(reread_info(t, name), Some((id, bytes)) if id.same_file(&info.0) && bytes == info.1)
+}
+
 /// Permanently removes one entry this process itself owns (a restored
 /// item's now-unneeded trash copy, or put's own fresh copy after a failed
 /// rollback): tombstone, unlink the info, `remove_tree` the tombstone.
 /// Holds no lock of its own -- the caller already holds `LOCK_SH` across the
 /// whole put or restore that created this entry (docs/design.md §5.4).
-/// First called by put.rs's copy-fallback rollback (C4a) and restore.rs's
-/// `restore_item` (C4b).
+/// Equivalent to `discard_verified(t, ms, name, None)`: no identity check,
+/// for a caller (put.rs's copy-fallback rollback, C4a) discarding a copy
+/// nothing else can yet know the name of. First called by put.rs's
+/// copy-fallback rollback (C4a) and, through `discard_verified`,
+/// restore.rs's `restore_item` (C4b).
 #[allow(dead_code)]
 pub fn discard(t: &Trash, ms: &Mounts, name: &OsStr) -> io::Result<()> {
+    discard_verified(t, ms, name, None)
+}
+
+/// Like `discard`, but ties the removal to a specific entry when `expected`
+/// is given: after the tombstone rename, the tombstoned file must still be
+/// `entry` -- otherwise something else (a restore plus a new put reusing
+/// the freed name, docs/design.md §5.4) now holds `files/NAME`, and it is
+/// renamed back with `NOREPLACE` instead of being deleted. The info is
+/// unlinked only when it still matches `info`'s identity and bytes, so a
+/// `.trashinfo` a different item just published under the freed name
+/// survives too. This is the fix for finding c0 (a copy-back restore that
+/// discards whatever now holds the name, not necessarily what it copied).
+/// First called by restore.rs's `restore_item` (C4b).
+#[allow(dead_code)]
+pub fn discard_verified(
+    t: &Trash,
+    ms: &Mounts,
+    name: &OsStr,
+    expected: Option<(Ident, &(Ident, Vec<u8>))>,
+) -> io::Result<()> {
     if let Some(why) = entry_conflict(t, ms, name) {
         return Err(io::Error::other(format!(
             "cannot remove the trash copy: it {why}"
@@ -736,7 +924,23 @@ pub fn discard(t: &Trash, ms: &Mounts, name: &OsStr) -> io::Result<()> {
     }
     let staging_fd = staging(t)?;
     let tomb = tombstone(t, &staging_fd, name)?;
-    let _ = unlinkat(&t.info, info_file_name(name), AtFlags::empty());
+    if let Some((entry, info)) = expected {
+        let is_it = sys::stat_at(&staging_fd, &tomb).is_ok_and(|m| m.id.same_file(&entry));
+        if !is_it {
+            // Not the entry we meant to discard: put it back untouched and
+            // refuse, rather than delete whatever raced into the name.
+            let _ = sys::rename_noreplace(&staging_fd, &tomb, &t.files, name);
+            return Err(io::Error::other(
+                "the trash entry changed identity since it was restored; leaving it in place",
+            ));
+        }
+        if info_matches(t, name, info) {
+            let _ = unlinkat(&t.info, info_file_name(name), AtFlags::empty());
+        }
+        // Otherwise a different item's info now uses this name: leave it.
+    } else {
+        let _ = unlinkat(&t.info, info_file_name(name), AtFlags::empty());
+    }
     let removal = sys::remove_tree(
         staging_fd.as_fd(),
         &tomb,
@@ -800,9 +1004,28 @@ impl Report {
 #[allow(dead_code)]
 pub fn delete_batch(t: &Trash, ms: &Mounts, doomed: &[Doomed], clean_staging: bool) -> Report {
     let mut rep = Report::default();
-    let staging_fd = match staging(t) {
-        Ok(s) => s,
-        Err(e) => return rep.fail(t, e),
+    // Nothing doomed here: only bother opening `.rip-staging` -- and only
+    // if it already exists, never creating it -- when there might be a
+    // stale box in it to clean up. A read-only trash dir with nothing
+    // selected must not fail `empty` merely because it cannot create a
+    // directory it does not need (docs/design.md §8.2 "nothing selected:
+    // exit 0").
+    let staging_fd = if doomed.is_empty() {
+        let opened = if clean_staging {
+            open_staging_if_exists(t)
+        } else {
+            Ok(None)
+        };
+        match opened {
+            Ok(Some(fd)) => fd,
+            Ok(None) => return rep,
+            Err(e) => return rep.fail(t, e),
+        }
+    } else {
+        match staging(t) {
+            Ok(s) => s,
+            Err(e) => return rep.fail(t, e),
+        }
     };
     let mut tombs: Vec<OsString> = Vec::new();
     {
@@ -906,15 +1129,22 @@ fn delete_orphan(
 #[allow(dead_code)]
 fn delete_dangling(t: &Trash, g: &Dangling, rep: &mut Report) {
     let info_name = info_file_name(&g.name);
-    let still_missing =
-        sys::stat_at(&t.files, &g.name).is_err_and(|e| e.kind() == ErrorKind::NotFound);
+    // A malformed name (`.`, `..`, empty, `/`-containing) is never a real
+    // files/ entry, so it is always "still missing" without ever resolving
+    // it against files/ (docs/design.md invariant 6: `..` would otherwise
+    // resolve to the trash root itself, `.` to files/ itself).
+    let still_missing = is_malformed_entry_name(&g.name)
+        || sys::stat_at(&t.files, &g.name).is_err_and(|e| e.kind() == ErrorKind::NotFound);
     let same_info = sys::stat_at(&t.info, &info_name).is_ok_and(|m| m.id.same_file(&g.info));
     if still_missing && same_info {
         let _ = unlinkat(&t.info, &info_name, AtFlags::empty());
         rep.deleted += 1;
-    } else {
-        rep.skip(&g.name, "changed since it was listed");
     }
+    // Otherwise: a concurrent put finished (files/NAME now exists) or a
+    // concurrent empty/restore already resolved this info (its identity no
+    // longer matches). Either way this is no longer dangling, so there is
+    // nothing wrong to report -- only a genuinely removed dangling info
+    // counts (docs/design.md §8.3's Dangling arm never skips one).
 }
 
 // ---------------------------------------------------------------------------
@@ -1129,5 +1359,54 @@ mod tests {
 
         let remaining = sys::read_names(staging(&t).unwrap()).unwrap();
         assert!(remaining.is_empty(), "{remaining:?}");
+    }
+
+    // ---- Review round (fix-empty.json) ----
+
+    /// c16: `reread_info`'s fstat check is only a fast path -- a writer with
+    /// access to this trash's info/ can grow the file between that fstat
+    /// and the read that follows. The read itself must stay capped, so a
+    /// growing (or lying) info can never make rip read or allocate past
+    /// `MAX_INFO_SIZE`, no matter how the race lands.
+    #[test]
+    fn reread_info_never_exceeds_the_cap_even_if_the_file_grows_after_fstat() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = make_trash(dir.path());
+        std::fs::write(dir.path().join("files/x"), b"x").unwrap();
+        let info_path = dir.path().join("info/x.trashinfo");
+        std::fs::write(&info_path, info_text("x", "2026-01-01T00:00:00")).unwrap();
+        let small = std::fs::metadata(&info_path).unwrap().len();
+
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let mut worst = 0usize;
+        let mut wins = 0u32;
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&info_path)
+                    .unwrap();
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = f.set_len(small);
+                    let _ = f.set_len(256 << 20); // 256 MiB, sparse
+                }
+                let _ = f.set_len(small);
+            });
+            let start = std::time::Instant::now();
+            while start.elapsed() < std::time::Duration::from_secs(5) && wins < 3 {
+                if let Some((_, bytes)) = reread_info(&t, OsStr::new("x")) {
+                    worst = worst.max(bytes.len());
+                    if bytes.len() as u64 > MAX_INFO_SIZE {
+                        wins += 1;
+                    }
+                }
+            }
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        assert!(
+            worst as u64 <= MAX_INFO_SIZE,
+            "reread_info returned {worst} bytes, past the {MAX_INFO_SIZE}-byte cap \
+             ({wins} times over)"
+        );
     }
 }

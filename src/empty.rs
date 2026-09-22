@@ -53,15 +53,26 @@ impl<'a> From<Entry<'a>> for Doomed<'a> {
 pub struct Cand {
     pub date: civil::DateTime,
     pub key: (usize, OsString),
+    /// Whether this candidate can merge with an adjacent, equal-date
+    /// candidate into one `--max-size` batch: only an item can (its
+    /// `DeletionDate` names one `rip` invocation, so every item sharing it
+    /// is that same batch). An orphan is dated by its files/ entry's local
+    /// ctime, an unrelated clock, so it is always its own single-item
+    /// batch even if that ctime happens to equal a neighboring item's
+    /// `DeletionDate` (coordinator decision, review round).
+    pub batchable: bool,
 }
 
 /// Indices into `c`, after this sorts it newest-first, to delete. No filter:
-/// every candidate. `cutoff`: `date < cutoff`. `max`: keep the newest
-/// candidates while their running total stays at most `max`, then delete the
-/// first one that pushes the total over and every older one (even a smaller
-/// one). Both filters together delete their union. The newest candidate
-/// alone over `max` is an error carrying (its size, `max`): nothing is
-/// deleted (docs/design.md §8.1, the brief's `--max-size`).
+/// every candidate. `cutoff`: `date < cutoff`, per candidate. `max`: groups
+/// candidates into batches -- a run of adjacent, equal-date `batchable`
+/// candidates is one batch, everything else is its own single-item batch --
+/// then keeps the newest batches while their running total stays at most
+/// `max`, and deletes the first batch that pushes the total over and every
+/// older batch whole (never splitting a batch by size). Both filters
+/// together delete their union. The newest batch alone over `max` is an
+/// error carrying (its total, `max`): nothing is deleted (docs/design.md
+/// §8.1, the brief's `--max-size`, coordinator decision on batches).
 pub fn select_for_empty(
     c: &mut [Cand],
     cutoff: Option<civil::DateTime>,
@@ -69,7 +80,9 @@ pub fn select_for_empty(
     mut size: impl FnMut(&Cand) -> u64,
 ) -> Result<Vec<usize>, (u64, u64)> {
     // Newest first; ties break on `key` so the order is reproducible however
-    // the caller happened to build the candidate list.
+    // the caller happened to build the candidate list. A `batchable` tie
+    // still needs this for a deterministic *within-batch* order; it no
+    // longer affects which batch a candidate lands in.
     c.sort_by(|a, b| b.date.cmp(&a.date).then_with(|| a.key.cmp(&b.key)));
 
     let mut doomed = vec![cutoff.is_none() && max.is_none(); c.len()];
@@ -80,18 +93,32 @@ pub fn select_for_empty(
     }
     if let Some(max) = max {
         let mut total = 0u64;
-        let mut first = None;
-        let overflow = c.iter().position(|e| {
-            let s = size(e);
-            first.get_or_insert(s);
-            total = total.saturating_add(s);
-            total > max
-        });
-        if let Some(i) = overflow {
-            if i == 0 {
-                return Err((first.unwrap(), max));
+        let mut i = 0usize;
+        while i < c.len() {
+            // One batch: `c[start]` plus every following candidate that
+            // shares its date and is batchable too. Sizes only as far as
+            // this needs -- never past the batch that overflows `max`.
+            let start = i;
+            let mut batch = 0u64;
+            loop {
+                batch = batch.saturating_add(size(&c[i]));
+                i += 1;
+                let joins_batch = i < c.len()
+                    && c[start].batchable
+                    && c[i].batchable
+                    && c[i].date == c[start].date;
+                if !joins_batch {
+                    break;
+                }
             }
-            doomed[i..].iter_mut().for_each(|d| *d = true);
+            total = total.saturating_add(batch);
+            if total > max {
+                if start == 0 {
+                    return Err((batch, max));
+                }
+                doomed[start..].iter_mut().for_each(|d| *d = true);
+                break;
+            }
         }
     }
     Ok((0..c.len()).filter(|&i| doomed[i]).collect())
@@ -156,6 +183,7 @@ pub fn run(
         cands.push(Cand {
             date: it.date,
             key: key.clone(),
+            batchable: true,
         });
         lookup.insert(key, Entry::Item(it));
     }
@@ -164,6 +192,7 @@ pub fn run(
         cands.push(Cand {
             date: o.date,
             key: key.clone(),
+            batchable: false,
         });
         lookup.insert(key, Entry::Orphan(o));
     }
@@ -178,7 +207,7 @@ pub fn run(
         Ok(idx) => idx,
         Err((have, max)) => {
             return Err(format!(
-                "the newest item alone is {} but --max-size is {}; nothing was deleted",
+                "the newest batch alone is {} but --max-size is {}; nothing was deleted",
                 human(have),
                 human(max)
             ));
@@ -211,24 +240,28 @@ pub fn run(
             "permanently delete {n_items} items and {n_orphans} orphans from {} trash directories",
             touched.len()
         );
-        // A size is shown only when `--max-size` already made rip compute
-        // one; under `--older-than` alone (or no filter) summing sizes here
-        // would walk entries nobody asked to have measured.
+        // A size is shown only when every doomed entry's size is already
+        // known from selection's own lazy walk (docs/design.md §8.1: it
+        // sizes only as far as `--max-size` needs, up to the batch that
+        // overflows). Walking the rest here just to fill in the prompt
+        // would measure the whole older part of the trash before asking
+        // anything -- so if even one doomed entry was never sized, the
+        // size is left out instead of computed.
         if max_size.is_some() {
-            let total: u64 = doomed_idx
-                .iter()
-                .map(|&i| {
-                    let key = &cands[i].key;
-                    if let Some(&s) = size_cache.get(key) {
-                        s
-                    } else {
-                        let s = entry_size(&trashes[key.0], &key.1);
-                        size_cache.insert(key.clone(), s);
-                        s
+            let mut total = 0u64;
+            let mut known = true;
+            for &i in &doomed_idx {
+                match size_cache.get(&cands[i].key) {
+                    Some(&s) => total = total.saturating_add(s),
+                    None => {
+                        known = false;
+                        break;
                     }
-                })
-                .sum();
-            question.push_str(&format!(" ({})", human(total)));
+                }
+            }
+            if known {
+                question.push_str(&format!(" ({})", human(total)));
+            }
         }
         question.push('?');
         match confirm(&question, "-y") {
@@ -287,6 +320,14 @@ mod tests {
         Cand {
             date: date.parse().unwrap(),
             key: (trash, OsString::from(name)),
+            batchable: true,
+        }
+    }
+
+    fn orphan_cand(trash: usize, name: &str, date: &str) -> Cand {
+        Cand {
+            batchable: false,
+            ..cand(trash, name, date)
         }
     }
 
@@ -399,5 +440,85 @@ mod tests {
                 (1, "a".to_string()),
             ]
         );
+    }
+
+    // ---- --max-size batching (review round, finding c2) ----
+
+    /// Two items sharing one `DeletionDate` -- one `rip` invocation -- are
+    /// the newest batch. Its total alone is over `max`, so this must error
+    /// and delete nothing, regardless of which of the two sorts first by
+    /// name: it must not delete the larger one just because a smaller
+    /// sibling happens to sort ahead of it by name.
+    #[test]
+    fn max_size_newest_batch_over_max_errors_whichever_name_sorts_first() {
+        for small in ["a_notes", "z_notes"] {
+            let mut c = vec![
+                cand(0, "movie.mkv", "2026-09-01T12:00:00"), // size 8
+                cand(0, small, "2026-09-01T12:00:00"),       // size 1
+                cand(0, "older", "2026-08-01T12:00:00"),     // size 1
+            ];
+            let size = |cd: &Cand| {
+                if cd.key.1 == OsStr::new("movie.mkv") {
+                    8
+                } else {
+                    1
+                }
+            };
+            let err = select_for_empty(&mut c, None, Some(4), size).unwrap_err();
+            assert_eq!(err, (9, 4), "small={small}");
+        }
+    }
+
+    /// An older (non-newest) batch of two same-`DeletionDate` items must be
+    /// deleted or kept as a whole, never split so that only the one that
+    /// sorts first (or last) by name goes.
+    #[test]
+    fn max_size_does_not_split_an_older_batch_by_name() {
+        for (first, second) in [("b_small", "c_big"), ("b_big", "c_small")] {
+            let mut c = vec![
+                cand(0, "newest", "2026-01-03T00:00:00"), // size 1, always kept
+                cand(0, first, "2026-01-01T00:00:00"),
+                cand(0, second, "2026-01-01T00:00:00"),
+            ];
+            let sizes: HashMap<(usize, OsString), u64> = [
+                ((0, OsString::from("newest")), 1u64),
+                ((0, OsString::from(first)), 1),
+                ((0, OsString::from(second)), 3),
+            ]
+            .into_iter()
+            .collect();
+            // total if the whole older batch is kept too: 1+1+3 = 5 > 2.
+            let got = select_for_empty(&mut c, None, Some(2), |cd| sizes[&cd.key]).unwrap();
+            let doomed = names(&c, &got);
+            assert_eq!(
+                doomed.len(),
+                2,
+                "batch split for ({first}, {second}): {doomed:?}"
+            );
+            assert!(doomed.contains(&first.to_string()) && doomed.contains(&second.to_string()));
+        }
+    }
+
+    /// An orphan never joins a batch, even when its (ctime-derived) date
+    /// exactly equals a neighboring item's `DeletionDate`: it is always its
+    /// own single-item batch (coordinator decision, review round).
+    #[test]
+    fn max_size_orphan_with_same_date_as_an_item_does_not_join_its_batch() {
+        let mut c = vec![
+            cand(0, "item", "2026-01-01T00:00:00"),
+            orphan_cand(0, "orphan", "2026-01-01T00:00:00"),
+        ];
+        let sizes: HashMap<(usize, OsString), u64> = [
+            ((0, OsString::from("item")), 3u64),
+            ((0, OsString::from("orphan")), 100),
+        ]
+        .into_iter()
+        .collect();
+        // If they merged into one batch, the total (103) would be over max
+        // (3) with start == 0, so this would error and delete nothing. As
+        // separate batches, "item" alone (3) fits and "orphan" alone (100)
+        // overflows on its own.
+        let got = select_for_empty(&mut c, None, Some(3), |cd| sizes[&cd.key]).unwrap();
+        assert_eq!(names(&c, &got), vec!["orphan"]);
     }
 }

@@ -387,3 +387,43 @@ fn escape_on_terminal() {
         String::from_utf8_lossy(&out.stdout)
     );
 }
+
+// c23 (review round, fix-empty.json): a relative Path= in the home trash
+// must resolve against $XDG_DATA_HOME, not against a symlinked Trash's
+// target's parent.
+#[test]
+fn relative_path_in_symlinked_home_trash_resolves_against_xdg_data_home() {
+    let mut sandbox = Sandbox::artemis();
+    sandbox.without("/home/u/.local/share/Trash");
+    let home_dir = sandbox.host("/home/u/.local/share");
+    std::fs::create_dir_all(&home_dir).unwrap();
+    let target_host = sandbox.host("/persist").join("u/.local/share/Trash");
+    std::fs::create_dir_all(target_host.join("files")).unwrap();
+    std::fs::create_dir_all(target_host.join("info")).unwrap();
+    // The home trash itself is a symlink to another subvolume (e.g.
+    // impermanence's "symlink" method), pointing at an *inside* path --
+    // unlike tests/common's own artemis layout, which bind-mounts it.
+    std::os::unix::fs::symlink("/persist/u/.local/share/Trash", home_dir.join("Trash")).unwrap();
+    std::fs::write(target_host.join("files/note.txt"), b"data").unwrap();
+    std::fs::write(
+        target_host.join("info/note.txt.trashinfo"),
+        b"[Trash Info]\nPath=docs/note.txt\nDeletionDate=2026-01-01T00:00:00\n",
+    )
+    .unwrap();
+
+    let out = sandbox.rip("/", &["list", "--all", "-0"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let records = parse_null_records(&out.stdout);
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(
+        records[0].1,
+        b"home/u/.local/share/docs/note.txt",
+        "a relative Path= in the home trash must resolve against $XDG_DATA_HOME \
+         ($HOME/.local/share), not the symlinked Trash's target's parent: {:?}",
+        String::from_utf8_lossy(&records[0].1)
+    );
+}
