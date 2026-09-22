@@ -253,7 +253,13 @@ pub fn open_home(path: &Path, create: bool, uid: u32) -> io::Result<Option<Trash
     if sys::stat_at(&dir, ".")?.uid != uid {
         return Ok(None);
     }
-    let base = canonical
+    // `path`'s own parent (`$XDG_DATA_HOME`), not `canonical`'s: the spec
+    // resolves a relative `Path=` in the home trash against `$XDG_DATA_HOME`
+    // regardless of where `Trash` itself points. When `Trash` is a symlink
+    // (e.g. impermanence's "symlink" method), `canonical.parent()` would be
+    // the *target*'s parent instead, misplacing `restore`/`undo`'s output
+    // for any relative `Path=` (docs/design.md §5's Home row).
+    let base = path
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| canonical.clone());
