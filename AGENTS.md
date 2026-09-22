@@ -14,6 +14,9 @@ btrfs subvolumes and bind mounts (NixOS impermanence). Design: docs/design.md.
 - Keep the invariants in docs/design.md §0. Never use std::fs::remove_dir_all or
   std::fs::rename in trash code. A change to a destructive path needs a test of its failure path.
 - A behavior change updates docs/design.md in the same commit.
+- A change to the command line (a subcommand, flag, value or parse rule) updates all three
+  hand-written completions (completions/rip.fish, completions/rip.bash, completions/_rip) and
+  tests/completions.rs in the same commit.
 - Never run doas or sudo on artemis.
 - Conventional Commits. Commit each working checkpoint; push main after `just check` and
   `just test` pass on Linux.
