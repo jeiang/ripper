@@ -1264,8 +1264,9 @@ mod tests {
         assert_eq!(c.items.len(), 1);
         let old_item = &c.items[0];
 
-        // Restore the old X by hand (not through rip): it leaves files/.
-        std::fs::remove_file(dir.path().join("files/x")).unwrap();
+        // Restore the old X by hand (not through rip): it leaves files/ by
+        // rename, so its inode stays alive and cannot be reused below.
+        std::fs::rename(dir.path().join("files/x"), dir.path().join("restored")).unwrap();
         unlinkat(&t.info, "x.trashinfo", AtFlags::empty()).unwrap();
 
         // A new X lands under the same name (a different inode).
@@ -1401,9 +1402,15 @@ mod tests {
         let entry = sys::stat_at(&t.files, &n).unwrap().id;
         let info = reread_info(&t, &n).unwrap();
 
-        // Someone else freed the name and reused it for an unrelated entry
-        // in the meantime.
-        std::fs::remove_file(dir.path().join("files").join(&n)).unwrap();
+        // Someone else freed the name (a restore renames the entry out, so
+        // its inode stays alive; deleting it instead would let ext4 hand
+        // the same inode number to the next file) and reused it for an
+        // unrelated entry in the meantime.
+        std::fs::rename(
+            dir.path().join("files").join(&n),
+            dir.path().join("restored"),
+        )
+        .unwrap();
         std::fs::write(dir.path().join("files").join(&n), b"UNRELATED").unwrap();
 
         let err = discard_verified(&t, &ms, &n, Some((entry, &info))).unwrap_err();
