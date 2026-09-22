@@ -7,6 +7,7 @@
 mod common;
 
 use std::ffi::{OsStr, OsString};
+use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -248,6 +249,108 @@ fn rip_without_fzf_tty(sandbox: &Sandbox, cwd: &str, args: &[&str]) -> Output {
         .expect("spawn `script` for rip_without_fzf_tty")
 }
 
+/// A `rip` invocation on a real pty, held open past the point its output
+/// first contains `until` -- unlike `Sandbox::rip_tty`, which writes its
+/// whole input up front and waits for exit, so it cannot hold a prompt
+/// open. Needed for the finding c0 and c10 regression tests below, which
+/// must run other `rip` invocations while a copy-back prompt is still
+/// waiting for an answer. Built the same way `rip_without_fzf_tty` builds
+/// its own quoted `bwrap`/`script` command line.
+struct PromptHold {
+    child: std::process::Child,
+    buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    reader: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PromptHold {
+    /// Writes `input` to the held process's stdin and waits for it to
+    /// finish, returning its combined pty output the way
+    /// `Sandbox::rip_tty`'s own `Output` does (everything in `stdout`,
+    /// `stderr` always empty).
+    fn finish(mut self, input: &str) -> Output {
+        self.child
+            .stdin
+            .take()
+            .expect("PromptHold's stdin")
+            .write_all(input.as_bytes())
+            .expect("write PromptHold input");
+        let status = self.child.wait().expect("wait for PromptHold's child");
+        self.reader
+            .take()
+            .expect("PromptHold's reader thread")
+            .join()
+            .expect("PromptHold's reader thread panicked");
+        let stdout = self.buf.lock().unwrap().clone();
+        Output {
+            status,
+            stdout,
+            stderr: Vec::new(),
+        }
+    }
+}
+
+fn rip_tty_hold(sandbox: &Sandbox, cwd: &str, args: &[&str], until: &str) -> PromptHold {
+    let c = base_bwrap(sandbox);
+    let raw: Vec<&OsStr> = c.get_args().collect();
+    let mut quoted = String::from("bwrap");
+    for a in &raw {
+        quoted.push(' ');
+        quoted.push_str(&sq(&a.to_string_lossy()));
+    }
+    quoted.push_str(" --chdir ");
+    quoted.push_str(&sq(cwd));
+    quoted.push_str(" -- /run/rip/bin/rip");
+    for a in args {
+        quoted.push(' ');
+        quoted.push_str(&sq(a));
+    }
+
+    let mut child = Command::new("script")
+        .arg("-qec")
+        .arg(&quoted)
+        .arg("/dev/null")
+        .env("SHELL", host_bash())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn `script` for rip_tty_hold");
+
+    let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut stdout = child.stdout.take().expect("rip_tty_hold's stdout");
+    let reader_buf = buf.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let until = until.to_string();
+    let reader = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut byte = [0u8; 1];
+        let mut notified = false;
+        loop {
+            match stdout.read(&mut byte) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let mut g = reader_buf.lock().unwrap();
+                    g.push(byte[0]);
+                    if !notified && String::from_utf8_lossy(&g).contains(&until) {
+                        notified = true;
+                        drop(g);
+                        let _ = tx.send(());
+                    }
+                }
+            }
+        }
+    });
+
+    rx.recv_timeout(std::time::Duration::from_secs(15))
+        .unwrap_or_else(|_| panic!("rip_tty_hold: {args:?} never printed the expected prompt"));
+
+    PromptHold {
+        child,
+        buf,
+        reader: Some(reader),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // by_original_path (design §13.3, §13.4 "Restore overwrites a file" table)
 // ---------------------------------------------------------------------------
@@ -409,6 +512,107 @@ fn copy_back_prompt() {
     assert!(sandbox.host("/home/u").join("d").exists());
 }
 
+// finding c10: a copy-back prompt waiting for an answer must not hold the
+// trash's lock, or an unattended `empty`/`purge` (including the planned
+// timer) would block on it with no time limit.
+#[test]
+fn empty_does_not_block_on_a_held_copy_back_prompt() {
+    let sandbox = Sandbox::artemis();
+    sandbox.config("copy_threshold = \"1\"\n");
+    sandbox.plant(
+        "/home/u/.local/share/Trash",
+        b"back",
+        b"/home/u/back",
+        "2026-01-01T00:00:00",
+        Body::File(b"data".to_vec()),
+    );
+
+    let hold = rip_tty_hold(&sandbox, "/", &["restore", "/home/u/back"], "[y/N]");
+
+    let started = std::time::Instant::now();
+    let out = sandbox.rip("/", &["empty", "--older-than", "0d", "-y"]);
+    let elapsed = started.elapsed();
+    assert_ok(&out, "empty while a copy-back prompt is held open");
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "empty must not block on restore's held prompt (took {elapsed:?})"
+    );
+
+    // Let the held restore finish so the sandbox's teardown does not race
+    // it; its own outcome (the item may already be gone, empty ran first)
+    // is not what this test is about.
+    let _ = hold.finish("n\n");
+}
+
+// finding c0: a copy-back restore must not discard whatever now holds
+// files/NAME by the time it gets around to it -- only the exact entry it
+// verified. Reproduces the deterministic "prompt window" case: while A
+// waits at its own copy-back prompt, B restores the same item (freeing the
+// name) and C trashes an unrelated file that reuses it; A's stale answer
+// must not destroy C's item.
+#[test]
+fn concurrent_restore_does_not_discard_a_name_reused_by_an_unrelated_item() {
+    let sandbox = Sandbox::artemis();
+    sandbox.config("copy_threshold = \"1\"\n");
+    // Bare "/home/u/X" (unlike Downloads/Documents/Trash) is on a
+    // different subvolume than the trash, so restoring it needs a copy and
+    // the size prompt.
+    sandbox.plant(
+        "/home/u/.local/share/Trash",
+        b"X",
+        b"/home/u/X",
+        "2026-01-01T00:00:00",
+        Body::File(b"OLD TRASHED ITEM".to_vec()),
+    );
+
+    let hold = rip_tty_hold(
+        &sandbox,
+        "/",
+        &["restore", "--rename", "/home/u/X"],
+        "[y/N]",
+    );
+
+    // B restores the same item first (plain restore, no --rename): it
+    // takes files/X and discards the original trash copy.
+    let b = sandbox.rip("/", &["restore", "-y", "/home/u/X"]);
+    assert_ok(&b, "B's restore of the same item");
+    assert_eq!(
+        std::fs::read(sandbox.host("/home/u/X")).unwrap(),
+        b"OLD TRASHED ITEM"
+    );
+
+    // C trashes an unrelated file that happens to reuse the freed name.
+    std::fs::write(
+        sandbox.host("/home/u/Downloads").join("X"),
+        b"UNRELATED PRECIOUS",
+    )
+    .unwrap();
+    let c = sandbox.rip("/home/u/Downloads", &["-v", "X"]);
+    assert_ok(&c, "C trashes an unrelated file named X");
+
+    // A finally gets its stale answer: the entry it verified is gone, so
+    // it must refuse rather than act on whatever now holds the name.
+    let a = hold.finish("y\n");
+    assert!(
+        !a.status.success(),
+        "A must refuse a stale copy-back instead of silently publishing it: {}",
+        stdout_str(&a)
+    );
+
+    // C's item must be completely untouched: still in the trash with its
+    // original content, and nothing published in its place.
+    let trash_x = trash_host_path(&sandbox, "/home/u/.local/share/Trash", b"X");
+    assert!(
+        trash_x.exists(),
+        "C's trash entry must survive A's stale restore attempt"
+    );
+    assert_eq!(std::fs::read(&trash_x).unwrap(), b"UNRELATED PRECIOUS");
+    assert!(
+        !sandbox.host("/home/u/X~1").exists(),
+        "A must not publish C's bytes under a name it never verified"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // copy_back_enospc_keeps_item / created_parents_rolled_back: a real ENOSPC
 // partway through the copy, via the size-limited tmpfs helper above.
@@ -479,6 +683,42 @@ fn created_parents_rolled_back() {
 
     let trash_deep = trash_host_path(&sandbox, "/home/u/.local/share/Trash", b"deep");
     assert!(&trash_deep.exists());
+}
+
+// finding c9: `confirm()` failing with no terminal is an early exit after
+// `ensure_parent`, the same as the ENOSPC case above, and must roll back
+// the parent directories `ensure_parent` created just as any other one
+// does, not leave them behind empty.
+#[test]
+fn created_parents_rolled_back_when_no_terminal_prompt() {
+    let sandbox = Sandbox::artemis();
+    sandbox.config("copy_threshold = \"1\"\n");
+    sandbox.plant(
+        "/home/u/.local/share/Trash",
+        b"f",
+        b"/home/u/newdir/sub/f",
+        "2026-01-01T00:00:00",
+        Body::File(b"nested".to_vec()),
+    );
+
+    // No terminal (Sandbox::rip's stdin is /dev/null): confirm() itself
+    // fails, before anything is copied or renamed.
+    let out = sandbox.rip("/", &["restore", "/home/u/newdir/sub/f"]);
+    assert_fails(&out, "no-tty copy-back prompt");
+    assert!(
+        !sandbox.host("/home/u/newdir").exists(),
+        "ensure_parent's created directories must be rolled back, not left empty: {}",
+        stderr_str(&out)
+    );
+    assert!(trash_host_path(&sandbox, "/home/u/.local/share/Trash", b"f").exists());
+
+    // The item is still cleanly restorable afterward.
+    let out = sandbox.rip("/", &["restore", "-y", "/home/u/newdir/sub/f"]);
+    assert_ok(&out, "restore -y after the rolled-back no-tty attempt");
+    assert_eq!(
+        std::fs::read(sandbox.host("/home/u/newdir/sub/f")).unwrap(),
+        b"nested"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -720,15 +720,49 @@ fn fresh_tombstone(staging: &OwnedFd, name: &OsStr) -> io::Result<OsString> {
     Err(io::Error::other("could not create a tombstone name"))
 }
 
+/// Whether `info/NAME.trashinfo` is still exactly `info`: same identity and
+/// bytes. Used by `discard_verified` below, and by restore.rs's rename-back
+/// path (which moves `files/NAME` out on its own, with no tombstone, so it
+/// must check this itself before unlinking the info it left behind) --
+/// both close the same name-reuse race a plain-by-name unlink cannot
+/// (docs/design.md §5.4, finding c0).
+#[allow(dead_code)]
+pub fn info_matches(t: &Trash, name: &OsStr, info: &(Ident, Vec<u8>)) -> bool {
+    matches!(reread_info(t, name), Some((id, bytes)) if id.same_file(&info.0) && bytes == info.1)
+}
+
 /// Permanently removes one entry this process itself owns (a restored
 /// item's now-unneeded trash copy, or put's own fresh copy after a failed
 /// rollback): tombstone, unlink the info, `remove_tree` the tombstone.
 /// Holds no lock of its own -- the caller already holds `LOCK_SH` across the
 /// whole put or restore that created this entry (docs/design.md §5.4).
-/// First called by put.rs's copy-fallback rollback (C4a) and restore.rs's
-/// `restore_item` (C4b).
+/// Equivalent to `discard_verified(t, ms, name, None)`: no identity check,
+/// for a caller (put.rs's copy-fallback rollback, C4a) discarding a copy
+/// nothing else can yet know the name of. First called by put.rs's
+/// copy-fallback rollback (C4a) and, through `discard_verified`,
+/// restore.rs's `restore_item` (C4b).
 #[allow(dead_code)]
 pub fn discard(t: &Trash, ms: &Mounts, name: &OsStr) -> io::Result<()> {
+    discard_verified(t, ms, name, None)
+}
+
+/// Like `discard`, but ties the removal to a specific entry when `expected`
+/// is given: after the tombstone rename, the tombstoned file must still be
+/// `entry` -- otherwise something else (a restore plus a new put reusing
+/// the freed name, docs/design.md §5.4) now holds `files/NAME`, and it is
+/// renamed back with `NOREPLACE` instead of being deleted. The info is
+/// unlinked only when it still matches `info`'s identity and bytes, so a
+/// `.trashinfo` a different item just published under the freed name
+/// survives too. This is the fix for finding c0 (a copy-back restore that
+/// discards whatever now holds the name, not necessarily what it copied).
+/// First called by restore.rs's `restore_item` (C4b).
+#[allow(dead_code)]
+pub fn discard_verified(
+    t: &Trash,
+    ms: &Mounts,
+    name: &OsStr,
+    expected: Option<(Ident, &(Ident, Vec<u8>))>,
+) -> io::Result<()> {
     if let Some(why) = entry_conflict(t, ms, name) {
         return Err(io::Error::other(format!(
             "cannot remove the trash copy: it {why}"
@@ -736,7 +770,23 @@ pub fn discard(t: &Trash, ms: &Mounts, name: &OsStr) -> io::Result<()> {
     }
     let staging_fd = staging(t)?;
     let tomb = tombstone(t, &staging_fd, name)?;
-    let _ = unlinkat(&t.info, info_file_name(name), AtFlags::empty());
+    if let Some((entry, info)) = expected {
+        let is_it = sys::stat_at(&staging_fd, &tomb).is_ok_and(|m| m.id.same_file(&entry));
+        if !is_it {
+            // Not the entry we meant to discard: put it back untouched and
+            // refuse, rather than delete whatever raced into the name.
+            let _ = sys::rename_noreplace(&staging_fd, &tomb, &t.files, name);
+            return Err(io::Error::other(
+                "the trash entry changed identity since it was restored; leaving it in place",
+            ));
+        }
+        if info_matches(t, name, info) {
+            let _ = unlinkat(&t.info, info_file_name(name), AtFlags::empty());
+        }
+        // Otherwise a different item's info now uses this name: leave it.
+    } else {
+        let _ = unlinkat(&t.info, info_file_name(name), AtFlags::empty());
+    }
     let removal = sys::remove_tree(
         staging_fd.as_fd(),
         &tomb,

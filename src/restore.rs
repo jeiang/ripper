@@ -494,6 +494,27 @@ fn rmdir_reverse(created: &[(OwnedFd, OsString)]) {
     }
 }
 
+/// Rolls back `ensure_parent`'s created directories on drop, unless
+/// `disarm`ed. Every `?` between `ensure_parent` and a successful publish
+/// then undoes them on its own -- including the no-terminal `confirm` error
+/// and the other early exits after it (finding c9) -- without each one
+/// having to remember to call `rmdir_reverse` itself.
+struct ParentGuard(Vec<(OwnedFd, OsString)>);
+
+impl ParentGuard {
+    /// Keeps the created directories: call once the destination is durably
+    /// in place (a successful rename or copy-back publish).
+    fn disarm(mut self) {
+        self.0.clear();
+    }
+}
+
+impl Drop for ParentGuard {
+    fn drop(&mut self) {
+        rmdir_reverse(&self.0);
+    }
+}
+
 /// Renames `from/src` to `to/name` (or, with `rename`, the first free
 /// `name~k`) without ever overwriting anything.
 fn rename_free(
@@ -517,10 +538,35 @@ fn rename_free(
     Err(io::Error::other("no free name"))
 }
 
+/// `it.entry`/`it.info` still match `t`'s on-disk state right now (a
+/// shorthand for the recheck finding c0 asks for at several points: right
+/// after the lock, again immediately before the rename-back, and again
+/// immediately before the copy -- the entry can be renamed or replaced by
+/// another `rip` at any point up to the moment we actually act on it, since
+/// `restore`/`put` share `LOCK_SH`, docs/design.md invariant 9).
+fn recheck(t: &Trash, it: &Item) -> Result<(), RestoreError> {
+    if trash::still_same(t, &it.name, &it.info, it.entry) {
+        Ok(())
+    } else {
+        Err(RestoreError::Other(
+            "it changed since it was listed; run the command again".into(),
+        ))
+    }
+}
+
 /// Restores one item: renames it back when its destination shares the
 /// trash's subvolume and a mount shows both, otherwise copies it back
 /// (design §7.2). `Ok(None)` means the person declined the copy-back size
 /// prompt; the item stays in the trash, and that is not a failure.
+///
+/// Every step after the lock is tied to the verified entry, not just its
+/// name (finding c0): the size prompt is asked *before* the lock is taken
+/// at all (so `empty`/`purge` never wait on a human answer, finding c10),
+/// then the lock is taken and `still_same` is rechecked immediately before
+/// each point that actually touches `files/NAME` -- the rename-back, and
+/// the copy. `trash::discard_verified` gets the entry's own identity and
+/// info, so it puts back (rather than deletes) whatever now holds the name
+/// if it does not match, and only unlinks an info file that still matches.
 fn restore_item(
     cx: &Cx,
     ts: &[Trash],
@@ -529,12 +575,6 @@ fn restore_item(
     yes: bool,
 ) -> Result<Option<PathBuf>, RestoreError> {
     let t = &ts[it.trash];
-    let _lock = sys::lock(&t.dir, Lock::Shared)?;
-    if !trash::still_same(t, &it.name, &it.info, it.entry) {
-        return Err(RestoreError::Other(
-            "it changed since it was listed; run the command again".into(),
-        ));
-    }
 
     let name = it
         .original
@@ -567,10 +607,10 @@ fn restore_item(
         }
     };
 
-    let (pfd, created) = ensure_parent(&base, &rel, beneath)?;
+    let (pfd, created_vec) = ensure_parent(&base, &rel, beneath)?;
+    let created = ParentGuard(created_vec);
 
     if !rename && sys::stat_at(&pfd, name).is_ok() {
-        rmdir_reverse(&created);
         return Err(RestoreError::Conflict(
             "exists; not replacing it (use --rename)".into(),
         ));
@@ -579,48 +619,75 @@ fn restore_item(
     let pid = sys::ident(&pfd)?;
     let pdir = sys::fd_path(&pfd)?;
 
-    if pid.dev == t.files_id.dev {
-        if let Some((from, to)) =
-            sys::route(&cx.mounts, &t.path.join("files"), t.files_id, &pdir, pid)?
-        {
-            match rename_free(&from, &it.name, &to, name, rename) {
-                Ok(n) => {
-                    trash::unlink_info(t, &it.name);
-                    return Ok(Some(pdir.join(n)));
-                }
-                // The rename crossed a filesystem boundary after all
-                // (`route`'s own fd checks raced): fall through to copy.
-                Err(e) if e.raw_os_error() == Some(Errno::XDEV.raw_os_error()) => {}
-                Err(e) => {
-                    rmdir_reverse(&created);
-                    return Err(RestoreError::Other(e.to_string()));
-                }
+    // A same-mount rename needs no copy; whether one is even possible does
+    // not touch `files/NAME` and needs no lock to check.
+    let route = if pid.dev == t.files_id.dev {
+        sys::route(&cx.mounts, &t.path.join("files"), t.files_id, &pdir, pid)?
+    } else {
+        None
+    };
+    let had_route = route.is_some();
+
+    // The copy-back size prompt is asked before any lock is taken, the same
+    // way put's own copy-fallback prompt is: otherwise `empty`/`purge`
+    // (including the unattended timer) wait on a human answer with no time
+    // limit (finding c10).
+    if route.is_none() {
+        let size = sys::walk(t.files.as_fd(), &it.name, Check::Size)?.size;
+        if !yes && size > cx.cfg.copy_threshold {
+            let confirmed = confirm(
+                &format!("copy {} back to {}?", human(size), it.original.display()),
+                "-y",
+            )
+            .map_err(RestoreError::Other)?;
+            if !confirmed {
+                return Ok(None);
             }
+        }
+    }
+
+    let _lock = sys::lock(&t.dir, Lock::Shared)?;
+    recheck(t, it)?;
+
+    if let Some((from, to)) = route {
+        // Recheck immediately before the rename-back (finding c0): a
+        // concurrent restore/put sharing the same LOCK_SH could have taken
+        // the name since the check above.
+        recheck(t, it)?;
+        match rename_free(&from, &it.name, &to, name, rename) {
+            Ok(n) => {
+                // Also verify before unlinking the info (finding c0): a put
+                // that reused the freed name in the meantime keeps its own
+                // info file, rather than losing it to this unlink.
+                if trash::info_matches(t, &it.name, &it.info) {
+                    trash::unlink_info(t, &it.name);
+                }
+                created.disarm();
+                return Ok(Some(pdir.join(n)));
+            }
+            // The rename crossed a filesystem boundary after all
+            // (`route`'s own fd checks raced): fall through to copy.
+            Err(e) if e.raw_os_error() == Some(Errno::XDEV.raw_os_error()) => {}
+            Err(e) => return Err(RestoreError::Other(e.to_string())),
+        }
+    }
+
+    if had_route && !yes {
+        // A route looked usable before the lock but needs a copy after
+        // all: asking now would hold the lock across the prompt (c10)
+        // again, so ask the person to retry instead of silently skipping
+        // the confirmation this rare race would otherwise cause.
+        let size = sys::walk(t.files.as_fd(), &it.name, Check::Size)?.size;
+        if size > cx.cfg.copy_threshold {
+            return Err(RestoreError::Other(
+                "it must be copied instead of renamed, which needs confirmation; run the command again".into(),
+            ));
         }
     }
 
     // Copy back. The destination is complete and durable before the trash
     // copy goes (design §0.3 invariant 2).
-    let size = sys::walk(t.files.as_fd(), &it.name, Check::Size)?.size;
-    if !yes && size > cx.cfg.copy_threshold {
-        let confirmed = confirm(
-            &format!("copy {} back to {}?", human(size), it.original.display()),
-            "-y",
-        )
-        .map_err(RestoreError::Other)?;
-        if !confirmed {
-            rmdir_reverse(&created);
-            return Ok(None);
-        }
-    }
-
-    let (bx, bfd) = match sys::make_box(pfd.as_fd(), ".rip-restore") {
-        Ok(v) => v,
-        Err(e) => {
-            rmdir_reverse(&created);
-            return Err(e.into());
-        }
-    };
+    let (bx, bfd) = sys::make_box(pfd.as_fd(), ".rip-restore")?;
     let discard_box = |bx: &OsStr| {
         sys::remove_tree(
             pfd.as_fd(),
@@ -632,22 +699,30 @@ fn restore_item(
             },
         );
     };
+    // Recheck immediately before the copy (finding c0).
+    if let Err(e) = recheck(t, it) {
+        discard_box(&bx);
+        return Err(e);
+    }
     if let Err(e) = sys::cp_archive(t.files.as_fd(), &it.name, bfd.as_fd(), OsStr::new("item")) {
         discard_box(&bx);
-        rmdir_reverse(&created);
         return Err(RestoreError::Other(format!("copying back failed: {e}")));
     }
     let n = match rename_free(&bfd, OsStr::new("item"), &pfd, name, rename) {
         Ok(n) => n,
         Err(e) => {
             discard_box(&bx);
-            rmdir_reverse(&created);
             return Err(RestoreError::Other(e.to_string()));
         }
     };
+    created.disarm();
     let _ = unlinkat(&pfd, &bx, AtFlags::REMOVEDIR);
     sys::syncfs(&pfd)?;
-    if let Err(e) = trash::discard(t, &cx.mounts, &it.name) {
+    // Recheck immediately before discard is `discard_verified`'s own job:
+    // it tombstones by name, then verifies the tombstoned file really is
+    // `it.entry` before treating it as ours to delete, and puts it back
+    // (rather than destroying it) if not (finding c0).
+    if let Err(e) = trash::discard_verified(t, &cx.mounts, &it.name, Some((it.entry, &it.info))) {
         eprintln!("rip: restored, but the trash copy remains: {e}");
     }
     Ok(Some(pdir.join(n)))
