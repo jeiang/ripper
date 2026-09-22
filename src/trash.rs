@@ -853,7 +853,6 @@ fn fresh_tombstone(staging: &OwnedFd, name: &OsStr) -> io::Result<OsString> {
 /// must check this itself before unlinking the info it left behind) --
 /// both close the same name-reuse race a plain-by-name unlink cannot
 /// (docs/design.md §5.4, finding c0).
-#[allow(dead_code)]
 pub fn info_matches(t: &Trash, name: &OsStr, info: &(Ident, Vec<u8>)) -> bool {
     matches!(reread_info(t, name), Some((id, bytes)) if id.same_file(&info.0) && bytes == info.1)
 }
@@ -863,29 +862,19 @@ pub fn info_matches(t: &Trash, name: &OsStr, info: &(Ident, Vec<u8>)) -> bool {
 /// rollback): tombstone, unlink the info, `remove_tree` the tombstone.
 /// Holds no lock of its own -- the caller already holds `LOCK_SH` across the
 /// whole put or restore that created this entry (docs/design.md §5.4).
-/// Equivalent to `discard_verified(t, ms, name, None)`: no identity check,
-/// for a caller (put.rs's copy-fallback rollback, C4a) discarding a copy
-/// nothing else can yet know the name of. First called by put.rs's
-/// copy-fallback rollback (C4a) and, through `discard_verified`,
-/// restore.rs's `restore_item` (C4b).
-#[allow(dead_code)]
-pub fn discard(t: &Trash, ms: &Mounts, name: &OsStr) -> io::Result<()> {
-    discard_verified(t, ms, name, None)
-}
-
-/// Like `discard`, but ties the removal to a specific entry when `expected`
-/// is given: after the tombstone rename, the tombstoned file must still be
-/// `entry` -- otherwise something else (a restore plus a new put reusing
-/// the freed name, docs/design.md §5.4) now holds `files/NAME`, and it is
-/// renamed back with `NOREPLACE` instead of being deleted. The info is
-/// unlinked only when it still matches `info`'s identity and bytes, so a
-/// `.trashinfo` a different item just published under the freed name
-/// survives too. This is the fix for finding c0 (a copy-back restore, or
-/// put's own copy-fallback rollback, that discards whatever now holds the
-/// name, not necessarily what it wrote). First called by restore.rs's
-/// `restore_item` (C4b); put.rs's copy-fallback rollback now calls it
-/// directly too, always with `Some`.
-#[allow(dead_code)]
+/// `expected`, when given, ties the removal to a specific entry: after the
+/// tombstone rename, the tombstoned file must still be `entry` -- otherwise
+/// something else (a restore plus a new put reusing the freed name,
+/// docs/design.md §5.4) now holds `files/NAME`, and it is renamed back with
+/// `NOREPLACE` instead of being deleted. The info is unlinked only when it
+/// still matches `info`'s identity and bytes, so a `.trashinfo` a different
+/// item just published under the freed name survives too. This is the fix
+/// for finding c0 (a copy-back restore, or put's own copy-fallback
+/// rollback, that discards whatever now holds the name, not necessarily
+/// what it wrote). Called by restore.rs's `restore_item` and put.rs's
+/// copy-fallback rollback, both always with `Some`; `None` stays supported
+/// for a caller that genuinely cannot know the name of what it is
+/// discarding.
 pub fn discard_verified(
     t: &Trash,
     ms: &Mounts,
