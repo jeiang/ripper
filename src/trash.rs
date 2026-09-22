@@ -37,15 +37,11 @@ pub struct Trash {
     pub files: OwnedFd,
     pub info: OwnedFd,
     pub id: Ident,
-    /// First read by put.rs's home-trash routing, `s.home().files_id` (C4a).
-    #[allow(dead_code)]
     pub files_id: Ident,
 }
 
 pub struct Item {
-    /// Indexes the `[Trash]` slice `load` was given. First read by
-    /// restore.rs's selection (`Target::Item`, C4b).
-    #[allow(dead_code)]
+    /// Indexes the `[Trash]` slice `load` was given.
     pub trash: usize,
     pub name: OsString,
     pub original: PathBuf,
@@ -57,13 +53,11 @@ pub struct Item {
 }
 
 pub struct Orphan {
-    /// Indexes the `[Trash]` slice `load` was given. First read by empty.rs
-    /// (C4c) to group a batch's doomed orphans by trash dir.
-    #[allow(dead_code)]
+    /// Indexes the `[Trash]` slice `load` was given, to group a batch's
+    /// doomed orphans by trash dir.
     pub trash: usize,
     pub name: OsString,
-    /// lstat ctime, local. First read by empty.rs's `select_for_empty` (C4c).
-    #[allow(dead_code)]
+    /// lstat ctime, local.
     pub date: civil::DateTime,
     pub entry: Ident,
     /// `Some`: a malformed info exists for this entry. Its `Vec<u8>` is
@@ -75,9 +69,8 @@ pub struct Orphan {
 }
 
 pub struct Dangling {
-    /// Indexes the `[Trash]` slice `load` was given. First read by empty.rs
-    /// (C4c) to group a batch's doomed dangling infos by trash dir.
-    #[allow(dead_code)]
+    /// Indexes the `[Trash]` slice `load` was given, to group a batch's
+    /// doomed dangling infos by trash dir.
     pub trash: usize,
     pub name: OsString,
     pub info: Ident,
@@ -93,9 +86,7 @@ pub struct Contents {
 
 /// Holds a reserved `info/NAME.trashinfo`. Dropping it without `commit()`
 /// unlinks the file, so every early return, error and panic rolls back
-/// (docs/design.md invariant 3). First constructed by put.rs's move-in and
-/// copy-fallback paths (C4a).
-#[allow(dead_code)]
+/// (docs/design.md invariant 3).
 pub struct Reserved<'t> {
     t: &'t Trash,
     base: OsString,
@@ -105,7 +96,6 @@ pub struct Reserved<'t> {
     live: bool,
 }
 
-#[allow(dead_code)] // first constructed and used by put.rs (C4a)
 impl Reserved<'_> {
     pub fn name(&self) -> &OsStr {
         &self.name
@@ -173,7 +163,6 @@ impl Drop for Reserved<'_> {
     }
 }
 
-#[allow(dead_code)] // first called by put.rs's move-in and copy-fallback paths (C4a)
 pub fn reserve<'t>(t: &'t Trash, base: &OsStr, text: Vec<u8>) -> io::Result<Reserved<'t>> {
     let mut r = Reserved {
         t,
@@ -655,15 +644,11 @@ fn load_info_entry(
 // Staging, discard
 // ---------------------------------------------------------------------------
 
-// First called by put.rs's copy fallback (C4a) and trash::discard/delete_batch below.
-#[allow(dead_code)]
 const STAGING_NAME: &str = ".rip-staging";
 
 /// `.rip-staging` in the trash root: `mkdirat` 0700 (`EEXIST` fine), then
 /// opened `O_NOFOLLOW`, checked owned by the current user and on the
-/// trash's own mount (docs/design.md §4 "on-disk names"). First called by
-/// put.rs's copy fallback (C4a); already used here by `discard`/`delete_batch`.
-#[allow(dead_code)]
+/// trash's own mount (docs/design.md §4 "on-disk names").
 pub fn staging(t: &Trash) -> io::Result<OwnedFd> {
     mkdir_ignore_exists(&t.dir, STAGING_NAME)?;
     let fd = sys::open_dir(&t.dir, STAGING_NAME)?;
@@ -710,9 +695,7 @@ fn open_staging_if_exists(t: &Trash) -> io::Result<Option<OwnedFd>> {
 
 /// Opens `t.base` (the topdir) with `O_PATH|O_DIRECTORY`, requiring its
 /// `dev` to equal the trash's own -- used by restore to resolve a topdir
-/// item's original path beneath it with `RESOLVE_BENEATH`. First called by
-/// restore.rs's `restore_item` (C4b).
-#[allow(dead_code)]
+/// item's original path beneath it with `RESOLVE_BENEATH`.
 pub fn open_top(t: &Trash) -> io::Result<OwnedFd> {
     let fd = sys::open_path(CWD, &t.base)?;
     let id = sys::ident(&fd)?;
@@ -725,9 +708,8 @@ pub fn open_top(t: &Trash) -> io::Result<OwnedFd> {
 /// Re-lstats `files/NAME` and re-reads `info/NAME.trashinfo`, requiring both
 /// to be unchanged since `info`/`entry` were recorded (docs/design.md §5.4:
 /// a restore plus a new put can reuse a name between load time and delete
-/// time). Used by `delete_item` below; also first called directly by
-/// restore.rs's `restore_item` (C4b).
-#[allow(dead_code)]
+/// time). Used by `delete_item` below and directly by restore.rs's
+/// `restore_item`.
 pub fn still_same(t: &Trash, name: &OsStr, info: &(Ident, Vec<u8>), entry: Ident) -> bool {
     let Ok(cur) = sys::stat_at(&t.files, name) else {
         return false;
@@ -738,9 +720,7 @@ pub fn still_same(t: &Trash, name: &OsStr, info: &(Ident, Vec<u8>), entry: Ident
     matches!(reread_info(t, name), Some((id, bytes)) if id.same_file(&info.0) && bytes == info.1)
 }
 
-// Used by `delete_orphan` below, whose own first live caller (empty.rs, C4c)
-// makes this reachable too.
-#[allow(dead_code)]
+// Used by `delete_orphan` below.
 fn orphan_still_same(t: &Trash, o: &Orphan) -> bool {
     let Ok(cur) = sys::stat_at(&t.files, &o.name) else {
         return false;
@@ -767,9 +747,7 @@ fn orphan_still_same(t: &Trash, o: &Orphan) -> bool {
     }
 }
 
-// First called by restore.rs's `restore_item`, after a successful
-// rename-back (C4b).
-#[allow(dead_code)]
+/// Called by restore.rs's `restore_item` after a successful rename-back.
 pub fn unlink_info(t: &Trash, name: &OsStr) {
     let _ = unlinkat(&t.info, info_file_name(name), AtFlags::empty());
 }
@@ -777,11 +755,7 @@ pub fn unlink_info(t: &Trash, name: &OsStr) {
 /// Whether `t.files/NAME` must not be touched right now: it has become a
 /// mount point, a bind source, or a directory containing one, since it was
 /// trashed (docs/design.md §5.3 "Mount refusals", reused here for both
-/// `delete_batch` and `discard`'s own-item cleanup). Reachable in the live
-/// build only once `discard`'s own first caller (put.rs's copy-fallback
-/// rollback, C4a) or `delete_batch`'s (empty.rs/restore.rs's purge, C4b/C4c)
-/// lands.
-#[allow(dead_code)]
+/// `delete_batch` and `discard`'s own-item cleanup).
 fn entry_conflict(t: &Trash, ms: &Mounts, name: &OsStr) -> Option<String> {
     let meta = sys::stat_at(&t.files, name).ok()?;
     let own = ms.iter().find(|m| m.id == t.id.mnt)?;
@@ -841,9 +815,7 @@ fn add_owner_write_if_needed(dir: &OwnedFd, name: &OsStr) {
     }
 }
 
-/// `rename_noreplace(files, NAME, staging, "del.<pid>.<n>")`. See
-/// `entry_conflict` above for why this is not yet reachable from `main`.
-#[allow(dead_code)]
+/// `rename_noreplace(files, NAME, staging, "del.<pid>.<n>")`.
 fn tombstone(t: &Trash, staging: &OwnedFd, name: &OsStr) -> io::Result<OsString> {
     add_owner_write_if_needed(&t.files, name);
     let pid = std::process::id();
@@ -861,9 +833,7 @@ fn tombstone(t: &Trash, staging: &OwnedFd, name: &OsStr) -> io::Result<OsString>
 /// Renames a stray staging entry (a leftover `put.*` copy box) to a fresh
 /// `del.*` tombstone name, in place, within `staging` itself: pid reuse can
 /// then never let a later put's own `make_box` claim the exact name this
-/// process is about to remove. First reachable once `delete_batch`'s own
-/// first caller (empty.rs/restore.rs's purge, C4b/C4c) lands.
-#[allow(dead_code)]
+/// process is about to remove.
 fn fresh_tombstone(staging: &OwnedFd, name: &OsStr) -> io::Result<OsString> {
     let pid = std::process::id();
     for _ in 0u64..1_000_000 {
@@ -968,25 +938,18 @@ pub fn discard_verified(
 // delete_batch (empty, purge)
 // ---------------------------------------------------------------------------
 
-// `Orphan`/`Dangling` are first constructed by empty.rs's own `run` (C4c);
-// `Item` is already exercised by this module's own tests.
-#[allow(dead_code)]
 pub enum Doomed<'a> {
     Item(&'a Item),
     Orphan(&'a Orphan),
     Dangling(&'a Dangling),
 }
 
-// First constructed (by `delete_batch` below) and inspected by callers once
-// empty.rs/restore.rs's purge lands (C4b/C4c).
-#[allow(dead_code)]
 #[derive(Default)]
 pub struct Report {
     pub deleted: u64,
     pub kept: Vec<(PathBuf, String)>,
 }
 
-#[allow(dead_code)] // see `Report` above
 impl Report {
     fn skip(&mut self, name: &OsStr, why: &str) {
         self.kept.push((PathBuf::from(name), why.to_string()));
@@ -1003,10 +966,8 @@ impl Report {
 /// delete of each tombstone runs after the lock is released, so a
 /// timer-run `empty` never blocks an interactive put or restore, and a
 /// restore can never receive a directory that is mid-deletion through an
-/// open fd (docs/design.md §5.4). First called by empty.rs's `run` and
-/// restore.rs's `purge` (C4b/C4c); already exercised here by this module's
-/// own tests.
-#[allow(dead_code)]
+/// open fd (docs/design.md §5.4). Called by empty.rs's `run` and
+/// restore.rs's `purge`.
 pub fn delete_batch(t: &Trash, ms: &Mounts, doomed: &[Doomed], clean_staging: bool) -> Report {
     let mut rep = Report::default();
     // Nothing doomed here: only bother opening `.rip-staging` -- and only
@@ -1072,8 +1033,6 @@ pub fn delete_batch(t: &Trash, ms: &Mounts, doomed: &[Doomed], clean_staging: bo
     rep
 }
 
-// Reachable once `delete_batch`'s own first caller lands (C4b/C4c).
-#[allow(dead_code)]
 fn delete_item(
     t: &Trash,
     ms: &Mounts,
@@ -1100,8 +1059,6 @@ fn delete_item(
     }
 }
 
-// Reachable once `delete_batch`'s own first caller lands (C4b/C4c).
-#[allow(dead_code)]
 fn delete_orphan(
     t: &Trash,
     ms: &Mounts,
@@ -1130,8 +1087,6 @@ fn delete_orphan(
     }
 }
 
-// Reachable once `delete_batch`'s own first caller lands (C4b/C4c).
-#[allow(dead_code)]
 fn delete_dangling(t: &Trash, g: &Dangling, rep: &mut Report) {
     let info_name = info_file_name(&g.name);
     // A malformed name (`.`, `..`, empty, `/`-containing) is never a real
@@ -1413,5 +1368,64 @@ mod tests {
             "reread_info returned {worst} bytes, past the {MAX_INFO_SIZE}-byte cap \
              ({wins} times over)"
         );
+    }
+
+    // ---- Review round (fix-common.json): discard_verified ----
+
+    /// The core mechanism put.rs's copy-fallback rollback now relies on
+    /// (§C5 finding: it used to call the unverified `discard`, which could
+    /// delete whatever now held the name instead of the copy it made). This
+    /// exercises `discard_verified` directly with the exact identity a
+    /// caller captures right after publishing its own entry.
+    #[test]
+    fn discard_verified_removes_a_matching_entry_and_its_info() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = make_trash(dir.path());
+        let ms = Mounts::default();
+
+        let r = reserve(&t, OsStr::new("x"), info_text("x", "2026-01-01T00:00:00")).unwrap();
+        let n = r.commit();
+        std::fs::write(dir.path().join("files").join(&n), b"published").unwrap();
+
+        let entry = sys::stat_at(&t.files, &n).unwrap().id;
+        let info = reread_info(&t, &n).unwrap();
+
+        discard_verified(&t, &ms, &n, Some((entry, &info))).unwrap();
+
+        assert!(!dir.path().join("files").join(&n).exists());
+        assert!(!dir.path().join("info/x.trashinfo").exists());
+    }
+
+    /// Same scenario `delete_batch_skips_reused_name` covers for `empty`/
+    /// `purge`'s own path, but for `discard_verified`: a caller's identity,
+    /// captured right after it published its own entry, must not authorize
+    /// deleting whatever a concurrent restore-plus-put has since put under
+    /// the same freed name (docs/design.md c0).
+    #[test]
+    fn discard_verified_puts_back_an_entry_that_changed_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = make_trash(dir.path());
+        let ms = Mounts::default();
+
+        let r = reserve(&t, OsStr::new("x"), info_text("x", "2026-01-01T00:00:00")).unwrap();
+        let n = r.commit();
+        std::fs::write(dir.path().join("files").join(&n), b"original").unwrap();
+        let entry = sys::stat_at(&t.files, &n).unwrap().id;
+        let info = reread_info(&t, &n).unwrap();
+
+        // Someone else freed the name and reused it for an unrelated entry
+        // in the meantime.
+        std::fs::remove_file(dir.path().join("files").join(&n)).unwrap();
+        std::fs::write(dir.path().join("files").join(&n), b"UNRELATED").unwrap();
+
+        let err = discard_verified(&t, &ms, &n, Some((entry, &info))).unwrap_err();
+        assert!(err.to_string().contains("changed identity"), "{err}");
+
+        // The unrelated entry, and its own info, must be untouched.
+        assert_eq!(
+            std::fs::read(dir.path().join("files").join(&n)).unwrap(),
+            b"UNRELATED"
+        );
+        assert!(dir.path().join("info/x.trashinfo").is_file());
     }
 }

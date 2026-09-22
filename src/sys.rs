@@ -4,15 +4,6 @@
 //! (on-disk names), §5 (crash consistency) and §6.5-§6.7 for the invariants
 //! these primitives back: every rename is `NOREPLACE`, removal never follows
 //! a symlink or crosses a mount, and a copy only ever reads its source.
-//!
-//! Every item here is fully implemented (§14.1's fixed signatures), but
-//! nothing outside this file calls into it yet: `trash.rs`, `put.rs`,
-//! `restore.rs` and `empty.rs` (C3-C4c) are still `unimplemented!()` stubs
-//! that will call these primitives once they land. Until then the whole
-//! module is unreachable from `main`, so `dead_code` would flag essentially
-//! every item individually; a module-level allow says that once, instead of
-//! repeating "first caller lands in a later checkpoint" on ~40 items.
-#![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
@@ -54,7 +45,6 @@ pub struct Meta {
     pub id: Ident,
     pub mode: u32,
     pub uid: u32,
-    pub nlink: u32,
     pub size: u64,
     pub mtime: (i64, u32),
     pub ctime: (i64, u32),
@@ -107,7 +97,6 @@ fn to_meta(x: fs::Statx) -> Meta {
         },
         mode: u32::from(x.stx_mode),
         uid: x.stx_uid,
-        nlink: x.stx_nlink,
         size: x.stx_size,
         mtime: (x.stx_mtime.tv_sec, x.stx_mtime.tv_nsec),
         ctime: (x.stx_ctime.tv_sec, x.stx_ctime.tv_nsec),
@@ -979,7 +968,6 @@ mod tests {
             id: Ident { dev, ino, mnt: 0 },
             mode: S_IFREG,
             uid: 0,
-            nlink: 1,
             size,
             mtime,
             ctime: mtime,

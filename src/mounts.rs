@@ -24,10 +24,8 @@ pub struct Mount {
     /// whether the underlying filesystem is itself writable: a `ro` bind
     /// mount of an otherwise-writable subvolume reads this way too).
     pub ro: bool,
-    #[allow(dead_code)] // first read by trash::discover's autofs skip (C3, design §0.1 #12)
     pub fstype: OsString,
     /// Where the mount point lies: the parent's filesystem and the path inside it.
-    #[allow(dead_code)] // first read by mount_conflict's containment check, called from C3/C4a
     pub under: Option<(FsId, PathBuf)>,
 }
 
@@ -66,7 +64,6 @@ impl Mounts {
         Mounts(mounts)
     }
 
-    #[allow(dead_code)] // first called by sys::route (C2b)
     pub fn by_id(&self, id: u64) -> Option<&Mount> {
         self.0.iter().find(|m| m.id == id)
     }
@@ -88,7 +85,6 @@ pub fn inside(m: &Mount, path: &Path) -> Option<PathBuf> {
 
 /// `path` (under mount `own`) as seen through `via`, another mount of the
 /// same filesystem, if `via` shows it.
-#[allow(dead_code)] // first called by route_candidates, itself first called from sys::route (C2b)
 pub fn through(own: &Mount, via: &Mount, path: &Path) -> Option<PathBuf> {
     Some(clean(
         via.point
@@ -98,7 +94,6 @@ pub fn through(own: &Mount, via: &Mount, path: &Path) -> Option<PathBuf> {
 
 /// Mounts that may show both `a` (in mount `am`) and `b` (in mount `bm`),
 /// with the translated paths. The candidates start with `am` itself.
-#[allow(dead_code)] // first called by sys::route (C2b)
 pub fn route_candidates(
     ms: &Mounts,
     am: u64,
@@ -121,7 +116,6 @@ pub fn route_candidates(
 /// Why `path` (reached through its own mount `own`) must not be trashed, if
 /// there is a reason. Compares filesystem paths, so it also works through
 /// alias views such as `/persist` and `/mnt/root`.
-#[allow(dead_code)] // first called by put's refusal checks and trash::delete_batch (C3/C4a)
 pub fn mount_conflict(
     ms: &Mounts,
     own: &Mount,

@@ -39,7 +39,11 @@ fn dispatch(cli: Cli) -> u8 {
     if let Some(shell) = cli.completions {
         let mut out = io::stdout().lock();
         let _ = out.write_all(&completions_script(shell));
-        return completions_exit_code();
+        // `--completions` prints the script and succeeds (docs/design.md
+        // §2.2): only combining it with another argument is a usage error,
+        // and clap's own `exclusive` check rejects that before `dispatch`
+        // ever sees it.
+        return 0;
     }
 
     if cli.cmd.is_none() && cli.files.is_empty() {
@@ -119,11 +123,11 @@ pub struct Cli {
     pub files: Vec<PathBuf>,
     /// Ignored: trashing is always recursive
     #[arg(short = 'r', visible_short_alias = 'R', long = "recursive")]
-    #[allow(dead_code)]
+    #[allow(dead_code)] // accepted for rm compatibility only; never read
     recursive: bool,
     /// Ignored
     #[arg(short = 'd', long = "dir")]
-    #[allow(dead_code)]
+    #[allow(dead_code)] // accepted for rm compatibility only; never read
     dir: bool,
     /// Ignore missing files and never prompt
     #[arg(short = 'f', long)]
@@ -339,7 +343,6 @@ pub fn escape(b: &[u8]) -> String {
 }
 
 /// Binary sizes, e.g. `1.2 GiB`.
-#[allow(dead_code)] // not called until put/restore size prompts land (C4a/C4b)
 pub fn human(n: u64) -> String {
     const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
     if n < 1024 {
@@ -364,7 +367,6 @@ pub enum Fallback {
     Refuse,
 }
 
-#[allow(dead_code)] // cfg.source is read once put's copy-fallback messages land (C4a)
 #[derive(Clone, Debug)]
 pub struct Config {
     pub fallback: Fallback,
@@ -464,20 +466,11 @@ fn generate_completion(shell: clap_complete::aot::Shell) -> Vec<u8> {
     buf
 }
 
-/// `--completions` prints the script and succeeds (docs/design.md §2.2):
-/// only combining it with another argument is a usage error, and clap's own
-/// `exclusive` check rejects that before `dispatch` ever sees it.
-fn completions_exit_code() -> u8 {
-    0
-}
-
 // ---------------------------------------------------------------------------
 // Shared context
 // ---------------------------------------------------------------------------
 
-/// Built once after argv parsing and config loading. Read by put/restore/empty
-/// once those modules are implemented (C4a-C4c); nothing reads it yet.
-#[allow(dead_code)]
+/// Built once after argv parsing and config loading. Read by put/restore/empty.
 pub struct Cx {
     pub cfg: Config,
     pub mounts: mounts::Mounts,
@@ -648,14 +641,6 @@ mod tests {
     #[test]
     fn completions_flag_conflicts_with_other_args() {
         assert!(try_parse(&["rip", "--completions", "fish", "foo"]).is_err());
-    }
-
-    #[test]
-    fn completions_flag_exits_success() {
-        // `--completions` prints the script and succeeds; only combining it
-        // with another argument is a (clap-level) usage error (docs/design.md
-        // §2.2), already covered by `completions_flag_conflicts_with_other_args`.
-        assert_eq!(completions_exit_code(), 0);
     }
 
     // ---- extra cases ----

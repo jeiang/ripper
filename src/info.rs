@@ -9,8 +9,6 @@ use std::path::{Component, Path, PathBuf};
 use jiff::civil;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode, percent_encode};
 
-// First constructed by `trash::open_home`/`trash::open_trash` (C3, feat(list)).
-#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
     Home,
@@ -22,7 +20,6 @@ pub enum Kind {
 
 /// Bytes left unescaped in a `Path=` value: unreserved (`A-Za-z0-9-._~`) plus
 /// `/`, matching gio's `percent_encoding` behavior.
-#[allow(dead_code)] // used by encode(), whose first caller is put.rs (C4a)
 const PATH_SET: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'-')
     .remove(b'.')
@@ -30,14 +27,10 @@ const PATH_SET: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'~')
     .remove(b'/');
 
-// First used by trash::reserve (C3, feat(list)).
-#[allow(dead_code)]
 pub const INFO_SUFFIX: &str = ".trashinfo";
 
 /// Builds a `.trashinfo` file's contents. `date` is formatted with no
 /// fractional seconds, matching the spec's `DeletionDate`.
-// First called by put.rs's move-in and copy-fallback paths (C4a, feat(put)).
-#[allow(dead_code)]
 pub fn encode(path_field: &[u8], date: civil::DateTime) -> Vec<u8> {
     format!(
         "[Trash Info]\nPath={}\nDeletionDate={}\n",
@@ -52,8 +45,6 @@ pub fn encode(path_field: &[u8], date: civil::DateTime) -> Vec<u8> {
 /// lines without `=` are ignored, and parsing stops at the next `[Group]`
 /// header. Each line has its trailing CR (and any other ASCII whitespace)
 /// stripped before matching.
-// First called by trash::load (C3, feat(list)).
-#[allow(dead_code)]
 pub fn parse(text: &[u8]) -> Result<(Vec<u8>, civil::DateTime), &'static str> {
     let mut lines = text.split(|&b| b == b'\n').map(<[u8]>::trim_ascii_end);
     if lines.next() != Some(b"[Trash Info]") {
@@ -75,7 +66,6 @@ pub fn parse(text: &[u8]) -> Result<(Vec<u8>, civil::DateTime), &'static str> {
 /// Accepts the spec's dashed `DeletionDate` (civil `DateTime`'s own format,
 /// `YYYY-MM-DDThh:mm:ss`) and the undashed form some writers use
 /// (`YYYYMMDDThh:mm:ss`).
-#[allow(dead_code)] // parse()'s helper; see parse() above
 fn parse_date(v: &[u8]) -> Option<civil::DateTime> {
     let s = std::str::from_utf8(v).ok()?.trim();
     s.parse()
@@ -88,8 +78,6 @@ fn parse_date(v: &[u8]) -> Option<civil::DateTime> {
 /// trashes the result must land strictly beneath `base` (`$topdir`); `Home`
 /// accepts any absolute path, since it is written as the user reached it and
 /// may point outside `$XDG_DATA_HOME`.
-// First called by trash::load (C3, feat(list)).
-#[allow(dead_code)]
 pub fn original(kind: Kind, base: &Path, decoded: &[u8]) -> Result<PathBuf, &'static str> {
     if decoded.is_empty() || decoded.contains(&0) {
         return Err("empty Path or NUL byte");
@@ -115,8 +103,6 @@ pub fn original(kind: Kind, base: &Path, decoded: &[u8]) -> Result<PathBuf, &'st
 /// bytes (for example `INFO_SUFFIX`) fits `NAME_MAX` (255 bytes). A name that
 /// is valid UTF-8 is cut back to a char boundary instead of splitting a
 /// codepoint; a non-UTF-8 name is cut on the raw byte count.
-// First called by trash::Reserved::claim (C3, feat(list)).
-#[allow(dead_code)]
 pub fn candidate(name: &OsStr, k: u64, reserve: usize) -> OsString {
     let suffix = if k == 0 {
         String::new()
