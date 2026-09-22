@@ -60,6 +60,14 @@ fn display_path(cwd: &Path, original: &Path) -> PathBuf {
     }
 }
 
+/// Escapes a path the way `escape()` escapes any other name, for the error,
+/// prompt and report messages below whose path can come straight from a
+/// hostile `Path=` (or an entry name in a shared topdir trash) and must not
+/// reach the terminal raw (design §2.4, §11, finding c7).
+fn esc_path(p: &Path) -> String {
+    escape(p.as_os_str().as_bytes())
+}
+
 /// Writes `-0`'s `DATE<TAB>PATH<NUL>` records, or plain `DATE  PATH\n`
 /// lines, oldest first (the order `items` is already sorted in). PATH is
 /// written as raw bytes throughout, except that it is passed through
@@ -214,7 +222,7 @@ fn by_trash_path<'a>(
             let item_name = ancestors[depth - 1].file_name().unwrap_or(OsStr::new(""));
             return Err(format!(
                 "{}: {verb} the whole item '{}'",
-                abs.display(),
+                esc_path(abs),
                 escape(item_name.as_bytes())
             ));
         }
@@ -238,7 +246,7 @@ fn by_trash_path<'a>(
             } else {
                 Err(format!(
                     "{}: no valid .trashinfo (try `rip purge`)",
-                    abs.display()
+                    esc_path(abs)
                 ))
             };
         }
@@ -253,7 +261,7 @@ fn by_trash_path<'a>(
 fn variants_message(ts: &[Trash], abs: &Path, matches: &[&Item]) -> String {
     let mut msg = format!(
         "{} names {} trashed items; pass one of these trash paths instead:",
-        abs.display(),
+        esc_path(abs),
         matches.len()
     );
     for it in matches {
@@ -261,7 +269,7 @@ fn variants_message(ts: &[Trash], abs: &Path, matches: &[&Item]) -> String {
         msg.push_str(&format!(
             "\n  {}  {}",
             it.date.strftime("%Y-%m-%d %H:%M:%S"),
-            trash_path.display()
+            esc_path(&trash_path)
         ));
     }
     msg
@@ -288,7 +296,7 @@ fn select<'a>(
         if pool.is_empty() {
             return Err(format!(
                 "nothing trashed under {} (try --all)",
-                cx.cwd.display()
+                esc_path(&cx.cwd)
             ));
         }
         out.extend(pick(&pool, verb, &cx.cwd)?.into_iter().map(Target::Item));
@@ -304,7 +312,7 @@ fn select<'a>(
                 0 => {
                     return Err(format!(
                         "nothing in the trash has the original path {}",
-                        abs.display()
+                        esc_path(&abs)
                     ));
                 }
                 1 => out.push(Target::Item(matches[0])),
@@ -638,7 +646,7 @@ fn restore_item(
         let size = sys::walk(t.files.as_fd(), &it.name, Check::Size)?.size;
         if !yes && size > cx.cfg.copy_threshold {
             let confirmed = confirm(
-                &format!("copy {} back to {}?", human(size), it.original.display()),
+                &format!("copy {} back to {}?", human(size), esc_path(&it.original)),
                 "-y",
             )
             .map_err(RestoreError::Other)?;
@@ -792,8 +800,8 @@ pub fn restore(
         if let Some(parent) = blocking_ancestor(&blocked, &it.original) {
             eprintln!(
                 "rip: cannot restore '{}': its parent {} was not restored; it stays in the trash",
-                it.original.display(),
-                parent.display()
+                esc_path(&it.original),
+                esc_path(parent)
             );
             ok = false;
             continue;
@@ -802,7 +810,7 @@ pub fn restore(
             Ok(Some(path)) => print_path(&cx.cwd, &path),
             Ok(None) => blocked.push(it.original.clone()),
             Err(e) => {
-                eprintln!("rip: cannot restore '{}': {e}", it.original.display());
+                eprintln!("rip: cannot restore '{}': {e}", esc_path(&it.original));
                 ok = false;
                 blocked.push(it.original.clone());
             }
@@ -843,8 +851,8 @@ pub fn undo(cx: &Cx, yes: bool) -> Result<bool, String> {
         if let Some(parent) = blocking_ancestor(&blocked, &it.original) {
             eprintln!(
                 "rip: cannot restore '{}': its parent {} was not restored; it stays in the trash",
-                it.original.display(),
-                parent.display()
+                esc_path(&it.original),
+                esc_path(parent)
             );
             ok = false;
             continue;
@@ -856,14 +864,14 @@ pub fn undo(cx: &Cx, yes: bool) -> Result<bool, String> {
                 let trash_path = trashes[it.trash].path.join("files").join(&it.name);
                 eprintln!(
                     "rip: cannot restore '{}': it exists; use `rip restore --rename {}`",
-                    it.original.display(),
-                    trash_path.display()
+                    esc_path(&it.original),
+                    esc_path(&trash_path)
                 );
                 ok = false;
                 blocked.push(it.original.clone());
             }
             Err(RestoreError::Other(msg)) => {
-                eprintln!("rip: cannot restore '{}': {msg}", it.original.display());
+                eprintln!("rip: cannot restore '{}': {msg}", esc_path(&it.original));
                 ok = false;
                 blocked.push(it.original.clone());
             }
@@ -934,7 +942,7 @@ pub fn purge(cx: &Cx, paths: &[PathBuf], all: bool, yes: bool) -> Result<bool, S
         }
         let report = trash::delete_batch(&trashes[idx], &cx.mounts, &doomed, false);
         for (path, why) in &report.kept {
-            eprintln!("rip: cannot delete '{}': {why}", path.display());
+            eprintln!("rip: cannot delete '{}': {why}", esc_path(path));
             ok = false;
         }
     }

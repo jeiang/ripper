@@ -1188,6 +1188,45 @@ fn hostile_paths() {
     );
 }
 
+// finding c7: an undo/restore error naming a hostile original path (from a
+// planted Path=, or the user's own oddly-named file) must not write raw
+// terminal escapes to stderr.
+#[test]
+fn undo_conflict_error_escapes_a_hostile_original_path() {
+    let sandbox = Sandbox::artemis();
+    let hostile: &[u8] = b"a\x1b]0;PWNED\x07b";
+    let mut original = b"/home/u/Downloads/".to_vec();
+    original.extend_from_slice(hostile);
+    sandbox.plant(
+        "/home/u/.local/share/Trash",
+        b"n",
+        &original,
+        "2026-01-01T00:00:00",
+        Body::File(b"x".to_vec()),
+    );
+    // Recreate the original path so undo hits the Conflict branch, whose
+    // message names both the original path and the trash path.
+    std::fs::write(
+        sandbox
+            .host("/home/u/Downloads")
+            .join(OsStr::from_bytes(hostile)),
+        b"already there",
+    )
+    .unwrap();
+
+    let out = sandbox.rip("/", &["undo"]);
+    assert_fails(&out, "undo conflict with a hostile original path");
+    let err = stderr_str(&out);
+    assert!(
+        !err.as_bytes().windows(2).any(|w| w == b"\x1b]"),
+        "raw ESC/OSC must not reach the terminal: {err:?}"
+    );
+    assert!(
+        err.contains("\\x1b") && err.contains("\\x07"),
+        "the hostile bytes must still be visible, escaped: {err:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // undo (design §7.4)
 // ---------------------------------------------------------------------------
