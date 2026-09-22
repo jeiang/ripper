@@ -307,22 +307,114 @@ pub struct Walk {
     pub manifest: Manifest,
 }
 
-/// `(dev, ino) -> (size, mtime)`. Keyed by the pair, not ino alone: a bare
-/// inode number is only unique within one `st_dev`, and nested btrfs
-/// subvolumes (each its own `st_dev`, docs/design.md §1 "Nested btrfs
-/// subvolumes count") routinely reuse low inode numbers, so two unrelated
-/// entries on different subvolumes can share an ino. mtime, not ctime:
-/// unlinking one name of a hard-linked inode changes the inode's ctime, so a
-/// ctime manifest would report every other link in the tree as changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Snapshot {
+    is_dir: bool,
+    size: u64,
+    mtime: (i64, u32),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PreEntry {
+    dev: Dev,
+    ino: u64,
+    snap: Snapshot,
+}
+
+/// What the preflight walk saw (`pre`), and -- once `verify_copy` has walked
+/// the finished copy -- what `cp` actually produced (`copy`). Both are keyed
+/// by `manifest_key`: the entry's path relative to the tree's own top, not
+/// by `(dev, ino)` alone. A bare inode number is only unique within one
+/// `st_dev` (nested btrfs subvolumes routinely reuse low inode numbers,
+/// docs/design.md §1), and worse, an inode that a concurrent writer renamed
+/// into a path the walk visited keeps its inode number, size and mtime, so
+/// an identity-only manifest would match it there even though `cp` never
+/// copied it at that path. Keying by path, and requiring a verified copy at
+/// that same path, closes both holes: a source entry is removable only where
+/// the walk saw it AND the trash demonstrably holds a copy of it, at the
+/// same relative location (docs/design.md c1).
+///
+/// mtime, not ctime, for the content check: unlinking one name of a
+/// hard-linked inode changes the inode's ctime, so a ctime-based check would
+/// report every other link in the tree as changed.
 #[derive(Debug, Default)]
 pub struct Manifest {
-    dirs: HashSet<(Dev, u64)>,
-    files: HashMap<(Dev, u64), (u64, (i64, u32))>,
+    pre: HashMap<PathBuf, PreEntry>,
+    /// `None` until `verify_copy` runs; `unchanged`/`dir_ok` authorize
+    /// nothing until then, so a caller cannot forget the step and silently
+    /// fall back to identity-only matching.
+    copy: Option<HashMap<PathBuf, Snapshot>>,
+    /// Inodes already counted into `Walk::size`, so a hard-linked pair of
+    /// paths is not double-counted. Unrelated to the per-path checks above.
+    seen_ino: HashSet<(Dev, u64)>,
+}
+
+/// `rel` without its leading component: the operand's own top-level name on
+/// the source side, or the copy box's fixed entry name (e.g. `item`) on the
+/// copy side. Stripping it means the two walks key their manifests
+/// identically regardless of what their respective top-level entries are
+/// called.
+fn manifest_key(rel: &Path) -> PathBuf {
+    rel.components().skip(1).collect()
 }
 
 impl Manifest {
-    pub fn unchanged(&self, m: &Meta) -> bool {
-        self.files.get(&(m.id.dev, m.id.ino)) == Some(&(m.size, m.mtime))
+    /// A non-directory entry the walk recorded at `rel` may be removed: its
+    /// identity and content are unchanged since the walk, AND the verified
+    /// copy holds a matching leaf at the same relative path (`cp -a` keeps
+    /// mtime) -- not merely some entry `cp` copied from a different path
+    /// with coincidentally equal content.
+    pub fn unchanged(&self, rel: &Path, m: &Meta) -> bool {
+        let Some(copy) = self.copy.as_ref() else {
+            return false;
+        };
+        let now = Snapshot {
+            is_dir: false,
+            size: m.size,
+            mtime: m.mtime,
+        };
+        let pre_ok = self
+            .pre
+            .get(rel)
+            .is_some_and(|p| p.dev == m.id.dev && p.ino == m.id.ino && p.snap == now);
+        pre_ok && copy.get(rel) == Some(&now)
+    }
+
+    /// A directory the walk descended into at `rel` may be entered (and, if
+    /// it ends up empty afterward, removed): same identity as the walk saw,
+    /// and the verified copy has a directory at the same relative path. Its
+    /// own size/mtime are not compared: a directory's mtime changes whenever
+    /// a child is added or removed, which is ordinary mid-copy and is judged
+    /// per child by `unchanged`/`dir_ok`, not here.
+    pub fn dir_ok(&self, rel: &Path, m: &Meta) -> bool {
+        let Some(copy) = self.copy.as_ref() else {
+            return false;
+        };
+        let pre_ok = self
+            .pre
+            .get(rel)
+            .is_some_and(|p| p.dev == m.id.dev && p.ino == m.id.ino && p.snap.is_dir);
+        pre_ok && copy.get(rel).is_some_and(|c| c.is_dir)
+    }
+
+    /// Walks the copy `cp_archive` just produced (rooted at
+    /// `box_fd`/`copy_name`, e.g. the staging box's `item`) and records what
+    /// actually landed at each relative path, keyed the same way the source
+    /// walk keys its own entries (relative to ITS OWN top), so the two line
+    /// up regardless of what the copy's top-level entry is called. Until
+    /// this runs, `unchanged`/`dir_ok` authorize no removal (docs/design.md
+    /// c1: the source may be deleted only where the trash holds a verified
+    /// copy of that exact entry).
+    pub fn verify_copy(&mut self, box_fd: BorrowedFd, copy_name: &OsStr) -> io::Result<()> {
+        let w = walk(box_fd, copy_name, Check::Size)?;
+        self.copy = Some(
+            w.manifest
+                .pre
+                .into_iter()
+                .map(|(k, v)| (k, v.snap))
+                .collect(),
+        );
+        Ok(())
     }
 }
 
@@ -362,7 +454,7 @@ pub fn walk(parent: BorrowedFd, name: &OsStr, check: Check) -> io::Result<Walk> 
     }
 
     if !top.is_dir() {
-        count_leaf(&top, &mut w);
+        count_leaf(Path::new(name), &top, &mut w);
         return Ok(w);
     }
 
@@ -394,16 +486,29 @@ struct WalkCtx {
     uid: Option<u32>,
 }
 
-fn count_leaf(m: &Meta, w: &mut Walk) {
-    let key = (m.id.dev, m.id.ino);
+fn count_leaf(rel: &Path, m: &Meta, w: &mut Walk) {
+    let ino_key = (m.id.dev, m.id.ino);
     // A hard-linked inode (nlink > 1) counts once: skip the size add on a
-    // repeat sighting, but keep refreshing the manifest entry (same value).
-    // Keyed by (dev, ino), so a same-numbered inode on a different
-    // subvolume is never mistaken for a repeat sighting of this one.
-    if !w.manifest.files.contains_key(&key) {
+    // repeat sighting. Keyed by (dev, ino), so a same-numbered inode on a
+    // different subvolume is never mistaken for a repeat sighting of this
+    // one. This is separate from the per-path manifest below: two distinct
+    // paths that happen to be hard links of one inode still each get their
+    // own manifest entry, since removal is judged per path.
+    if w.manifest.seen_ino.insert(ino_key) {
         w.size += m.size;
     }
-    w.manifest.files.insert(key, (m.size, m.mtime));
+    w.manifest.pre.insert(
+        manifest_key(rel),
+        PreEntry {
+            dev: m.id.dev,
+            ino: m.id.ino,
+            snap: Snapshot {
+                is_dir: false,
+                size: m.size,
+                mtime: m.mtime,
+            },
+        },
+    );
 }
 
 fn flag_immutable(m: &Meta, rel: &Path, w: &mut Walk) {
@@ -462,7 +567,18 @@ fn walk_open_dir(
     ctx: &WalkCtx,
     w: &mut Walk,
 ) -> Option<WalkFrame> {
-    w.manifest.dirs.insert((m.id.dev, m.id.ino));
+    w.manifest.pre.insert(
+        manifest_key(&rel),
+        PreEntry {
+            dev: m.id.dev,
+            ino: m.id.ino,
+            snap: Snapshot {
+                is_dir: true,
+                size: 0,
+                mtime: (0, 0),
+            },
+        },
+    );
     if m.id.mnt != ctx.own_mnt {
         if ctx.uid.is_some() {
             w.problem
@@ -552,7 +668,7 @@ fn walk_child(
         }
     }
     if !m.is_dir() {
-        count_leaf(&m, w);
+        count_leaf(&rel, &m, w);
         return None;
     }
     walk_open_dir(dir, &n, rel, &m, ctx, w)
@@ -626,7 +742,9 @@ fn enter_or_unlink(
         }
     };
     if !m.is_dir() {
-        if o.manifest.is_some_and(|mf| !mf.unchanged(&m)) {
+        if o.manifest
+            .is_some_and(|mf| !mf.unchanged(&manifest_key(&rel), &m))
+        {
             r.kept
                 .push((rel, "changed or new since it was copied".into()));
             return None;
@@ -643,7 +761,7 @@ fn enter_or_unlink(
         return None;
     }
     if o.manifest
-        .is_some_and(|mf| !mf.dirs.contains(&(m.id.dev, m.id.ino)))
+        .is_some_and(|mf| !mf.dir_ok(&manifest_key(&rel), &m))
     {
         r.kept.push((rel, "new since it was copied".into()));
         return None;
@@ -899,15 +1017,13 @@ mod tests {
     }
 
     #[test]
-    fn manifest_keeps_colliding_ino_on_different_dev_distinct() {
+    fn count_leaf_size_dedups_hardlinks_not_colliding_ino_on_a_different_dev() {
         // Two entries that share an inode number but live on different
         // devices, as two nested btrfs subvolumes commonly do for their
         // root directory and first ordinary file (docs/design.md §1
-        // "Nested btrfs subvolumes count", since `cp -a` copies them). A
-        // manifest keyed by ino alone treats the second sighting as a
-        // hard-link repeat of the first: it skips adding its size, and
-        // overwrites the first entry's (size, mtime), so the first file
-        // is later reported "changed" even though it never changed.
+        // "Nested btrfs subvolumes count", since `cp -a` copies them). Size
+        // dedup is keyed by (dev, ino) (for real hard links), so it must
+        // not mistake this collision for a repeat sighting and undercount.
         let dev_a = Dev(1, 0);
         let dev_b = Dev(1, 1);
         let colliding_ino = 257;
@@ -919,19 +1035,15 @@ mod tests {
             problem: None,
             manifest: Manifest::default(),
         };
-        count_leaf(&file_a, &mut w);
-        count_leaf(&file_b, &mut w);
+        count_leaf(Path::new("top/a"), &file_a, &mut w);
+        count_leaf(Path::new("top/b"), &file_b, &mut w);
 
         assert_eq!(
             w.size,
             5 + 9,
             "colliding ino on a different dev undercounted the walk size"
         );
-        assert!(
-            w.manifest.unchanged(&file_a),
-            "file_a's manifest entry must survive file_b's colliding-ino sighting"
-        );
-        assert!(w.manifest.unchanged(&file_b));
+        assert_eq!(w.manifest.pre.len(), 2, "both paths must be recorded");
     }
 
     #[test]
@@ -1135,6 +1247,25 @@ mod tests {
         }
     }
 
+    /// A manifest whose `copy` mirrors `pre` exactly: every entry the walk
+    /// saw is treated as verified in the trash, unchanged. Simulates an
+    /// ordinary, uneventful `cp` for tests that want to exercise
+    /// `unchanged`/`dir_ok`'s content checks in isolation, without driving a
+    /// real `cp_archive` + `verify_copy` round trip.
+    fn manifest_with_copy_mirroring_pre(w: &Walk) -> Manifest {
+        Manifest {
+            pre: w.manifest.pre.clone(),
+            copy: Some(
+                w.manifest
+                    .pre
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.snap))
+                    .collect(),
+            ),
+            seen_ino: HashSet::new(),
+        }
+    }
+
     #[test]
     fn remove_tree_manifest_keeps_changed_and_new_entries() {
         let dir = tempfile::tempdir().unwrap();
@@ -1152,6 +1283,7 @@ mod tests {
         )
         .unwrap();
         assert!(w.problem.is_none(), "{:?}", w.problem);
+        let manifest = manifest_with_copy_mirroring_pre(&w);
 
         // Mutate after the walk: rewrite one file (different length, so the
         // manifest's size check alone is enough to catch it), add a new one.
@@ -1164,7 +1296,7 @@ mod tests {
             OsStr::new("victim"),
             &Remove {
                 mnt,
-                manifest: Some(&w.manifest),
+                manifest: Some(&manifest),
                 trash: false,
             },
         );
@@ -1195,11 +1327,34 @@ mod tests {
         let victim = stat_at(&r, "victim").unwrap();
         let sub = stat_at(&r, "victim/sub").unwrap();
         let foreign_dev = Dev(sub.id.dev.0, sub.id.dev.1.wrapping_add(1));
+        let dir_snap = Snapshot {
+            is_dir: true,
+            size: 0,
+            mtime: (0, 0),
+        };
         let mut manifest = Manifest::default();
         // "victim" itself is recorded correctly, so the walk descends into
         // it; only "sub" gets the foreign-dev collision entry.
-        manifest.dirs.insert((victim.id.dev, victim.id.ino));
-        manifest.dirs.insert((foreign_dev, sub.id.ino));
+        manifest.pre.insert(
+            PathBuf::new(),
+            PreEntry {
+                dev: victim.id.dev,
+                ino: victim.id.ino,
+                snap: dir_snap,
+            },
+        );
+        manifest.pre.insert(
+            PathBuf::from("sub"),
+            PreEntry {
+                dev: foreign_dev,
+                ino: sub.id.ino,
+                snap: dir_snap,
+            },
+        );
+        manifest.copy = Some(HashMap::from([
+            (PathBuf::new(), dir_snap),
+            (PathBuf::from("sub"), dir_snap),
+        ]));
 
         let mnt = ident(&r).unwrap().mnt;
         let res = remove_tree(
@@ -1222,6 +1377,209 @@ mod tests {
             stat_at(&r, "victim/sub").is_ok(),
             "victim/sub must not be removed: it never matched the manifest"
         );
+    }
+
+    // ---- c1: the manifest must key on path, and require a verified copy,
+    // not just a matching (dev, ino, size, mtime) found anywhere ----
+
+    #[test]
+    fn remove_tree_verified_copy_removes_only_what_it_confirms() {
+        // End-to-end happy path through the real fix: walk, `cp_archive`,
+        // `verify_copy`, then `remove_tree`. Exercises the actual key
+        // alignment between the source's own top-level name ("victim") and
+        // the copy box's fixed top-level name ("item"), which the isolated
+        // Manifest-only tests above do not cover.
+        let dir = tempfile::tempdir().unwrap();
+        let r = root(&dir);
+        mkdirat(&r, "victim", Mode::from_raw_mode(0o700)).unwrap();
+        mkdirat(&r, "victim/sub", Mode::from_raw_mode(0o700)).unwrap();
+        std::fs::write(dir.path().join("victim/a"), b"AAAA").unwrap();
+        std::fs::write(dir.path().join("victim/sub/b"), b"BB").unwrap();
+
+        let mut w = walk(
+            r.as_fd(),
+            OsStr::new("victim"),
+            Check::Removable {
+                uid: getuid().as_raw(),
+            },
+        )
+        .unwrap();
+        assert!(w.problem.is_none(), "{:?}", w.problem);
+
+        mkdirat(&r, "box", Mode::from_raw_mode(0o700)).unwrap();
+        let box_fd = open_dir(&r, "box").unwrap();
+        cp_archive(
+            r.as_fd(),
+            OsStr::new("victim"),
+            box_fd.as_fd(),
+            OsStr::new("item"),
+        )
+        .unwrap();
+        w.manifest
+            .verify_copy(box_fd.as_fd(), OsStr::new("item"))
+            .unwrap();
+
+        let mnt = ident(&r).unwrap().mnt;
+        let res = remove_tree(
+            r.as_fd(),
+            OsStr::new("victim"),
+            &Remove {
+                mnt,
+                manifest: Some(&w.manifest),
+                trash: false,
+            },
+        );
+        assert!(res.removed_any);
+        assert!(res.kept.is_empty(), "{:?}", res.kept);
+        assert!(matches!(stat_at(&r, "victim"), Err(e) if e.kind() == ErrorKind::NotFound));
+        assert_eq!(
+            std::fs::read(dir.path().join("box/item/a")).unwrap(),
+            b"AAAA"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("box/item/sub/b")).unwrap(),
+            b"BB"
+        );
+    }
+
+    #[test]
+    fn remove_tree_keeps_an_entry_renamed_to_a_path_the_walk_never_saw() {
+        // Reproduces the c1 finding: `t/b/f` is renamed to `t/a/f` between
+        // the preflight walk and the copy (simulated here directly, since
+        // the underlying bug is a data-modeling one, not a timing one: the
+        // manifest must refuse a path it never walked, regardless of
+        // whether the identity now sitting there matches some other entry
+        // the walk saw). Before the fix, a manifest keyed by (dev, ino)
+        // alone would match `t/a/f`'s unchanged inode/size/mtime and delete
+        // it, even though `cp` copied nothing at that path.
+        let dir = tempfile::tempdir().unwrap();
+        let r = root(&dir);
+        mkdirat(&r, "t", Mode::from_raw_mode(0o700)).unwrap();
+        mkdirat(&r, "t/a", Mode::from_raw_mode(0o700)).unwrap();
+        mkdirat(&r, "t/b", Mode::from_raw_mode(0o700)).unwrap();
+        std::fs::write(dir.path().join("t/a/one"), b"1").unwrap();
+        std::fs::write(dir.path().join("t/b/marker"), b"MARKER").unwrap();
+
+        let mut w = walk(
+            r.as_fd(),
+            OsStr::new("t"),
+            Check::Removable {
+                uid: getuid().as_raw(),
+            },
+        )
+        .unwrap();
+        assert!(w.problem.is_none(), "{:?}", w.problem);
+
+        // `cp` copies the tree as it stood at the walk (this test does not
+        // need to race a real `cp`: what matters is that the copy has no
+        // entry at "t/a/marker", exactly as a real race would leave it,
+        // since neither cp's visit to `t/a` nor its visit to `t/b` ever
+        // saw the file at that path).
+        mkdirat(&r, "box", Mode::from_raw_mode(0o700)).unwrap();
+        let box_fd = open_dir(&r, "box").unwrap();
+        cp_archive(
+            r.as_fd(),
+            OsStr::new("t"),
+            box_fd.as_fd(),
+            OsStr::new("item"),
+        )
+        .unwrap();
+        w.manifest
+            .verify_copy(box_fd.as_fd(), OsStr::new("item"))
+            .unwrap();
+
+        // Now simulate the concurrent writer: the file is renamed into a
+        // directory the walk already recorded, with its (dev, ino, size,
+        // mtime) unchanged (a rename preserves all four).
+        std::fs::rename(dir.path().join("t/b/marker"), dir.path().join("t/a/marker")).unwrap();
+
+        let mnt = ident(&r).unwrap().mnt;
+        let res = remove_tree(
+            r.as_fd(),
+            OsStr::new("t"),
+            &Remove {
+                mnt,
+                manifest: Some(&w.manifest),
+                trash: false,
+            },
+        );
+        assert!(
+            std::fs::exists(dir.path().join("t/a/marker")).unwrap(),
+            "the renamed file must survive: cp never copied it at that path"
+        );
+        let kept: Vec<String> = res
+            .kept
+            .iter()
+            .map(|(p, _)| p.to_string_lossy().into_owned())
+            .collect();
+        assert!(kept.iter().any(|n| n.contains("marker")), "{kept:?}");
+        // The untouched sibling is still removed normally.
+        assert!(!std::fs::exists(dir.path().join("t/a/one")).unwrap());
+    }
+
+    #[test]
+    fn remove_tree_keeps_an_entry_the_verified_copy_does_not_actually_hold() {
+        // The path-keyed identity check alone is not enough (a verifier's
+        // correction to the c1 finding): a file that moves away and back to
+        // its original path during the copy window keeps its (dev, ino,
+        // size, mtime) match at that same path, yet `cp` may never have
+        // copied it there. Only a copy that `verify_copy` actually confirms
+        // may authorize deletion.
+        let dir = tempfile::tempdir().unwrap();
+        let r = root(&dir);
+        mkdirat(&r, "t", Mode::from_raw_mode(0o700)).unwrap();
+        mkdirat(&r, "t/zz", Mode::from_raw_mode(0o700)).unwrap();
+        std::fs::write(dir.path().join("t/zz/f"), b"VERIFY-ME").unwrap();
+
+        let mut w = walk(
+            r.as_fd(),
+            OsStr::new("t"),
+            Check::Removable {
+                uid: getuid().as_raw(),
+            },
+        )
+        .unwrap();
+        assert!(w.problem.is_none(), "{:?}", w.problem);
+
+        mkdirat(&r, "box", Mode::from_raw_mode(0o700)).unwrap();
+        let box_fd = open_dir(&r, "box").unwrap();
+        cp_archive(
+            r.as_fd(),
+            OsStr::new("t"),
+            box_fd.as_fd(),
+            OsStr::new("item"),
+        )
+        .unwrap();
+        // Simulate the race's outcome directly: `cp` never actually copied
+        // "t/zz/f" (it moved away before cp visited "zz" and back before
+        // removal), so the verified copy must not hold it, even though it
+        // does hold everything else and the source file itself never moved
+        // in this test.
+        std::fs::remove_file(dir.path().join("box/item/zz/f")).unwrap();
+        w.manifest
+            .verify_copy(box_fd.as_fd(), OsStr::new("item"))
+            .unwrap();
+
+        let mnt = ident(&r).unwrap().mnt;
+        let res = remove_tree(
+            r.as_fd(),
+            OsStr::new("t"),
+            &Remove {
+                mnt,
+                manifest: Some(&w.manifest),
+                trash: false,
+            },
+        );
+        assert!(
+            std::fs::exists(dir.path().join("t/zz/f")).unwrap(),
+            "must survive: identity matches the walk, but the verified copy does not hold it"
+        );
+        let kept: Vec<String> = res
+            .kept
+            .iter()
+            .map(|(p, _)| p.to_string_lossy().into_owned())
+            .collect();
+        assert!(kept.iter().any(|n| n.contains('f')), "{kept:?}");
     }
 
     #[test]

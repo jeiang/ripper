@@ -596,7 +596,7 @@ fn copy_to_home(
         .into());
     }
 
-    let w = sys::walk(pfd.as_fd(), name, Check::Removable { uid: cx.uid })?; // one pass, before any write
+    let mut w = sys::walk(pfd.as_fd(), name, Check::Removable { uid: cx.uid })?; // one pass, before any write
     if let Some(p) = w.problem {
         return Err(format!("{p}; not copying it").into());
     }
@@ -641,6 +641,17 @@ fn copy_to_home(
     if let Err(e) = sys::cp_archive(pfd.as_fd(), name, bfd.as_fd(), OsStr::new("item")) {
         drop_box(&bx);
         return Err(format!("copying into the home trash failed: {e}; left it untouched").into());
+    }
+
+    // 1b. Verify: walk what `cp` actually produced, so step 5 below deletes
+    // a source entry only where the trash demonstrably holds a copy of it at
+    // the same relative path -- not merely one whose inode, size and mtime
+    // still match something the pre-copy walk saw somewhere in the tree
+    // (docs/design.md c1: a concurrent rename during the copy must not
+    // authorize deleting an entry `cp` never actually copied).
+    if let Err(e) = w.manifest.verify_copy(bfd.as_fd(), OsStr::new("item")) {
+        drop_box(&bx);
+        return Err(format!("could not verify the copy: {e}; left it untouched").into());
     }
 
     // 2. Reserve, 3. publish with NOREPLACE.
