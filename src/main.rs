@@ -315,7 +315,10 @@ fn parse_age(s: &str) -> Result<jiff::Span, String> {
 
 /// Writes control bytes as `\n`, `\t` and `\xNN`, invalid UTF-8 as `\xNN`, and a
 /// backslash as `\\`. Used for human output to a terminal and for fzf display.
-#[allow(dead_code)] // not called until list/restore/fzf display land (C3/C4b)
+/// `char::is_control` covers C0 (below 0x20), DEL (0x7f) and, importantly,
+/// C1 (U+0080..=U+009F, encoded as two valid UTF-8 bytes): a terminal in
+/// UTF-8 mode can act on a C1 control the same as its ESC-prefixed C0
+/// equivalent, so a hostile name cannot smuggle one through as "valid text".
 pub fn escape(b: &[u8]) -> String {
     let mut out = String::new();
     for chunk in b.utf8_chunks() {
@@ -324,9 +327,7 @@ pub fn escape(b: &[u8]) -> String {
                 '\\' => out.push_str("\\\\"),
                 '\n' => out.push_str("\\n"),
                 '\t' => out.push_str("\\t"),
-                c if (c as u32) < 0x20 || c as u32 == 0x7f => {
-                    out.push_str(&format!("\\x{:02x}", c as u32))
-                }
+                c if c.is_control() => out.push_str(&format!("\\x{:02x}", c as u32)),
                 c => out.push(c),
             }
         }
@@ -824,6 +825,21 @@ mod tests {
         assert_eq!(escape(b"a\nb\tc"), "a\\nb\\tc");
         assert_eq!(escape(&[0x41, 0x01, 0x42]), "A\\x01B");
         assert_eq!(escape(&[0xff, 0x41]), "\\xffA");
+    }
+
+    // Regression for c7: escape() previously let C1 controls (U+0080..=U+009F,
+    // valid as UTF-8) through unescaped, so a terminal in UTF-8 mode (e.g.
+    // xterm) could still act on them (CSI is U+009B, OSC is U+009D, ST is
+    // U+009C). char::is_control() catches C0, DEL and C1 alike.
+    #[test]
+    fn escape_c1_controls() {
+        assert_eq!(escape("a\u{9b}b".as_bytes()), "a\\x9bb");
+        assert_eq!(escape("\u{80}\u{9f}".as_bytes()), "\\x80\\x9f");
+        // The full round trip from the finding: CSI 31m RED OSC 0;T ST.
+        assert_eq!(
+            escape("a\u{9b}31mRED\u{9d}0;T\u{9c}".as_bytes()),
+            "a\\x9b31mRED\\x9d0;T\\x9c"
+        );
     }
 
     #[test]
