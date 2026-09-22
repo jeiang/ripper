@@ -887,6 +887,22 @@ fn zsh_config_equals_form_still_gives_subcommands_at_the_first_word() {
     }
 }
 
+// zsh keeps `--config=PATH` as one word, so `_rip` must strip the flag
+// itself before completing the value as a file.
+#[test]
+fn zsh_config_equals_form_completes_files_for_the_value() {
+    let sandbox = sandbox_with_shell_completions();
+    std::fs::write(sandbox.host("/home/u/Downloads").join("c.toml"), b"").unwrap();
+
+    for line in ["rip --config=", "rip --config=c"] {
+        let got = zsh_words(&complete_zsh(&sandbox, "/home/u/Downloads", line));
+        assert!(
+            got.iter().any(|w| w == "c.toml"),
+            "{line}<TAB> must complete files: {got:?}"
+        );
+    }
+}
+
 #[test]
 fn zsh_config_equals_form_then_restore_gives_trashed_paths_not_cwd_files() {
     let sandbox = sandbox_with_shell_completions();

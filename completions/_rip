@@ -81,11 +81,15 @@ _rip() {
     local prev=$words[CURRENT-1]
     _rip_state
 
-    if [[ $state != -- && $prev == --config ]]; then
-        _files
-        return
+    if [[ $state != -- ]]; then
+        # --config's value: `--config PATH`, or `--config=PATH`, which zsh
+        # keeps as one word (compset moves the flag into IPREFIX).
+        if [[ $prev == --config ]] || compset -P '--config='; then
+            _files
+            return
+        fi
+        compadd -- --config
     fi
-    [[ $state != -- ]] && compadd -- --config
 
     case $state in
     first)

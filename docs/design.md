@@ -193,6 +193,8 @@ zsh's `_rip_trashed` shows the deletion date next to each trashed path with
 `PATH -- DATE`, the same approach `_describe` uses internally): `-d` without
 `-l` makes the description array replace the match in the listing instead of
 annotating it, which would show only dates and no paths.
+zsh keeps `--config=PATH` as one word, so `_rip` strips the flag with
+`compset -P '--config='` before completing the value as a file.
 
 ### 2.2 Exit codes
 
