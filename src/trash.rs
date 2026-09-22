@@ -427,8 +427,18 @@ fn reread_info(t: &Trash, name: &OsStr) -> Option<(Ident, Vec<u8>)> {
     if !meta.is_file() || meta.len() > MAX_INFO_SIZE {
         return Some((id, Vec::new()));
     }
+    // `meta.len()` above is only a fast path: a writer with access to this
+    // topdir's info/ can grow the file between that fstat and the read
+    // below (docs/design.md invariant 6), so the read itself stays capped
+    // too, rather than trusting the size fstat reported.
     let mut buf = Vec::new();
-    file.read_to_end(&mut buf).ok()?;
+    (&mut file)
+        .take(MAX_INFO_SIZE + 1)
+        .read_to_end(&mut buf)
+        .ok()?;
+    if buf.len() as u64 > MAX_INFO_SIZE {
+        return Some((id, Vec::new()));
+    }
     Some((id, buf))
 }
 
@@ -1183,5 +1193,54 @@ mod tests {
 
         let remaining = sys::read_names(staging(&t).unwrap()).unwrap();
         assert!(remaining.is_empty(), "{remaining:?}");
+    }
+
+    // ---- Review round (fix-empty.json) ----
+
+    /// c16: `reread_info`'s fstat check is only a fast path -- a writer with
+    /// access to this trash's info/ can grow the file between that fstat
+    /// and the read that follows. The read itself must stay capped, so a
+    /// growing (or lying) info can never make rip read or allocate past
+    /// `MAX_INFO_SIZE`, no matter how the race lands.
+    #[test]
+    fn reread_info_never_exceeds_the_cap_even_if_the_file_grows_after_fstat() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = make_trash(dir.path());
+        std::fs::write(dir.path().join("files/x"), b"x").unwrap();
+        let info_path = dir.path().join("info/x.trashinfo");
+        std::fs::write(&info_path, info_text("x", "2026-01-01T00:00:00")).unwrap();
+        let small = std::fs::metadata(&info_path).unwrap().len();
+
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let mut worst = 0usize;
+        let mut wins = 0u32;
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&info_path)
+                    .unwrap();
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = f.set_len(small);
+                    let _ = f.set_len(256 << 20); // 256 MiB, sparse
+                }
+                let _ = f.set_len(small);
+            });
+            let start = std::time::Instant::now();
+            while start.elapsed() < std::time::Duration::from_secs(5) && wins < 3 {
+                if let Some((_, bytes)) = reread_info(&t, OsStr::new("x")) {
+                    worst = worst.max(bytes.len());
+                    if bytes.len() as u64 > MAX_INFO_SIZE {
+                        wins += 1;
+                    }
+                }
+            }
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        assert!(
+            worst as u64 <= MAX_INFO_SIZE,
+            "reread_info returned {worst} bytes, past the {MAX_INFO_SIZE}-byte cap \
+             ({wins} times over)"
+        );
     }
 }
