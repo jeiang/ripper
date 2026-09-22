@@ -1038,9 +1038,12 @@ fn delete_dangling(t: &Trash, g: &Dangling, rep: &mut Report) {
     if still_missing && same_info {
         let _ = unlinkat(&t.info, &info_name, AtFlags::empty());
         rep.deleted += 1;
-    } else {
-        rep.skip(&g.name, "changed since it was listed");
     }
+    // Otherwise: a concurrent put finished (files/NAME now exists) or a
+    // concurrent empty/restore already resolved this info (its identity no
+    // longer matches). Either way this is no longer dangling, so there is
+    // nothing wrong to report -- only a genuinely removed dangling info
+    // counts (docs/design.md §8.3's Dangling arm never skips one).
 }
 
 // ---------------------------------------------------------------------------

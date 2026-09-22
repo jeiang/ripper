@@ -698,3 +698,66 @@ fn unopenable_info_with_existing_files_entry_is_still_removable() {
     );
     assert!(!trash_host.join("info/stuck.trashinfo").exists());
 }
+
+/// c21 (review round, fix-empty.json): `empty`'s unlocked load can see a
+/// concurrent put's reserved info before its rename lands, classifying it
+/// Dangling; once `empty` gets `LOCK_EX`, the put has finished. This must
+/// be a silent no-op, not a reported failed delete (exit 1) about the file
+/// the user just trashed.
+#[test]
+fn dangling_completed_by_concurrent_put_is_not_a_failure() {
+    let sandbox = Sandbox::artemis();
+    // An info-only entry, as `put`'s reserve() leaves one while its rename
+    // into files/ is still pending (docs/design.md §5.4): from the outside
+    // this looks dangling.
+    sandbox.plant(
+        "/home/u/.local/share/Trash",
+        b"inflight",
+        b"/home/u/Downloads/inflight",
+        &days_ago(0),
+        Body::Missing,
+    );
+    let trash_host = sandbox.host("/home/u/.local/share/Trash");
+
+    // Hold LOCK_SH on the trash dir, exactly as put.rs's move_in does while
+    // its info is reserved but not yet renamed into files/: empty's own
+    // unlocked load then sees "inflight" as dangling.
+    let lock_file = fs::File::open(&trash_host).unwrap();
+    rustix::fs::flock(&lock_file, FlockOperation::LockShared).unwrap();
+
+    // `thread::scope` (not `thread::spawn(move || ...)`): `sandbox` must
+    // outlive this whole test, including the assertions below, or its own
+    // `Drop` (which removes its temp dirs) would run as soon as the
+    // spawned closure returns, wiping the trash out from under those
+    // assertions before they run -- masking the very outcome this test
+    // checks for.
+    let out = std::thread::scope(|s| {
+        let handle = s.spawn(|| sandbox.rip("/", &["empty", "--older-than", "30d", "-y"]));
+
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            !handle.is_finished(),
+            "empty should still be waiting for the lock"
+        );
+
+        // The concurrent put finishes: the rename lands.
+        fs::write(trash_host.join("files/inflight"), b"user data").unwrap();
+        rustix::fs::flock(&lock_file, FlockOperation::Unlock).unwrap();
+
+        handle.join().expect("the empty thread panicked")
+    });
+    drop(lock_file);
+
+    assert_ok(&out);
+    assert!(
+        !stderr(&out).contains("could not delete"),
+        "a dangling info a concurrent put completed must not be reported as a \
+         failed delete: {}",
+        stderr(&out)
+    );
+    assert!(
+        trash_host.join("files/inflight").is_file(),
+        "the just-trashed item must survive intact"
+    );
+    assert!(trash_host.join("info/inflight.trashinfo").is_file());
+}
