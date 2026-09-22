@@ -831,6 +831,38 @@ fn missing_and_force() {
 }
 
 #[test]
+fn force_ignores_enotdir_like_rm_but_still_refuses_trailing_slash() {
+    // docs/design.md c25: `rip -f f/x`, where `f` is a regular file, fails
+    // to resolve with ENOTDIR. GNU `rm -f` treats that the same as a
+    // missing path (its own nonexistent_file_errno list includes ENOTDIR)
+    // and exits 0 silently; `-f` must do the same. The trailing-slash
+    // refusal (`f/`, a deliberate rip-specific extra refusal, docs/design.md
+    // §1) is a different case and must still fail even under `-f`.
+    let sandbox = Sandbox::artemis();
+    let base = sandbox.host("/home/u/Downloads");
+    std::fs::write(base.join("f"), b"x").unwrap();
+
+    let out = sandbox.rip("/home/u/Downloads", &["-f", "f/x"]);
+    assert_ok(&out);
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(base.join("f").is_file(), "f itself must be untouched");
+
+    let out = sandbox.rip("/home/u/Downloads", &["-f", "f/x/y"]);
+    assert_ok(&out);
+
+    let out = sandbox.rip("/home/u/Downloads", &["-f", "f/"]);
+    assert_fail(&out);
+    assert!(
+        base.join("f").is_file(),
+        "the trailing-slash refusal must still leave f untouched"
+    );
+}
+
+#[test]
 fn interactive() {
     let sandbox = Sandbox::artemis();
     let base = sandbox.host("/home/u/Downloads");

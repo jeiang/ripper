@@ -466,7 +466,18 @@ impl From<String> for PutErr {
 impl From<io::Error> for PutErr {
     fn from(e: io::Error) -> Self {
         PutErr {
-            not_found: e.kind() == io::ErrorKind::NotFound,
+            // `-f` ignores a missing operand the way `rm -f` does (docs
+            // brief item 4). GNU rm's `nonexistent_file_errno` treats
+            // ENOTDIR the same as ENOENT: a path whose parent component
+            // turned out not to be a directory is just as gone as one that
+            // never existed (c25). This does not cover the trailing-slash
+            // refusals in `put_one` (`'X/' names a symbolic link`, `Not a
+            // directory` for a non-directory operand itself): those are
+            // rip's own deliberate refusals, not this conversion.
+            not_found: matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ),
             msg: e.to_string(),
         }
     }
