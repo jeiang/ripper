@@ -2,9 +2,9 @@
 # Pushes store paths to garret with retries and a per-attempt watchdog.
 # Adapted from cornn-flaek's .ci/garret-push.sh, but strict: unlike that
 # version's continue-on-error default, exhausted attempts always fail this
-# job. .github/workflows/release.yml's release job does not depend on the
-# garret job, so a cache outage turns this job red without blocking the
-# GitHub release.
+# job. Nothing depends on the jobs that run it (release.yml's garret job,
+# ci.yml's push job), so a cache outage turns that job red without blocking
+# the GitHub release or the other checks.
 set -euo pipefail
 
 if [ $# -lt 1 ]; then
@@ -12,7 +12,7 @@ if [ $# -lt 1 ]; then
   exit 64
 fi
 
-export PATH=$HOME/.nix-profile/bin:$PATH # release.yml installs the client via `nix profile install`
+export PATH=$HOME/.nix-profile/bin:$PATH # the workflows install the client via `nix profile install`
 
 config=${GARRET_CONFIG:-.ci/garret.toml}
 timeout=${GARRET_PUSH_TIMEOUT:-1800}

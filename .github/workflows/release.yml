@@ -57,6 +57,9 @@ jobs:
       - name: Build the default package
         run: nix build .#default --print-build-logs
 
+      - name: Build the static binary
+        run: nix build .#static -o result-static --print-build-logs
+
       # garret admits a GitHub OIDC push only when the token's repository_id,
       # event_name, job_workflow_ref and ref all match the github-actions
       # issuer in cornn-flaek modules/garret/default.nix. It must list this
@@ -65,8 +68,8 @@ jobs:
       - name: Install the garret client
         run: nix profile install "github:jeiang/garret/c83cd2a79ea32427555cdd1eb1d255a3d2c0e7db#garret"
 
-      - name: Push the closure to garret
-        run: .ci/garret-push.sh ./result
+      - name: Push the closures to garret
+        run: .ci/garret-push.sh ./result ./result-static
 
   release:
     name: create GitHub release

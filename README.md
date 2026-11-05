@@ -232,6 +232,9 @@ for `restore`/`purge`.
 CI (`.github/workflows/ci.yml`) runs `just check` on every push and pull
 request, builds the Nix package (which runs the unit tests) and checks the
 installed completions, and runs the full test suite on a real btrfs loop
-mount. Pushing a `vX.Y.Z` tag runs `.github/workflows/release.yml`, which
-builds the static binary, publishes the GitHub release, and pushes the Nix
-package's closure to the `garret` binary cache.
+mount. Every job substitutes from the `garret` binary cache, and on a push
+to main that passes all three, CI pushes the default and static packages'
+closures and the dev shell's to it. Pushing a `vX.Y.Z` tag runs
+`.github/workflows/release.yml`, which builds the static binary, publishes
+the GitHub release, and pushes the default and static packages' closures to
+`garret`.
