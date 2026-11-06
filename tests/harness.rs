@@ -201,3 +201,37 @@ fn without_fzf_leaves_no_fzf_on_path() {
         String::from_utf8_lossy(&out.stdout)
     );
 }
+
+/// `spawn_tty` hands `script` the whole bwrap command line as one shell
+/// string; an argument with a single quote, a space and a non-UTF-8 byte
+/// must still reach `rip` byte for byte (here: name the file it trashes).
+#[test]
+fn spawn_tty_round_trips_a_non_utf8_argument() {
+    use std::io::Read;
+    use std::os::unix::ffi::OsStrExt;
+
+    let sandbox = Sandbox::artemis();
+    let name = std::ffi::OsStr::from_bytes(b"q'uo te\xff");
+    let src = sandbox.host("/home/u/Downloads").join(name);
+    std::fs::write(&src, b"x").unwrap();
+
+    let mut child = sandbox.spawn_tty("/home/u/Downloads", &[name]);
+    drop(child.stdin.take());
+    let mut tty = Vec::new();
+    child.stdout.take().unwrap().read_to_end(&mut tty).unwrap();
+    let status = child.wait().unwrap();
+    assert!(
+        status.success(),
+        "rip failed: {}",
+        String::from_utf8_lossy(&tty)
+    );
+    assert!(!src.exists(), "the file must have been trashed");
+    assert!(
+        sandbox
+            .host("/home/u/.local/share/Trash/files")
+            .join(name)
+            .exists(),
+        "the trashed name must be byte-identical: {}",
+        String::from_utf8_lossy(&tty)
+    );
+}

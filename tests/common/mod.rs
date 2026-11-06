@@ -17,7 +17,7 @@ use std::io::{self, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -267,9 +267,26 @@ impl Sandbox {
     /// separable: `Output::stdout` carries everything the terminal saw, and
     /// `Output::stderr` is always empty.
     pub fn rip_tty(&self, cwd: &str, args: &[&str], input: &str) -> Output {
+        let mut child = self.spawn_tty(cwd, args);
+        child
+            .stdin
+            .take()
+            .expect("script's stdin")
+            .write_all(input.as_bytes())
+            .expect("write rip_tty input");
+        child.wait_with_output().expect("wait for rip_tty")
+    }
+
+    /// Starts `rip` on a real pty the way `rip_tty` does, but returns the
+    /// running `script` process (stdin, stdout and stderr all piped) so the
+    /// caller can read its output while it is still waiting for input.
+    /// Closing stdin is end of input. The bwrap command line is passed to
+    /// `script` as one shell string, quoted byte-wise (`shell_quote`), so
+    /// any argument, including a non-UTF-8 one, arrives unchanged.
+    pub fn spawn_tty(&self, cwd: &str, args: &[impl AsRef<OsStr>]) -> Child {
         let mut argv: Vec<&OsStr> = Vec::with_capacity(args.len() + 1);
         argv.push(OsStr::new("/run/rip/bin/rip"));
-        argv.extend(args.iter().map(OsStr::new));
+        argv.extend(args.iter().map(|a| a.as_ref()));
         let cmd = self.command(cwd, &argv);
 
         let mut quoted = shell_quote(cmd.get_program());
@@ -279,7 +296,7 @@ impl Sandbox {
         }
         let script_cmd = OsString::from_vec(quoted);
 
-        let mut child = Command::new("script")
+        Command::new("script")
             .arg("-qec")
             .arg(&script_cmd)
             .arg("/dev/null")
@@ -288,14 +305,7 @@ impl Sandbox {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn `script` for rip_tty");
-        child
-            .stdin
-            .take()
-            .expect("script's stdin")
-            .write_all(input.as_bytes())
-            .expect("write rip_tty input");
-        child.wait_with_output().expect("wait for rip_tty")
+            .expect("spawn `script` for a rip pty")
     }
 
     /// Runs an arbitrary program inside the sandbox (`fish`, `date`, `mv`,
@@ -641,7 +651,7 @@ fn btrfs_subvolume_create(path: &Path) {
     }
 }
 
-/// The bash the fake `fzf` script's shebang and `rip_tty`'s `SHELL` use. It
+/// The bash the fake `fzf` script's shebang and `spawn_tty`'s `SHELL` use. It
 /// must resolve under `/nix/store`: only `/nix`, not the rest of the host's
 /// `PATH` directories (e.g. `/run/current-system/sw/bin`), is bound into the
 /// sandbox.
@@ -658,7 +668,7 @@ fn host_bash() -> PathBuf {
     }
     panic!(
         "Sandbox: no `bash` under /nix/store on PATH (needed for the fake fzf script's shebang \
-         and rip_tty's SHELL); run inside `nix develop`."
+         and spawn_tty's SHELL); run inside `nix develop`."
     );
 }
 
@@ -692,7 +702,7 @@ exit \"${{FAKE_FZF_EXIT:-0}}\"\n",
     chmod(&path, 0o755);
 }
 
-/// Shell-quotes one argument for `script -c`'s command string (`rip_tty`).
+/// Shell-quotes one argument for `script -c`'s command string (`spawn_tty`).
 /// Operates on raw bytes throughout, so a non-UTF-8 argument round-trips.
 fn shell_quote(arg: &OsStr) -> Vec<u8> {
     let bytes = arg.as_bytes();

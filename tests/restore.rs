@@ -72,163 +72,15 @@ fn trash_host_path(sandbox: &Sandbox, trash_inside: &str, name: &[u8]) -> PathBu
 }
 
 // ---------------------------------------------------------------------------
-// Custom pty launchers. They reconstruct the fixed bwrap flags
-// `Sandbox::command` also uses, plus the *default* artemis binds by their
-// well-known inside paths (read back through `Sandbox`'s own public
-// `host()`), so they only work against a freshly built, unmodified
-// `Sandbox::artemis()` -- never after `.bind()`/`.without()` have changed
-// the layout.
+// A pty session held open past a prompt
 // ---------------------------------------------------------------------------
-
-const DEFAULT_BINDS: &[&str] = &[
-    "/persist",
-    "/home",
-    "/home/u/Downloads",
-    "/home/u/Documents",
-    "/home/u/.local/share/Trash",
-    "/mnt/side",
-    "/mnt/pside",
-    "/mnt/other",
-    "/mnt/ro",
-];
-
-/// The scaffolding common to every custom launcher below: the same fixed
-/// bwrap flags and binds `Sandbox::command` uses, `rip`'s own binary bound
-/// at the usual inside path, and a `PATH` of just `/run/rip/bin` plus the
-/// host's own `/nix/store` entries -- deliberately WITHOUT
-/// `/run/rip/fakebin` (the fake `fzf`), which is the one thing no
-/// `Sandbox` method can omit. Callers finish the invocation themselves
-/// (`--chdir`, `--`, argv).
-fn base_bwrap(sandbox: &Sandbox) -> Command {
-    let mut c = Command::new("bwrap");
-    c.args([
-        "--unshare-user",
-        "--unshare-pid",
-        "--die-with-parent",
-        "--new-session",
-        "--proc",
-        "/proc",
-        "--dev",
-        "/dev",
-        "--tmpfs",
-        "/tmp",
-        "--ro-bind",
-        "/nix",
-        "/nix",
-        "--ro-bind",
-        "/etc",
-        "/etc",
-    ]);
-    for p in ["/usr", "/bin", "/lib", "/lib64"] {
-        c.args(["--ro-bind-try", p, p]);
-    }
-    c.arg("--ro-bind")
-        .arg(env!("CARGO_BIN_EXE_rip"))
-        .arg("/run/rip/bin/rip");
-    for inside in DEFAULT_BINDS {
-        c.arg("--bind").arg(sandbox.host(inside)).arg(inside);
-    }
-    c.args([
-        "--clearenv",
-        "--setenv",
-        "HOME",
-        "/home/u",
-        "--setenv",
-        "XDG_CONFIG_HOME",
-        "/home/u/.config",
-    ]);
-    let mut path_entries = vec![PathBuf::from("/run/rip/bin")];
-    if let Some(host_path) = std::env::var_os("PATH") {
-        path_entries
-            .extend(std::env::split_paths(&host_path).filter(|p| p.starts_with("/nix/store")));
-    }
-    c.arg("--setenv")
-        .arg("PATH")
-        .arg(std::env::join_paths(path_entries).expect("PATH entries must not contain ':' or NUL"));
-    c
-}
-
-/// Single-quotes `s` for a POSIX shell command line (the only quoting
-/// `rip_without_fzf_tty` needs: every argument it is ever given is a plain
-/// path or flag, with no embedded single quotes).
-fn sq(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
-
-/// A `bash` under `/nix/store` on the host's own `PATH` (NixOS has no
-/// `/bin/sh`), for `script -qec`'s `SHELL` (mirrors
-/// tests/common/mod.rs's own `host_bash`, which is private to that module).
-fn host_bash() -> PathBuf {
-    if let Some(path) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path) {
-            let candidate = dir.join("bash");
-            if let Ok(real) = candidate.canonicalize() {
-                if real.starts_with("/nix/store") && real.is_file() {
-                    return real;
-                }
-            }
-        }
-    }
-    panic!("rip_without_fzf_tty: no `bash` under /nix/store on PATH; run inside `nix develop`");
-}
-
-/// Runs `rip` on a real pty (so `pick()`'s own terminal check passes and it
-/// actually tries to run fzf), in a bwrap session whose `PATH` has no `fzf`
-/// at all -- the one environment `Sandbox::rip_tty` can never produce,
-/// since its bwrap invocation always binds the fake `fzf` (design §0
-/// invariant 7: "an irreversible action without a terminal" is
-/// `Sandbox::rip`'s job; a genuinely missing `fzf` needs this).
-fn rip_without_fzf_tty(sandbox: &Sandbox, cwd: &str, args: &[&str]) -> Output {
-    let c = base_bwrap(sandbox);
-    let raw: Vec<&OsStr> = c.get_args().collect();
-    let mut quoted = String::from("bwrap");
-    let mut i = 0;
-    while i < raw.len() {
-        // `base_bwrap`'s forwarded PATH always includes the dev shell's
-        // OWN /nix/store entries, which (unlike the fake fzf in
-        // /run/rip/fakebin) includes a REAL fzf -- exactly the thing this
-        // launcher exists to make unavailable. Rewrite that one `--setenv
-        // PATH <value>` triple with a filtered value instead of forwarding
-        // it verbatim.
-        if i + 2 < raw.len() && raw[i] == OsStr::new("--setenv") && raw[i + 1] == OsStr::new("PATH")
-        {
-            let filtered: Vec<PathBuf> = std::env::split_paths(&raw[i + 2])
-                .filter(|p| !p.to_string_lossy().contains("fzf"))
-                .collect();
-            let value = std::env::join_paths(filtered).unwrap();
-            quoted.push_str(" --setenv PATH ");
-            quoted.push_str(&sq(&value.to_string_lossy()));
-            i += 3;
-            continue;
-        }
-        quoted.push(' ');
-        quoted.push_str(&sq(&raw[i].to_string_lossy()));
-        i += 1;
-    }
-    quoted.push_str(" --chdir ");
-    quoted.push_str(&sq(cwd));
-    quoted.push_str(" -- /run/rip/bin/rip");
-    for a in args {
-        quoted.push(' ');
-        quoted.push_str(&sq(a));
-    }
-    Command::new("script")
-        .arg("-qec")
-        .arg(&quoted)
-        .arg("/dev/null")
-        .env("SHELL", host_bash())
-        .stdin(Stdio::null())
-        .output()
-        .expect("spawn `script` for rip_without_fzf_tty")
-}
 
 /// A `rip` invocation on a real pty, held open past the point its output
 /// first contains `until` -- unlike `Sandbox::rip_tty`, which writes its
 /// whole input up front and waits for exit, so it cannot hold a prompt
 /// open. Needed for the docs/design.md §5.3 regression tests below, which
 /// must run other `rip` invocations while a copy-back prompt is still
-/// waiting for an answer. Built the same way `rip_without_fzf_tty` builds
-/// its own quoted `bwrap`/`script` command line.
+/// waiting for an answer. Started with `Sandbox::spawn_tty`.
 struct PromptHold {
     child: std::process::Child,
     buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
@@ -263,31 +115,7 @@ impl PromptHold {
 }
 
 fn rip_tty_hold(sandbox: &Sandbox, cwd: &str, args: &[&str], until: &str) -> PromptHold {
-    let c = base_bwrap(sandbox);
-    let raw: Vec<&OsStr> = c.get_args().collect();
-    let mut quoted = String::from("bwrap");
-    for a in &raw {
-        quoted.push(' ');
-        quoted.push_str(&sq(&a.to_string_lossy()));
-    }
-    quoted.push_str(" --chdir ");
-    quoted.push_str(&sq(cwd));
-    quoted.push_str(" -- /run/rip/bin/rip");
-    for a in args {
-        quoted.push(' ');
-        quoted.push_str(&sq(a));
-    }
-
-    let mut child = Command::new("script")
-        .arg("-qec")
-        .arg(&quoted)
-        .arg("/dev/null")
-        .env("SHELL", host_bash())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn `script` for rip_tty_hold");
+    let mut child = sandbox.spawn_tty(cwd, args);
 
     let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut stdout = child.stdout.take().expect("rip_tty_hold's stdout");
@@ -975,7 +803,7 @@ fn picker_cancel_exit0() {
 
 #[test]
 fn fzf_missing() {
-    let sandbox = Sandbox::artemis();
+    let mut sandbox = Sandbox::artemis();
     sandbox.plant(
         "/home/u/.local/share/Trash",
         b"x",
@@ -984,7 +812,11 @@ fn fzf_missing() {
         Body::File(b"x".to_vec()),
     );
 
-    let out = rip_without_fzf_tty(&sandbox, "/home/u/Downloads", &["restore"]);
+    // On a real pty, so `pick()`'s terminal check passes and it actually
+    // tries to run fzf, with no fzf on PATH at all (not even the dev
+    // shell's real one).
+    sandbox.without_fzf();
+    let out = sandbox.rip_tty("/home/u/Downloads", &["restore"], "");
     assert!(!out.status.success(), "{out:?}");
     let text = stdout_str(&out);
     assert!(
