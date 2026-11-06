@@ -55,10 +55,13 @@ pub enum Entry {
     Other,
 }
 
+/// Which spec method `choose_topdir` picked: `Admin` is `$topdir/.Trash/$uid`
+/// (method 1), `User` is `$topdir/.Trash-$uid` (method 2). Either is used
+/// as is when it is already the user's directory and created when missing.
 #[derive(Clone, Copy, Debug)]
 pub enum Pick {
-    Admin { create: bool },
-    User { create: bool },
+    Admin,
+    User,
 }
 
 /// Spec methods 1 and 2. `admin_uid` is only meaningful when `admin` is a
@@ -71,14 +74,14 @@ pub fn choose_topdir(
 ) -> Result<Pick, &'static str> {
     if matches!(admin, Entry::Dir { sticky: true, .. }) {
         match admin_uid {
-            Entry::Dir { uid: u, .. } if u == uid => return Ok(Pick::Admin { create: false }),
-            Entry::Missing => return Ok(Pick::Admin { create: true }),
+            Entry::Dir { uid: u, .. } if u == uid => return Ok(Pick::Admin),
+            Entry::Missing => return Ok(Pick::Admin),
             _ => {} // invalid: fall through to method 2
         }
     }
     match user {
-        Entry::Dir { uid: u, .. } if u == uid => Ok(Pick::User { create: false }),
-        Entry::Missing => Ok(Pick::User { create: true }),
+        Entry::Dir { uid: u, .. } if u == uid => Ok(Pick::User),
+        Entry::Missing => Ok(Pick::User),
         Entry::Dir { .. } => Err("its .Trash-UID belongs to another user"),
         Entry::Other => Err("its .Trash-UID is not a directory"),
     }
@@ -110,14 +113,26 @@ fn find_dir(dir: impl AsFd, name: &OsStr) -> Found {
     }
 }
 
-fn found_entry(f: &Found) -> Entry {
-    match f {
-        Found::Missing => Entry::Missing,
-        Found::Dir(_, m) => Entry::Dir {
-            uid: m.uid,
-            sticky: m.sticky(),
-        },
-        Found::Other => Entry::Other,
+impl Found {
+    fn entry(&self) -> Entry {
+        match self {
+            Found::Missing => Entry::Missing,
+            Found::Dir(_, m) => Entry::Dir {
+                uid: m.uid,
+                sticky: m.sticky(),
+            },
+            Found::Other => Entry::Other,
+        }
+    }
+
+    /// The directory itself when it was found; otherwise
+    /// `mkdir_and_open(dir, name)`, which refuses (never follows) whatever
+    /// else is there.
+    fn open_or_mkdir(self, dir: impl AsFd, name: &OsStr) -> io::Result<OwnedFd> {
+        match self {
+            Found::Dir(fd, _) => Ok(fd),
+            Found::Missing | Found::Other => mkdir_and_open(dir, name),
+        }
     }
 }
 
@@ -192,88 +207,53 @@ pub fn topdir_trash(own: &Mount, src: &Meta, uid: u32, path: &Path) -> Result<Tr
     let user_path = own.point.join(&user_name);
 
     let admin = find_dir(&top, OsStr::new(".Trash"));
-    let admin_entry = found_entry(&admin);
-    let (admin_fd, admin_sticky) = match admin {
-        Found::Dir(fd, m) => (Some(fd), m.sticky()),
-        _ => (None, false),
+    // Method 1 looks inside `.Trash` only when it is a sticky directory.
+    let admin_uid = match &admin {
+        Found::Dir(fd, m) if m.sticky() => find_dir(fd, OsStr::new(&uid_s)),
+        _ => Found::Missing,
     };
-    let admin_uid = if admin_sticky {
-        // `admin_fd` is always `Some` here: `admin_sticky` is only true when
-        // `admin` matched `Found::Dir`, which is exactly when `admin_fd` was
-        // set from that same match.
-        find_dir(admin_fd.as_ref().unwrap(), OsStr::new(&uid_s))
-    } else {
-        Found::Missing
-    };
-    let admin_uid_entry = found_entry(&admin_uid);
-    let mut admin_uid_fd = match admin_uid {
-        Found::Dir(fd, _) => Some(fd),
-        _ => None,
-    };
-
     let user = find_dir(&top, OsStr::new(&user_name));
-    let user_entry = found_entry(&user);
-    let mut user_fd = match user {
-        Found::Dir(fd, _) => Some(fd),
-        _ => None,
-    };
 
-    if matches!(admin_entry, Entry::Dir { sticky: false, .. } | Entry::Other) {
+    if matches!(
+        admin.entry(),
+        Entry::Dir { sticky: false, .. } | Entry::Other
+    ) {
         eprintln!(
             "rip: {} is not a sticky directory; not using it",
             admin_path.display()
         );
     }
 
-    let pick = choose_topdir(admin_entry, admin_uid_entry, user_entry, uid)?;
-    let mut trash_path = match pick {
-        Pick::Admin { .. } => admin_uid_path.clone(),
-        Pick::User { .. } => user_path.clone(),
-    };
-
-    let trash_fd: OwnedFd = if let Pick::Admin { create: true } = pick {
-        // Method 1 ("mkdirat(.Trash, uid, 0700)") can still fail even though
-        // .Trash itself passed the sticky/ownership checks above (e.g. a
-        // quota or an ACL); fall back to method 2 rather than failing the
-        // whole operand.
-        let admin_fd = admin_fd
-            .as_ref()
-            .expect("choose_topdir only picks Admin when .Trash is a sticky dir");
-        match mkdir_and_open(admin_fd, OsStr::new(&uid_s)) {
-            Ok(fd) => fd,
-            Err(e) => {
-                eprintln!(
-                    "rip: cannot create {}: {e}; using {}",
-                    admin_uid_path.display(),
-                    user_path.display()
-                );
-                match user_entry {
-                    Entry::Dir { uid: u, .. } if u == uid => {}
-                    Entry::Missing => {}
-                    Entry::Dir { .. } => {
-                        return Err("its .Trash-UID belongs to another user".into());
-                    }
-                    Entry::Other => return Err("its .Trash-UID is not a directory".into()),
-                }
-                trash_path = user_path.clone();
-                match user_fd.take() {
-                    Some(fd) => fd,
-                    None => mkdir_and_open(&top, OsStr::new(&user_name))
-                        .map_err(|e| format!("cannot create {}: {e}", user_path.display()))?,
+    let pick = choose_topdir(admin.entry(), admin_uid.entry(), user.entry(), uid)?;
+    let admin_trash = match (pick, &admin) {
+        (Pick::Admin, Found::Dir(admin_fd, _)) => {
+            match admin_uid.open_or_mkdir(admin_fd, OsStr::new(&uid_s)) {
+                Ok(fd) => Some(fd),
+                // Method 1's mkdirat(.Trash, uid) can still fail even though
+                // .Trash itself passed the sticky check above (e.g. a quota
+                // or an ACL); fall back to method 2 rather than failing the
+                // whole operand.
+                Err(e) => {
+                    eprintln!(
+                        "rip: cannot create {}: {e}; using {}",
+                        admin_uid_path.display(),
+                        user_path.display()
+                    );
+                    choose_topdir(Entry::Missing, Entry::Missing, user.entry(), uid)?;
+                    None
                 }
             }
         }
-    } else if let Pick::Admin { create: false } = pick {
-        admin_uid_fd
-            .take()
-            .expect("choose_topdir Admin{create:false} means admin_uid already opened as a dir")
-    } else if let Pick::User { create: false } = pick {
-        user_fd
-            .take()
-            .expect("choose_topdir User{create:false} means user already opened as a dir")
-    } else {
-        mkdir_and_open(&top, OsStr::new(&user_name))
-            .map_err(|e| format!("cannot create {}: {e}", user_path.display()))?
+        _ => None,
+    };
+    let (trash_fd, trash_path) = match admin_trash {
+        Some(fd) => (fd, admin_uid_path),
+        None => {
+            let fd = user
+                .open_or_mkdir(&top, OsStr::new(&user_name))
+                .map_err(|e| format!("cannot create {}: {e}", user_path.display()))?;
+            (fd, user_path)
+        }
     };
 
     if path.starts_with(&trash_path) {
@@ -927,13 +907,13 @@ mod tests {
         for admin in entries() {
             for admin_uid in entries() {
                 for user in entries() {
-                    if let Ok(Pick::Admin { .. }) = choose_topdir(admin, admin_uid, user, uid) {
+                    if let Ok(Pick::Admin) = choose_topdir(admin, admin_uid, user, uid) {
                         assert!(
                             usable(admin_uid, uid),
                             "Admin picked with an unusable admin_uid: {admin_uid:?}"
                         );
                     }
-                    if let Ok(Pick::User { .. }) = choose_topdir(admin, admin_uid, user, uid) {
+                    if let Ok(Pick::User) = choose_topdir(admin, admin_uid, user, uid) {
                         assert!(
                             usable(user, uid),
                             "User picked with an unusable user: {user:?}"
@@ -950,7 +930,7 @@ mod tests {
         for admin in entries() {
             for admin_uid in entries() {
                 for user in entries() {
-                    if let Ok(Pick::Admin { .. }) = choose_topdir(admin, admin_uid, user, uid) {
+                    if let Ok(Pick::Admin) = choose_topdir(admin, admin_uid, user, uid) {
                         assert!(
                             is_sticky_dir(admin),
                             "Admin picked without a sticky .Trash: {admin:?}"
@@ -961,28 +941,32 @@ mod tests {
         }
     }
 
+    /// What `Pick` no longer spells out: the picked directory is reused when
+    /// it was found as a directory and created only when it was missing --
+    /// and anything else there is refused, never followed.
     #[test]
-    fn choose_topdir_create_true_only_for_missing() {
-        let uid = 1000;
-        for admin in entries() {
-            for admin_uid in entries() {
-                for user in entries() {
-                    match choose_topdir(admin, admin_uid, user, uid) {
-                        Ok(Pick::Admin { create }) => {
-                            assert_eq!(
-                                create,
-                                matches!(admin_uid, Entry::Missing),
-                                "{admin_uid:?}"
-                            );
-                        }
-                        Ok(Pick::User { create }) => {
-                            assert_eq!(create, matches!(user, Entry::Missing), "{user:?}");
-                        }
-                        Err(_) => {}
-                    }
-                }
-            }
-        }
+    fn open_or_mkdir_reuses_a_found_dir_and_creates_only_a_missing_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let top = sys::open_dir(CWD, dir.path()).unwrap();
+        std::fs::create_dir(dir.path().join("have")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("have"), dir.path().join("link")).unwrap();
+
+        let have = find_dir(&top, OsStr::new("have"));
+        assert!(matches!(have, Found::Dir(..)));
+        let fd = have.open_or_mkdir(&top, OsStr::new("have")).unwrap();
+        let have_id = sys::stat_at(&top, "have").unwrap().id;
+        assert!(sys::ident(&fd).unwrap().same_file(&have_id));
+
+        let new = find_dir(&top, OsStr::new("new"));
+        assert!(matches!(new, Found::Missing));
+        let fd = new.open_or_mkdir(&top, OsStr::new("new")).unwrap();
+        let m = sys::stat_at(&top, "new").unwrap();
+        assert!(m.is_dir() && sys::ident(&fd).unwrap().same_file(&m.id));
+        assert_eq!(m.mode & 0o777, 0o700);
+
+        let link = find_dir(&top, OsStr::new("link"));
+        assert!(matches!(link, Found::Other));
+        assert!(link.open_or_mkdir(&top, OsStr::new("link")).is_err());
     }
 
     #[test]
@@ -993,7 +977,7 @@ mod tests {
                 for user in entries() {
                     let method1_valid = is_sticky_dir(admin) && usable(admin_uid, uid);
                     let result = choose_topdir(admin, admin_uid, user, uid);
-                    let picked_admin = matches!(result, Ok(Pick::Admin { .. }));
+                    let picked_admin = matches!(result, Ok(Pick::Admin));
                     assert_eq!(
                         picked_admin, method1_valid,
                         "admin={admin:?} admin_uid={admin_uid:?} user={user:?} -> {result:?}"
@@ -1001,9 +985,9 @@ mod tests {
                     if !method1_valid {
                         // Falls through to method 2's own outcome exactly.
                         match result {
-                            Ok(Pick::User { .. }) => assert!(usable(user, uid)),
+                            Ok(Pick::User) => assert!(usable(user, uid)),
                             Err(_) => assert!(!usable(user, uid)),
-                            Ok(Pick::Admin { .. }) => unreachable!(),
+                            Ok(Pick::Admin) => unreachable!(),
                         }
                     }
                 }

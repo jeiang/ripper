@@ -418,6 +418,39 @@ fn admin_trash_uid_mkdir_failure_falls_back_to_user_trash() {
     );
 }
 
+/// The same `.Trash/UID` failure when `.Trash-UID` is not usable either (a
+/// plain file): the topdir trash is unusable, not a refusal, so the item is
+/// copied to the home trash like any other operand with no topdir trash.
+#[test]
+fn admin_trash_uid_mkdir_failure_with_an_unusable_user_trash_copies_home() {
+    let uid = getuid().as_raw();
+    let sandbox = Sandbox::artemis();
+    let admin = sandbox.host("/mnt/other").join(".Trash");
+    std::fs::create_dir(&admin).unwrap();
+    std::fs::set_permissions(&admin, std::fs::Permissions::from_mode(0o1555)).unwrap();
+    let user_trash = sandbox.host("/mnt/other").join(format!(".Trash-{uid}"));
+    std::fs::write(&user_trash, b"not a dir").unwrap();
+    let target = sandbox.host("/mnt/other").join("x");
+    std::fs::write(&target, b"hello").unwrap();
+
+    let out = sandbox.rip("/mnt/other", &["x"]);
+    std::fs::set_permissions(&admin, std::fs::Permissions::from_mode(0o1777)).unwrap();
+    assert_ok(&out);
+
+    assert!(!target.exists());
+    assert_eq!(
+        std::fs::read(sandbox.host("/home/u/.local/share/Trash/files/x")).unwrap(),
+        b"hello"
+    );
+    assert_eq!(std::fs::read(&user_trash).unwrap(), b"not a dir");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains(&format!("cannot create /mnt/other/.Trash/{uid}"))
+            && err.contains("its .Trash-UID is not a directory"),
+        "{err}"
+    );
+}
+
 #[test]
 fn invalid_user_trash_symlink_falls_back() {
     let uid = getuid().as_raw();
