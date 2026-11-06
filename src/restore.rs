@@ -14,7 +14,7 @@ use rustix::fs::{AtFlags, CWD, Mode, OFlags, ResolveFlags, mkdirat, openat2, unl
 use rustix::io::{Errno, fcntl_dupfd_cloexec};
 
 use crate::info::{self, Kind};
-use crate::sys::{self, Check, Lock, Remove};
+use crate::sys::{self, Check, Lock};
 use crate::trash::{self, Contents, Doomed, Entry, Item, Trash};
 use crate::{Cx, confirm, escape, human};
 
@@ -681,36 +681,19 @@ fn restore_item(
 
     // Copy back. The destination is complete and durable before the trash
     // copy goes (design §0 invariant 2).
-    let (bx, bfd) = sys::make_box(pfd.as_fd(), ".rip-restore")?;
-    let discard_box = |bx: &OsStr| {
-        sys::remove_tree(
-            pfd.as_fd(),
-            bx,
-            &Remove {
-                mnt: pid.mnt,
-                manifest: None,
-                trash: true,
-            },
-        );
-    };
+    let bx = sys::make_box(pfd.as_fd(), ".rip-restore", pid.mnt)?; // dropped before _lock
     // Recheck immediately before the copy (design §5.3).
-    if let Err(e) = recheck(t, it) {
-        discard_box(&bx);
-        return Err(e);
-    }
-    if let Err(e) = sys::cp_archive(t.files.as_fd(), &it.name, bfd.as_fd(), OsStr::new("item")) {
-        discard_box(&bx);
-        return Err(RestoreError::Other(format!("copying back failed: {e}")));
-    }
-    let n = match rename_free(&bfd, OsStr::new("item"), &pfd, name, rename) {
-        Ok(n) => n,
-        Err(e) => {
-            discard_box(&bx);
-            return Err(RestoreError::Other(e.to_string()));
-        }
-    };
+    recheck(t, it)?;
+    sys::cp_archive(
+        t.files.as_fd(),
+        &it.name,
+        bx.fd().as_fd(),
+        OsStr::new("item"),
+    )
+    .map_err(|e| RestoreError::Other(format!("copying back failed: {e}")))?;
+    let n = rename_free(bx.fd(), OsStr::new("item"), &pfd, name, rename)?;
     created.disarm();
-    let _ = unlinkat(&pfd, &bx, AtFlags::REMOVEDIR);
+    bx.finish();
     sys::syncfs(&pfd)?;
     // Recheck immediately before discard is `discard_verified`'s own job:
     // it tombstones by name, then verifies the tombstoned file really is

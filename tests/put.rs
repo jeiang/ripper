@@ -626,6 +626,35 @@ fn copy_refused_unwritable_subdir() {
     );
 }
 
+/// A copy that succeeds but cannot be published (the home trash's `info/`
+/// is not writable, so the reservation fails after the copy is complete)
+/// leaves the source untouched and no copied box behind in `.rip-staging`
+/// (docs/design.md §5.2).
+#[test]
+fn copy_rollback_when_the_reservation_fails() {
+    let sandbox = Sandbox::artemis();
+    let base = sandbox.host("/home/u");
+    std::fs::create_dir_all(base.join("d")).unwrap();
+    std::fs::write(base.join("d/f"), b"x").unwrap();
+    let trash = sandbox.host("/home/u/.local/share/Trash");
+    std::fs::create_dir_all(trash.join("files")).unwrap();
+    std::fs::create_dir_all(trash.join("info")).unwrap();
+    std::fs::set_permissions(trash.join("info"), std::fs::Permissions::from_mode(0o500)).unwrap();
+
+    let out = sandbox.rip("/home/u", &["d"]);
+    std::fs::set_permissions(trash.join("info"), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert_fail(&out);
+    assert!(base.join("d/f").is_file());
+    assert!(empty_dir(&trash.join("files")));
+    assert!(empty_dir(&trash.join("info")));
+    assert!(
+        trash.join(".rip-staging").is_dir(),
+        "the copy must have been staged before the reservation failed"
+    );
+    assert!(empty_dir(&trash.join(".rip-staging")), "no box left behind");
+}
+
 // ---------------------------------------------------------------------------
 // Collisions, non-UTF-8, symlinks (docs/design.md §4)
 // ---------------------------------------------------------------------------

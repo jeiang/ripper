@@ -10,7 +10,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use jiff::civil;
-use rustix::fs::{AtFlags, CWD, Mode, mkdirat, unlinkat};
+use rustix::fs::{CWD, Mode, mkdirat};
 use rustix::io::Errno;
 
 use crate::info::{self, Kind};
@@ -780,25 +780,12 @@ fn copy_to_home(
     let home = s.home();
     let _lock = sys::lock(&home.dir, Lock::Shared)?; // held for the whole copy: empty waits
     let staging = trash::staging(home)?;
-    let (bx, bfd) = sys::make_box(staging.as_fd(), "put")?;
-    let drop_box = |bx: &OsStr| {
-        sys::remove_tree(
-            staging.as_fd(),
-            bx,
-            &Remove {
-                mnt: home.id.mnt,
-                manifest: None,
-                trash: true,
-            },
-        );
-    };
+    let bx = sys::make_box(staging.as_fd(), "put", home.id.mnt)?; // dropped before _lock: removed under it
 
     // 1. Copy. The source is only read. No info exists yet, so a long copy
     // leaves nothing dangling.
-    if let Err(e) = sys::cp_archive(pfd.as_fd(), name, bfd.as_fd(), OsStr::new("item")) {
-        drop_box(&bx);
-        return Err(format!("copying into the home trash failed: {e}; left it untouched").into());
-    }
+    sys::cp_archive(pfd.as_fd(), name, bx.fd().as_fd(), OsStr::new("item"))
+        .map_err(|e| format!("copying into the home trash failed: {e}; left it untouched"))?;
 
     // 1b. Verify: walk what `cp` actually produced, so step 5 below deletes
     // a source entry only where the trash demonstrably holds a copy of it at
@@ -806,36 +793,21 @@ fn copy_to_home(
     // still match something the pre-copy walk saw somewhere in the tree
     // (docs/design.md §5.2: a concurrent rename during the copy must not
     // authorize deleting an entry `cp` never actually copied).
-    if let Err(e) = w.manifest.verify_copy(bfd.as_fd(), OsStr::new("item")) {
-        drop_box(&bx);
-        return Err(format!("could not verify the copy: {e}; left it untouched").into());
-    }
+    w.manifest
+        .verify_copy(bx.fd().as_fd(), OsStr::new("item"))
+        .map_err(|e| format!("could not verify the copy: {e}; left it untouched"))?;
 
     // 2. Reserve, 3. publish with NOREPLACE.
-    let mut r = match trash::reserve(
+    let mut r = trash::reserve(
         home,
         name,
         info::encode(path.as_os_str().as_bytes(), s.date),
-    ) {
-        Ok(r) => r,
-        Err(e) => {
-            drop_box(&bx);
-            return Err(e.into());
-        }
-    };
+    )?;
     loop {
-        match sys::rename_noreplace(&bfd, OsStr::new("item"), &home.files, r.name()) {
+        match sys::rename_noreplace(bx.fd(), OsStr::new("item"), &home.files, r.name()) {
             Ok(()) => break,
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                if let Err(e) = r.advance() {
-                    drop_box(&bx);
-                    return Err(e.into());
-                }
-            }
-            Err(e) => {
-                drop_box(&bx);
-                return Err(e.into());
-            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => r.advance()?,
+            Err(e) => return Err(e.into()),
         }
     }
     let n = r.commit();
@@ -849,7 +821,7 @@ fn copy_to_home(
         .ok()
         .map(|m| m.id)
         .zip(trash::reread_info(home, &n));
-    let _ = unlinkat(&staging, &bx, AtFlags::REMOVEDIR);
+    bx.finish();
 
     // 4. The copy, its info and the rename are on disk before any source
     // byte is removed.

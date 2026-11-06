@@ -908,16 +908,67 @@ pub fn cp_archive(
     }
 }
 
-/// `mkdirat(dir, "<prefix>.<pid>.<n>", 0700)`, `n+1` on `EEXIST`; returns the
-/// name and an `O_RDONLY|O_DIRECTORY` fd.
-pub fn make_box(dir: BorrowedFd, prefix: &str) -> io::Result<(OsString, OwnedFd)> {
+/// A fresh staging box from `make_box`. Dropping it without `finish()`
+/// removes the box and everything in it (`remove_tree`, trash policy, never
+/// leaving `mnt`), so every early return between `make_box` and a
+/// successful publish cleans up on its own -- the same shape as
+/// `trash::Reserved`. Declare it after the trash lock, so it drops (and the
+/// box goes) while that lock is still held (docs/design.md §0 invariant 9).
+pub struct StagingBox<'a> {
+    dir: BorrowedFd<'a>,
+    name: OsString,
+    fd: OwnedFd,
+    mnt: u64,
+    live: bool,
+}
+
+impl StagingBox<'_> {
+    /// The box's own `O_RDONLY|O_DIRECTORY` fd.
+    pub fn fd(&self) -> &OwnedFd {
+        &self.fd
+    }
+
+    /// `rmdir`s the box once its content has been published out of it, and
+    /// disarms the drop-time `remove_tree`.
+    pub fn finish(mut self) {
+        self.live = false;
+        let _ = unlinkat(self.dir, &self.name, AtFlags::REMOVEDIR);
+    }
+}
+
+impl Drop for StagingBox<'_> {
+    fn drop(&mut self) {
+        if self.live {
+            remove_tree(
+                self.dir,
+                &self.name,
+                &Remove {
+                    mnt: self.mnt,
+                    manifest: None,
+                    trash: true,
+                },
+            );
+        }
+    }
+}
+
+/// `mkdirat(dir, "<prefix>.<pid>.<n>", 0700)`, `n+1` on `EEXIST`, guarded by
+/// a `StagingBox`. `mnt` is `dir`'s mount id, which the drop-time removal
+/// never leaves.
+pub fn make_box<'a>(dir: BorrowedFd<'a>, prefix: &str, mnt: u64) -> io::Result<StagingBox<'a>> {
     let pid = std::process::id();
     for n in 0u64..1_000_000 {
         let name = OsString::from(format!("{prefix}.{pid}.{n}"));
         match mkdirat(dir, &name, Mode::from_raw_mode(0o700)) {
             Ok(()) => {
                 let fd = open_dir(dir, &name)?;
-                return Ok((name, fd));
+                return Ok(StagingBox {
+                    dir,
+                    name,
+                    fd,
+                    mnt,
+                    live: true,
+                });
             }
             Err(Errno::EXIST) => continue,
             Err(e) => return Err(e.into()),
@@ -1710,6 +1761,43 @@ mod tests {
             std::fs::read_link(dst_path.join("dangling")).unwrap(),
             Path::new("nowhere")
         );
+    }
+
+    // ---- make_box / StagingBox ----
+
+    #[test]
+    fn staging_box_drop_removes_its_content_and_finish_removes_it_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = root(&dir);
+        let mnt = ident(&r).unwrap().mnt;
+
+        // Dropped unfinished (an error exit): the box and a whole tree in
+        // it go, even a read-only directory (trash policy).
+        let bx = make_box(r.as_fd(), "put", mnt).unwrap();
+        mkdirat(bx.fd(), "item", Mode::from_raw_mode(0o700)).unwrap();
+        let item = open_dir(bx.fd(), "item").unwrap();
+        std::fs::write(
+            dir.path()
+                .join(format!("put.{}.0/item/f", std::process::id())),
+            b"x",
+        )
+        .unwrap();
+        rustix::fs::fchmod(&item, Mode::from_raw_mode(0o500)).unwrap();
+        drop(item);
+        drop(bx);
+        assert!(read_names(&r).unwrap().is_empty());
+
+        // Finished once its content was published out of it: rmdir'd.
+        let bx = make_box(r.as_fd(), "put", mnt).unwrap();
+        std::fs::write(
+            dir.path()
+                .join(format!("put.{}.0/item", std::process::id())),
+            b"x",
+        )
+        .unwrap();
+        renameat(bx.fd(), "item", &r, "published").unwrap();
+        bx.finish();
+        assert_eq!(read_names(&r).unwrap(), vec![OsString::from("published")]);
     }
 
     // ---- verify before route()/mount_conflict() rely on them ----

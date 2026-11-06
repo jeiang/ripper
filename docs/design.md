@@ -419,7 +419,7 @@ is mid-deletion through an open fd.
 | A read-only mount routed around through a writable alias | Refused up front (`own.ro`); `route()` skips a read-only candidate | `read_only_mount_is_refused_not_routed_around` |
 | An operand inside a trash discovery skipped (missing `info/`) reused | `topdir_trash`'s own inside-trash check, not only discovery's | `skipped_half_trash_is_still_refused_not_repaired_and_reused` |
 | `rip dir dir/f` moves `f` out of the trashed item | Each operand resolved just before it moves | `parent_then_child` |
-| Source deleted before the copy is complete and durable | Box, then reserve, publish, `syncfs`, then removal | `copy_rollback_unreadable_file`, `ephemeral_root_copies` |
+| Source deleted before the copy is complete and durable | Box, then reserve, publish, `syncfs`, then removal | `copy_rollback_unreadable_file`, `copy_rollback_when_the_reservation_fails`, `ephemeral_root_copies` |
 | A source entry changed during the copy is deleted | Manifest keyed by path, verified against the finished copy (`verify_copy`) | `remove_tree` manifest units; `Manifest`/`verify_copy` unit tests |
 | A hard-linked tree is reported as changed | mtime, not ctime | `copy_hardlinked_tree`; hard-link unit |
 | Copy complete but the source half-deleted | Full-tree preflight | `copy_refused_unwritable_subdir`, `copy_refused_sticky_foreign` |
@@ -433,7 +433,7 @@ is mid-deletion through an open fd.
 | A racing writer makes a `.trashinfo` read past its size cap | The read itself is capped, not just the `fstat` | `reread_info_never_exceeds_the_cap_even_if_the_file_grows_after_fstat` |
 | A deep tree fails midway | Explicit stack, `RLIMIT_NOFILE` raise (called from `dispatch`), tombstone retry | 5000-level unit; `dispatch_raises_the_soft_nofile_limit` |
 | Restore overwrites a file | lstat refusal plus NOREPLACE | `conflict_refused_and_rename` |
-| Restore deletes the trash copy before the target is complete | Box, publish, `syncfs`, tombstone | `copy_back_enospc_keeps_item` |
+| Restore deletes the trash copy before the target is complete | Box, publish, `syncfs`, tombstone | `copy_back_enospc_keeps_item`, `copy_back_publish_conflict_leaves_no_box` |
 | A hostile `Path=` writes outside its topdir | `RESOLVE_BENEATH` | `hostile_paths` |
 | A FIFO info hangs rip | `O_NONBLOCK` and `S_ISREG` | `malformed_and_fifo_infos` |
 | `--max-size` or `--older-than` deletes too much | Pure selection, whole-batch walk (never splits a `DeletionDate` batch by size) | `select_for_empty` table; `max_size` scenarios |
@@ -482,7 +482,7 @@ from a single process, or a scope well beyond "small and direct":
 src/main.rs     CLI types, argv pre-scan, config, prompts, display helpers, Cx, dispatch, exit codes
 src/mounts.rs   [pure] mountinfo parser, FsId, path translation, mount refusals, route candidates
 src/sys.rs      Dev/Ident/Meta, statx, open helpers, fd_path, rename_noreplace, lock, route, walk,
-                remove_tree, cp_archive, make_box, syncfs, raise_nofile
+                remove_tree, cp_archive, make_box and its StagingBox guard, syncfs, raise_nofile
 src/info.rs     [pure] .trashinfo encode/parse, Path= codec, dates, Kind, original(), collision names
 src/trash.rs    Trash, home trash, discovery, load, Reserved guard, staging, tombstones, delete_batch, discard_verified
 src/put.rs      rip FILE...: resolution, refusals, choose(), topdir trash, rename, copy fallback

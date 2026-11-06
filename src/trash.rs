@@ -1336,16 +1336,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let t = make_trash(dir.path());
         let staging_fd = staging(&t).unwrap();
-        let (box_name, box_fd) = sys::make_box(staging_fd.as_fd(), "put").unwrap();
+        let bx = sys::make_box(staging_fd.as_fd(), "put", t.id.mnt).unwrap();
+        // A crashed put leaves its box behind: the guard never runs.
+        std::mem::forget(bx);
+        let boxes = sys::read_names(&staging_fd).unwrap();
+        assert_eq!(boxes.len(), 1, "{boxes:?}");
         std::fs::write(
             dir.path()
                 .join(STAGING_NAME)
-                .join(&box_name)
+                .join(&boxes[0])
                 .join("leftover"),
             b"x",
         )
         .unwrap();
-        drop(box_fd);
 
         let ms = Mounts::parse(b"");
         let report = delete_batch(&t, &ms, &[], true);
