@@ -378,6 +378,46 @@ fn admin_trash_non_sticky_falls_back_with_warning() {
     );
 }
 
+/// docs/design.md §3.1: a valid sticky `.Trash` where creating `.Trash/UID`
+/// fails (here `.Trash` is not writable) falls back to `.Trash-UID` with a
+/// warning, still renaming on the file's own filesystem: it neither fails
+/// the operand nor copies it to the home trash.
+#[test]
+fn admin_trash_uid_mkdir_failure_falls_back_to_user_trash() {
+    let uid = getuid().as_raw();
+    let sandbox = Sandbox::artemis();
+    let admin = sandbox.host("/mnt/other").join(".Trash");
+    std::fs::create_dir(&admin).unwrap();
+    std::fs::set_permissions(&admin, std::fs::Permissions::from_mode(0o1555)).unwrap();
+    let target = sandbox.host("/mnt/other").join("x");
+    std::fs::write(&target, b"hello").unwrap();
+    let before = inode(&target);
+
+    let out = sandbox.rip("/mnt/other", &["x"]);
+    std::fs::set_permissions(&admin, std::fs::Permissions::from_mode(0o1777)).unwrap();
+    assert_ok(&out);
+
+    let trashed = sandbox
+        .host("/mnt/other")
+        .join(format!(".Trash-{uid}/files/x"));
+    assert!(trashed.is_file());
+    assert_eq!(inode(&trashed), before, "must be a rename, not a copy");
+    assert!(!admin.join(uid.to_string()).exists());
+    let info = read_info(
+        &sandbox
+            .host("/mnt/other")
+            .join(format!(".Trash-{uid}/info/x.trashinfo")),
+    );
+    assert!(info.contains("\nPath=x\n"), "{info}");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains(&format!(
+            "cannot create /mnt/other/.Trash/{uid}: Permission denied"
+        )) && err.contains(&format!("using /mnt/other/.Trash-{uid}")),
+        "{err}"
+    );
+}
+
 #[test]
 fn invalid_user_trash_symlink_falls_back() {
     let uid = getuid().as_raw();
