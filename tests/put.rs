@@ -9,8 +9,8 @@ mod common;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::path::Path;
+use std::process::Output;
 
 use common::{Body, Sandbox};
 use rustix::process::getuid;
@@ -1036,83 +1036,8 @@ fn argv_rules() {
 
 // ---------------------------------------------------------------------------
 // Read-only mounts (docs/design.md §1): a real read-only MOUNT (mountinfo's
-// `ro` option), not a permission-based restriction, which `Sandbox`'s own
-// `bind`/`without` API cannot express. This mirrors tests/restore.rs's own
-// `base_bwrap`, built locally rather than by editing tests/common/mod.rs.
+// `ro` option), not a permission-based restriction.
 // ---------------------------------------------------------------------------
-
-const DEFAULT_BINDS: &[&str] = &[
-    "/persist",
-    "/home",
-    "/home/u/Downloads",
-    "/home/u/Documents",
-    "/home/u/.local/share/Trash",
-    "/mnt/side",
-    "/mnt/pside",
-    "/mnt/other",
-    "/mnt/ro",
-];
-
-/// The same fixed bwrap flags and binds `Sandbox::command` uses, plus `rip`'s
-/// own binary bound at the usual inside path. Callers add any extra binds
-/// (e.g. a genuine `--ro-bind`) and finish the invocation themselves.
-fn base_bwrap(sandbox: &Sandbox) -> Command {
-    let mut c = Command::new("bwrap");
-    c.args([
-        "--unshare-user",
-        "--unshare-pid",
-        "--die-with-parent",
-        "--new-session",
-        "--proc",
-        "/proc",
-        "--dev",
-        "/dev",
-        "--tmpfs",
-        "/tmp",
-        "--ro-bind",
-        "/nix",
-        "/nix",
-        "--ro-bind",
-        "/etc",
-        "/etc",
-    ]);
-    for p in ["/usr", "/bin", "/lib", "/lib64"] {
-        c.args(["--ro-bind-try", p, p]);
-    }
-    c.arg("--ro-bind")
-        .arg(env!("CARGO_BIN_EXE_rip"))
-        .arg("/run/rip/bin/rip");
-    for inside in DEFAULT_BINDS {
-        c.arg("--bind").arg(sandbox.host(inside)).arg(inside);
-    }
-    c
-}
-
-/// Finishes a `base_bwrap` command (env, cwd, argv) and runs it with stdin
-/// `/dev/null`, never a terminal.
-fn run_bwrap(mut c: Command, cwd: &str, args: &[&str]) -> Output {
-    c.args([
-        "--clearenv",
-        "--setenv",
-        "HOME",
-        "/home/u",
-        "--setenv",
-        "XDG_CONFIG_HOME",
-        "/home/u/.config",
-    ]);
-    let mut path_entries = vec![PathBuf::from("/run/rip/bin")];
-    if let Some(host_path) = std::env::var_os("PATH") {
-        path_entries
-            .extend(std::env::split_paths(&host_path).filter(|p| p.starts_with("/nix/store")));
-    }
-    c.arg("--setenv")
-        .arg("PATH")
-        .arg(std::env::join_paths(path_entries).expect("PATH entries must not contain ':' or NUL"));
-    c.arg("--chdir").arg(cwd);
-    c.arg("--").arg("/run/rip/bin/rip").args(args);
-    c.stdin(Stdio::null());
-    c.output().expect("spawn bwrap")
-}
 
 #[test]
 fn read_only_mount_is_refused_not_routed_around() {
@@ -1120,14 +1045,13 @@ fn read_only_mount_is_refused_not_routed_around() {
     // genuinely read-only MOUNT (not just permission bits), must be refused
     // like `rm` would -- not bypassed by renaming through /persist, a
     // writable alias of the same subvolume (docs/design.md §1).
-    let sandbox = Sandbox::artemis();
+    let mut sandbox = Sandbox::artemis();
     let ro_host = sandbox.host("/persist").join("u/roview");
     std::fs::create_dir_all(&ro_host).unwrap();
     std::fs::write(ro_host.join("x"), b"protected").unwrap();
 
-    let mut c = base_bwrap(&sandbox);
-    c.arg("--ro-bind").arg(&ro_host).arg("/home/u/roview");
-    let out = run_bwrap(c, "/home/u/roview", &["-v", "x"]);
+    sandbox.bind_ro(&ro_host, "/home/u/roview");
+    let out = sandbox.rip("/home/u/roview", &["-v", "x"]);
 
     assert_fail(&out);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -1216,39 +1140,11 @@ fn walk_problem_message_escapes_a_hostile_entry_name() {
 // ---------------------------------------------------------------------------
 // A deleted cwd (docs/design.md §2.2): each `Sandbox::rip` call starts a
 // fresh process with a fresh, valid cwd, so reproducing this needs one bwrap
-// session that runs several `rip` invocations from a single shell, the
-// first of which trashes the directory that shell is sitting in.
+// session (`Sandbox::exec` of `bash -c`) that runs several `rip` invocations
+// from a single shell, the first of which trashes the directory that shell
+// is sitting in. The copy fallback genuinely unlinks it, so every later
+// command runs with a cwd `getcwd` can no longer resolve at all.
 // ---------------------------------------------------------------------------
-
-/// Like `run_bwrap`, but runs `bash -c script` instead of a single `rip`
-/// invocation: every command in `script` shares this one process's cwd, so
-/// once the script itself trashes that directory (through the copy
-/// fallback, which genuinely unlinks it rather than just renaming it
-/// elsewhere), every later command in the script runs with a cwd `getcwd`
-/// can no longer resolve at all.
-fn run_bwrap_shell(sandbox: &Sandbox, cwd: &str, script: &str) -> Output {
-    let mut c = base_bwrap(sandbox);
-    c.args([
-        "--clearenv",
-        "--setenv",
-        "HOME",
-        "/home/u",
-        "--setenv",
-        "XDG_CONFIG_HOME",
-        "/home/u/.config",
-    ]);
-    let mut path_entries = vec![PathBuf::from("/run/rip/bin")];
-    if let Some(host_path) = std::env::var_os("PATH") {
-        path_entries
-            .extend(std::env::split_paths(&host_path).filter(|p| p.starts_with("/nix/store")));
-    }
-    c.arg("--setenv")
-        .arg("PATH")
-        .arg(std::env::join_paths(path_entries).expect("PATH entries must not contain ':' or NUL"));
-    c.args(["--chdir", cwd, "--", "bash", "-c", script]);
-    c.stdin(Stdio::null());
-    c.output().expect("spawn bwrap for run_bwrap_shell")
-}
 
 #[test]
 fn commands_run_from_a_deleted_cwd_do_not_exit_2() {
@@ -1279,7 +1175,7 @@ fn commands_run_from_a_deleted_cwd_do_not_exit_2() {
 /run/rip/bin/rip undo -y; echo UNDO_EXIT=$?
 /run/rip/bin/rip restore -y /home/u/Documents/old; echo RESTORE_EXIT=$?
 ";
-    let out = run_bwrap_shell(&sandbox, "/mnt/side/D", script);
+    let out = sandbox.exec("/mnt/side/D", &["bash", "-c", script]);
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(
         out.status.success(),

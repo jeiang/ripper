@@ -44,13 +44,37 @@ const BTRFS_SUPER_MAGIC: u32 = 0x9123_683E;
 pub struct Sandbox {
     base: PathBuf,
     shm: PathBuf,
-    /// (host path, path inside the sandbox), applied to `bwrap` as `--bind`
-    /// in this order: a later bind at the same inside path covers an
-    /// earlier one, exactly as a real mount would.
-    binds: Vec<(PathBuf, String)>,
+    /// Applied to `bwrap` in this order: a later mount at the same inside
+    /// path covers an earlier one, and a nested mount must come after its
+    /// parent, exactly as with real mounts.
+    mounts: Vec<Mount>,
     fakebin: PathBuf,
+    /// Whether `PATH` offers any `fzf` (the fake one first); see `without_fzf`.
+    fzf: bool,
     fzf_pick: Option<String>,
     fzf_exit: Option<i32>,
+}
+
+/// One mount of the sandbox's layout, by its path inside the sandbox.
+enum Mount {
+    /// A host directory, `--bind` (or `--ro-bind` when `ro`, a genuinely
+    /// read-only mount: writes fail with `EROFS`, not `EACCES`).
+    Bind {
+        host: PathBuf,
+        inside: String,
+        ro: bool,
+    },
+    /// A fresh tmpfs of `size` bytes (`--size SIZE --tmpfs INSIDE`): it has
+    /// no host path and vanishes when the sandboxed process exits.
+    Tmpfs { inside: String, size: u64 },
+}
+
+impl Mount {
+    fn inside(&self) -> &str {
+        match self {
+            Mount::Bind { inside, .. } | Mount::Tmpfs { inside, .. } => inside,
+        }
+    }
 }
 
 /// What `plant` puts at `files/NAME` (docs/design.md §4: Item/Orphan/
@@ -105,58 +129,118 @@ impl Sandbox {
         let fakebin = base.join("fakebin");
         write_fake_fzf(&fakebin);
 
-        let binds = vec![
-            (p, "/persist".to_string()),
-            (root, "/home".to_string()),
-            (p_downloads, "/home/u/Downloads".to_string()),
-            (p_documents, "/home/u/Documents".to_string()),
-            (p_trash, "/home/u/.local/share/Trash".to_string()),
-            (side, "/mnt/side".to_string()),
-            (p_pside, "/mnt/pside".to_string()),
-            (shm_other, "/mnt/other".to_string()),
-            (shm_ro, "/mnt/ro".to_string()),
+        let bind = |host: PathBuf, inside: &str| Mount::Bind {
+            host,
+            inside: inside.to_string(),
+            ro: false,
+        };
+        let mounts = vec![
+            bind(p, "/persist"),
+            bind(root, "/home"),
+            bind(p_downloads, "/home/u/Downloads"),
+            bind(p_documents, "/home/u/Documents"),
+            bind(p_trash, "/home/u/.local/share/Trash"),
+            bind(side, "/mnt/side"),
+            bind(p_pside, "/mnt/pside"),
+            bind(shm_other, "/mnt/other"),
+            bind(shm_ro, "/mnt/ro"),
         ];
 
         Sandbox {
             base,
             shm,
-            binds,
+            mounts,
             fakebin,
+            fzf: true,
             fzf_pick: None,
             fzf_exit: None,
         }
     }
 
-    /// Appends a bind, after the layout's own binds: a bind at an inside
-    /// path the layout already uses covers it, the way a real mount would.
+    /// Appends a read-write bind, after the layout's own mounts: a bind at an
+    /// inside path the layout already uses covers it, the way a real mount
+    /// would.
     pub fn bind(&mut self, host: impl Into<PathBuf>, inside: &str) -> &mut Self {
-        self.binds.push((host.into(), inside.to_string()));
+        self.push_bind(host.into(), inside, false)
+    }
+
+    /// Like `bind`, but a genuinely read-only mount (`--ro-bind`).
+    pub fn bind_ro(&mut self, host: impl Into<PathBuf>, inside: &str) -> &mut Self {
+        self.push_bind(host.into(), inside, true)
+    }
+
+    fn push_bind(&mut self, host: PathBuf, inside: &str, ro: bool) -> &mut Self {
+        self.mounts.push(Mount::Bind {
+            host,
+            inside: inside.to_string(),
+            ro,
+        });
         self
     }
 
-    /// Removes the layout's bind at `inside` (e.g. `without("/persist")`),
+    /// Makes the existing bind at exactly `inside` (the visible one, if
+    /// several) a genuinely read-only mount, in place, so its position in
+    /// the mount order is unchanged. Panics if no bind is at `inside`.
+    pub fn read_only(&mut self, inside: &str) -> &mut Self {
+        let ro = self
+            .mounts
+            .iter_mut()
+            .rev()
+            .find_map(|m| match m {
+                Mount::Bind { inside: i, ro, .. } if i == inside => Some(ro),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("Sandbox::read_only: no bind at {inside:?}"));
+        *ro = true;
+        self
+    }
+
+    /// Appends a size-limited tmpfs at `inside` (writes past `size` bytes
+    /// fail with `ENOSPC`). It has no host path: `host()` panics for any
+    /// path on it, and it and its contents vanish when the sandboxed process
+    /// exits, so inspect it from inside the same `exec`.
+    pub fn tmpfs(&mut self, inside: &str, size: u64) -> &mut Self {
+        self.mounts.push(Mount::Tmpfs {
+            inside: inside.to_string(),
+            size,
+        });
+        self
+    }
+
+    /// Removes the layout's mount at `inside` (e.g. `without("/persist")`),
     /// so nothing is mounted there at all.
     pub fn without(&mut self, inside: &str) -> &mut Self {
-        self.binds.retain(|(_, i)| i != inside);
+        self.mounts.retain(|m| m.inside() != inside);
         self
     }
 
-    /// The host path backing `inside`, by the longest matching bind prefix
-    /// (ties go to the most recently added bind, which is what is actually
-    /// visible inside the sandbox). Panics if nothing covers `inside`.
+    /// Leaves `PATH` with no `fzf` at all: neither the fake one nor a real
+    /// one from the dev shell's own `/nix/store` entries.
+    pub fn without_fzf(&mut self) -> &mut Self {
+        self.fzf = false;
+        self
+    }
+
+    /// The host path backing `inside`, by the longest matching mount prefix
+    /// (ties go to the most recently added mount, which is what is actually
+    /// visible inside the sandbox). Panics if nothing covers `inside`, or if
+    /// it is on a tmpfs (which has no host path).
     pub fn host(&self, inside: &str) -> PathBuf {
-        let mut best: Option<(&str, &Path)> = None;
-        for (host, i) in &self.binds {
-            let covers = inside == i.as_str() || inside.starts_with(&format!("{i}/"));
-            if !covers {
-                continue;
-            }
-            if best.is_none_or(|(bi, _)| i.len() >= bi.len()) {
-                best = Some((i.as_str(), host.as_path()));
+        let mut best: Option<&Mount> = None;
+        for m in &self.mounts {
+            let i = m.inside();
+            let covers = inside == i || inside.starts_with(&format!("{i}/"));
+            if covers && best.is_none_or(|b| i.len() >= b.inside().len()) {
+                best = Some(m);
             }
         }
-        let (bind_inside, bind_host) =
-            best.unwrap_or_else(|| panic!("Sandbox::host: no bind covers {inside:?}"));
+        let (bind_inside, bind_host) = match best {
+            Some(Mount::Bind { host, inside, .. }) => (inside.as_str(), host.as_path()),
+            Some(Mount::Tmpfs { inside: t, .. }) => {
+                panic!("Sandbox::host: {inside:?} is on the tmpfs at {t:?}, which has no host path")
+            }
+            None => panic!("Sandbox::host: no bind covers {inside:?}"),
+        };
         let rel = inside[bind_inside.len()..].trim_start_matches('/');
         if rel.is_empty() {
             bind_host.to_path_buf()
@@ -331,11 +415,18 @@ impl Sandbox {
         c.arg("--ro-bind")
             .arg(&self.fakebin)
             .arg("/run/rip/fakebin");
-        c.arg("--ro-bind")
-            .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/completions/rip.fish"))
-            .arg("/run/rip/rip.fish");
-        for (host, inside) in &self.binds {
-            c.arg("--bind").arg(host).arg(inside);
+        for m in &self.mounts {
+            match m {
+                Mount::Bind { host, inside, ro } => {
+                    let flag = if *ro { "--ro-bind" } else { "--bind" };
+                    c.arg(flag).arg(host).arg(inside);
+                }
+                // `--size` applies to the very next `--tmpfs` only.
+                Mount::Tmpfs { inside, size } => {
+                    c.arg("--size").arg(size.to_string());
+                    c.arg("--tmpfs").arg(inside);
+                }
+            }
         }
         c.args([
             "--clearenv",
@@ -363,14 +454,21 @@ impl Sandbox {
 
     /// `/run/rip/fakebin:/run/rip/bin`, plus the `/nix/store` entries of the
     /// host's own `PATH` (so `rip` can find `cp`, and `fzf`'s fake can find
-    /// nothing it should not: only Nix-provided tools are forwarded).
+    /// nothing it should not: only Nix-provided tools are forwarded). After
+    /// `without_fzf`, the fake's directory and every forwarded entry that
+    /// holds an `fzf` are left out.
     fn path(&self) -> OsString {
-        let mut entries = vec![
-            PathBuf::from("/run/rip/fakebin"),
-            PathBuf::from("/run/rip/bin"),
-        ];
+        let mut entries = Vec::new();
+        if self.fzf {
+            entries.push(PathBuf::from("/run/rip/fakebin"));
+        }
+        entries.push(PathBuf::from("/run/rip/bin"));
         if let Some(host_path) = env::var_os("PATH") {
-            entries.extend(env::split_paths(&host_path).filter(|p| p.starts_with("/nix/store")));
+            entries.extend(
+                env::split_paths(&host_path).filter(|p| {
+                    p.starts_with("/nix/store") && (self.fzf || !p.join("fzf").exists())
+                }),
+            );
         }
         env::join_paths(entries).expect("PATH entries must not contain ':' or NUL")
     }

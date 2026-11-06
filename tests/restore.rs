@@ -72,19 +72,12 @@ fn trash_host_path(sandbox: &Sandbox, trash_inside: &str, name: &[u8]) -> PathBu
 }
 
 // ---------------------------------------------------------------------------
-// A size-limited tmpfs for a real ENOSPC (design §6:
-// "copy_back_enospc_keeps_item"), which `Sandbox`'s own `bind`/`without`
-// cannot express (they only add host-directory `--bind`s; bubblewrap's own
-// `--size BYTES --tmpfs DEST` has no equivalent there, and tests/restore.rs
-// may not edit tests/common/mod.rs). This reconstructs the handful of fixed
-// bwrap flags `Sandbox::command` also uses, plus the *default* artemis
-// binds by their well-known inside paths (read back through `Sandbox`'s own
-// public `host()`), so it only works against a freshly built, unmodified
+// Custom pty launchers. They reconstruct the fixed bwrap flags
+// `Sandbox::command` also uses, plus the *default* artemis binds by their
+// well-known inside paths (read back through `Sandbox`'s own public
+// `host()`), so they only work against a freshly built, unmodified
 // `Sandbox::artemis()` -- never after `.bind()`/`.without()` have changed
-// the layout. The `rip` invocation and a follow-up `ls` both run inside ONE
-// bwrap session (via a small bash script), so the size-limited tmpfs is
-// still mounted when the listing runs, even though it (and anything the
-// failed copy left inside it) vanishes the moment this process exits.
+// the layout.
 // ---------------------------------------------------------------------------
 
 const DEFAULT_BINDS: &[&str] = &[
@@ -153,26 +146,6 @@ fn base_bwrap(sandbox: &Sandbox) -> Command {
         .arg("PATH")
         .arg(std::env::join_paths(path_entries).expect("PATH entries must not contain ':' or NUL"));
     c
-}
-
-/// Runs, in one bwrap session: `rip` with `rip_args`, then `find
-/// /mnt/small` so the test can see what a failed copy left behind before
-/// the size-limited tmpfs disappears. `rip`'s own stdout/stderr are not
-/// separated from the trailing shell's (both go to this process's
-/// stdout/stderr, combined with the `find` output), so assertions look for
-/// substrings rather than exact equality.
-fn rip_small_tmpfs_session(sandbox: &Sandbox, tmpfs_size: u64, rip_args: &str) -> Output {
-    let mut c = base_bwrap(sandbox);
-    c.arg("--size")
-        .arg(tmpfs_size.to_string())
-        .arg("--tmpfs")
-        .arg("/mnt/small");
-    let script = format!(
-        "/run/rip/bin/rip {rip_args}; echo RIP_EXIT=$?; echo SMALL_LISTING:; find /mnt/small"
-    );
-    c.args(["--chdir", "/", "--", "bash", "-c", &script]);
-    c.stdin(Stdio::null());
-    c.output().expect("spawn bwrap for rip_small_tmpfs_session")
 }
 
 /// Single-quotes `s` for a POSIX shell command line (the only quoting
@@ -615,12 +588,23 @@ fn concurrent_restore_does_not_discard_a_name_reused_by_an_unrelated_item() {
 
 // ---------------------------------------------------------------------------
 // copy_back_enospc_keeps_item / created_parents_rolled_back: a real ENOSPC
-// partway through the copy, via the size-limited tmpfs helper above.
+// partway through the copy, into a size-limited tmpfs at /mnt/small. The
+// tmpfs (and anything the failed copy left inside it) vanishes when the
+// sandboxed process exits, so `rip` and a follow-up `find /mnt/small` run
+// in ONE bwrap session; `rip`'s own stdout is combined with the `find`
+// output, so assertions look for substrings.
 // ---------------------------------------------------------------------------
+
+/// `bash -c` script for one tmpfs session: `rip RIP_ARGS`, its exit status,
+/// then a listing of what is left in /mnt/small.
+fn small_tmpfs_script(rip_args: &str) -> String {
+    format!("/run/rip/bin/rip {rip_args}; echo RIP_EXIT=$?; echo SMALL_LISTING:; find /mnt/small")
+}
 
 #[test]
 fn copy_back_enospc_keeps_item() {
-    let sandbox = Sandbox::artemis();
+    let mut sandbox = Sandbox::artemis();
+    sandbox.tmpfs("/mnt/small", 4096);
     sandbox.plant(
         "/home/u/.local/share/Trash",
         b"big",
@@ -629,7 +613,14 @@ fn copy_back_enospc_keeps_item() {
         Body::File(vec![b'x'; 64 * 1024]),
     );
 
-    let out = rip_small_tmpfs_session(&sandbox, 4096, "restore -y /mnt/small/big");
+    let out = sandbox.exec(
+        "/",
+        &[
+            "bash",
+            "-c",
+            &small_tmpfs_script("restore -y /mnt/small/big"),
+        ],
+    );
     let out_text = stdout_str(&out);
     assert!(
         out_text.contains("RIP_EXIT=1"),
@@ -660,7 +651,8 @@ fn copy_back_enospc_keeps_item() {
 
 #[test]
 fn created_parents_rolled_back() {
-    let sandbox = Sandbox::artemis();
+    let mut sandbox = Sandbox::artemis();
+    sandbox.tmpfs("/mnt/small", 4096);
     sandbox.plant(
         "/home/u/.local/share/Trash",
         b"deep",
@@ -669,7 +661,14 @@ fn created_parents_rolled_back() {
         Body::File(vec![b'y'; 64 * 1024]),
     );
 
-    let out = rip_small_tmpfs_session(&sandbox, 4096, "restore -y /mnt/small/newdir/deep");
+    let out = sandbox.exec(
+        "/",
+        &[
+            "bash",
+            "-c",
+            &small_tmpfs_script("restore -y /mnt/small/newdir/deep"),
+        ],
+    );
     let out_text = stdout_str(&out);
     assert!(out_text.contains("RIP_EXIT=1"), "{out_text}");
     // `find /mnt/small` after the failed restore must show only the tmpfs

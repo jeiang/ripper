@@ -8,8 +8,7 @@ use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
-use std::process::{Command, Output, Stdio};
+use std::process::Output;
 use std::time::Duration;
 
 use common::{Body, Sandbox};
@@ -767,97 +766,13 @@ fn dangling_completed_by_concurrent_put_is_not_a_failure() {
 // A genuinely read-only bind
 // ---------------------------------------------------------------------------
 
-/// The inside paths `Sandbox::command` binds by default, in the order it
-/// binds them (mirrors tests/restore.rs's own `DEFAULT_BINDS`).
-const DEFAULT_BINDS: &[&str] = &[
-    "/persist",
-    "/home",
-    "/home/u/Downloads",
-    "/home/u/Documents",
-    "/home/u/.local/share/Trash",
-    "/mnt/side",
-    "/mnt/pside",
-    "/mnt/other",
-    "/mnt/ro",
-];
-
-/// Like `Sandbox::rip`, but mounts `ro_inside` (one of `DEFAULT_BINDS`) as a
-/// genuinely read-only bind (bubblewrap `--ro-bind`, so a write there gives
-/// `EROFS`) instead of read-write. `Sandbox`'s own `bind`/`without` cannot
-/// express this -- unlike the sandbox's own always-present `/mnt/ro`, whose
-/// read-only-ness is only a `0555` directory mode (`EACCES`, not `EROFS`) --
-/// and tests/empty.rs may not edit tests/common/mod.rs (pattern copied from
-/// tests/restore.rs's own `base_bwrap`).
-fn rip_with_one_bind_readonly(
-    sandbox: &Sandbox,
-    ro_inside: &str,
-    cwd: &str,
-    args: &[&str],
-) -> Output {
-    let mut c = Command::new("bwrap");
-    c.args([
-        "--unshare-user",
-        "--unshare-pid",
-        "--die-with-parent",
-        "--new-session",
-        "--proc",
-        "/proc",
-        "--dev",
-        "/dev",
-        "--tmpfs",
-        "/tmp",
-        "--ro-bind",
-        "/nix",
-        "/nix",
-        "--ro-bind",
-        "/etc",
-        "/etc",
-    ]);
-    for p in ["/usr", "/bin", "/lib", "/lib64"] {
-        c.args(["--ro-bind-try", p, p]);
-    }
-    c.arg("--ro-bind")
-        .arg(env!("CARGO_BIN_EXE_rip"))
-        .arg("/run/rip/bin/rip");
-    for inside in DEFAULT_BINDS {
-        let flag = if *inside == ro_inside {
-            "--ro-bind"
-        } else {
-            "--bind"
-        };
-        c.arg(flag).arg(sandbox.host(inside)).arg(inside);
-    }
-    c.args([
-        "--clearenv",
-        "--setenv",
-        "HOME",
-        "/home/u",
-        "--setenv",
-        "XDG_CONFIG_HOME",
-        "/home/u/.config",
-    ]);
-    let mut path_entries = vec![PathBuf::from("/run/rip/bin")];
-    if let Some(host_path) = std::env::var_os("PATH") {
-        path_entries
-            .extend(std::env::split_paths(&host_path).filter(|p| p.starts_with("/nix/store")));
-    }
-    c.arg("--setenv")
-        .arg("PATH")
-        .arg(std::env::join_paths(path_entries).expect("PATH entries must not contain ':' or NUL"));
-    c.args(["--chdir", cwd, "--", "/run/rip/bin/rip"]);
-    c.args(args);
-    c.stdin(Stdio::null());
-    c.output()
-        .expect("spawn bwrap for rip_with_one_bind_readonly")
-}
-
 /// A trash dir on a genuinely read-only mount, with nothing selected in it,
 /// must not fail `empty` merely because `.rip-staging` cannot be created
 /// there.
 #[test]
 fn readonly_topdir_trash_with_nothing_selected_does_not_fail() {
     let uid = getuid().as_raw();
-    let sandbox = Sandbox::artemis();
+    let mut sandbox = Sandbox::artemis();
     sandbox.plant(
         "/home/u/.local/share/Trash",
         b"old",
@@ -874,12 +789,10 @@ fn readonly_topdir_trash_with_nothing_selected_does_not_fail() {
         Body::File(b"data".to_vec()),
     );
 
-    let out = rip_with_one_bind_readonly(
-        &sandbox,
-        "/mnt/other",
-        "/",
-        &["empty", "--older-than", "30d", "-y"],
-    );
+    // A genuinely read-only mount (`EROFS`), unlike the layout's own
+    // `/mnt/ro`, whose read-only-ness is only a `0555` mode (`EACCES`).
+    sandbox.read_only("/mnt/other");
+    let out = sandbox.rip("/", &["empty", "--older-than", "30d", "-y"]);
     assert_ok(&out);
 
     let home_host = sandbox.host("/home/u/.local/share/Trash");

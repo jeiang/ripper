@@ -9,12 +9,12 @@ mod common;
 
 use common::{Body, Sandbox};
 
-/// Runs `fish --no-config -c "source /run/rip/rip.fish; complete -C 'CMDLINE'"`
+/// Runs `fish --no-config -c "source /run/rip/completions/rip.fish; complete -C 'CMDLINE'"`
 /// inside the sandbox and returns each candidate's completion word (the part
 /// before fish's `\t` description, when it has one).
 fn complete(sandbox: &Sandbox, cwd: &str, cmdline: &str) -> Vec<String> {
     let script = format!(
-        "source /run/rip/rip.fish; complete -C {}",
+        "source /run/rip/completions/rip.fish; complete -C {}",
         single_quote(cmdline)
     );
     let out = sandbox.exec(cwd, &["fish", "--no-config", "-c", script.as_str()]);
@@ -34,11 +34,11 @@ fn single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// A sandbox with `completions/` (this crate's, not a copy) bound at
-/// `/run/rip/completions`, for the bash and zsh harnesses below.
+/// A sandbox with `completions/` (this crate's, not a copy) bound read-only
+/// at `/run/rip/completions`, for the fish, bash and zsh harnesses below.
 fn sandbox_with_shell_completions() -> Sandbox {
     let mut sandbox = Sandbox::artemis();
-    sandbox.bind(
+    sandbox.bind_ro(
         concat!(env!("CARGO_MANIFEST_DIR"), "/completions"),
         "/run/rip/completions",
     );
@@ -301,7 +301,7 @@ const SUBCOMMANDS: [&str; 5] = ["undo", "list", "restore", "empty", "purge"];
 
 #[test]
 fn rip_gives_subcommands_and_files() {
-    let sandbox = Sandbox::artemis();
+    let sandbox = sandbox_with_shell_completions();
     let downloads_host = sandbox.host("/home/u/Downloads");
     std::fs::write(downloads_host.join("fixture.txt"), b"x").unwrap();
 
@@ -320,7 +320,7 @@ fn rip_gives_subcommands_and_files() {
 
 #[test]
 fn double_dash_gives_no_subcommands() {
-    let sandbox = Sandbox::artemis();
+    let sandbox = sandbox_with_shell_completions();
     let downloads_host = sandbox.host("/home/u/Downloads");
     std::fs::write(downloads_host.join("fixture.txt"), b"x").unwrap();
 
@@ -339,7 +339,7 @@ fn double_dash_gives_no_subcommands() {
 
 #[test]
 fn a_file_argument_gives_no_subcommands() {
-    let sandbox = Sandbox::artemis();
+    let sandbox = sandbox_with_shell_completions();
     let downloads_host = sandbox.host("/home/u/Downloads");
     std::fs::write(downloads_host.join("somefile"), b"x").unwrap();
 
@@ -354,7 +354,7 @@ fn a_file_argument_gives_no_subcommands() {
 
 #[test]
 fn restore_gives_planted_trashed_paths() {
-    let sandbox = Sandbox::artemis();
+    let sandbox = sandbox_with_shell_completions();
     sandbox.plant(
         "/home/u/.local/share/Trash",
         b"x",
@@ -377,7 +377,7 @@ fn restore_gives_planted_trashed_paths() {
 
 #[test]
 fn config_equals_form_still_gives_subcommands_at_the_first_word() {
-    let sandbox = Sandbox::artemis();
+    let sandbox = sandbox_with_shell_completions();
     std::fs::write(sandbox.host("/home/u/Downloads").join("c.toml"), b"").unwrap();
 
     let got = complete(&sandbox, "/home/u/Downloads", "rip --config=c.toml ");
@@ -391,7 +391,7 @@ fn config_equals_form_still_gives_subcommands_at_the_first_word() {
 
 #[test]
 fn config_equals_form_then_restore_gives_trashed_paths_not_cwd_files() {
-    let sandbox = Sandbox::artemis();
+    let sandbox = sandbox_with_shell_completions();
     std::fs::write(sandbox.host("/home/u/Downloads").join("c.toml"), b"").unwrap();
     sandbox.plant(
         "/home/u/.local/share/Trash",
@@ -418,7 +418,7 @@ fn config_equals_form_then_restore_gives_trashed_paths_not_cwd_files() {
 
 #[test]
 fn rm_style_flag_before_a_subcommand_gives_files_only() {
-    let sandbox = Sandbox::artemis();
+    let sandbox = sandbox_with_shell_completions();
     std::fs::write(sandbox.host("/home/u/Downloads").join("fixture.txt"), b"x").unwrap();
 
     let got = complete(&sandbox, "/home/u/Downloads", "rip -f ");
@@ -439,7 +439,7 @@ fn help_flag_does_not_lock_out_subcommands() {
     // -h is neither an rm-style flag nor a --config/--completions value
     // (src/main.rs's first_word() leaves the scan state unchanged for it),
     // so it must not be treated like `-f` and lock the state to "files".
-    let sandbox = Sandbox::artemis();
+    let sandbox = sandbox_with_shell_completions();
     let got = complete(&sandbox, "/home/u/Downloads", "rip -h ");
     assert!(
         got.iter().any(|w| w == "list"),
@@ -455,7 +455,7 @@ fn help_flag_does_not_lock_out_subcommands() {
 
 #[test]
 fn restore_skips_a_trashed_path_with_an_embedded_newline() {
-    let sandbox = Sandbox::artemis();
+    let sandbox = sandbox_with_shell_completions();
     // A trashed item whose original path holds a literal newline (e.g. from
     // an extracted archive) -- no planted/hostile topdir needed.
     sandbox.plant(
