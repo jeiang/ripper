@@ -410,20 +410,11 @@ fn pick<'a>(items: &[&'a Item], verb: &str, cwd: &Path) -> Result<Vec<&'a Item>,
 // ---------------------------------------------------------------------------
 
 /// `restore_item`'s failure. `Conflict` is specifically "the destination
-/// already exists"; `undo` (which never takes `--rename`) turns that one
-/// into a `rip restore --rename <trash path>` hint. Everything else is
-/// `Other`.
+/// already exists" (only without `--rename`); `restore_batch` turns it into
+/// a `rip restore --rename <trash path>` hint. Everything else is `Other`.
 enum RestoreError {
-    Conflict(String),
+    Conflict,
     Other(String),
-}
-
-impl std::fmt::Display for RestoreError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RestoreError::Conflict(m) | RestoreError::Other(m) => write!(f, "{m}"),
-        }
-    }
 }
 
 impl From<io::Error> for RestoreError {
@@ -605,9 +596,7 @@ fn restore_item(
     let created = ParentGuard(created_vec);
 
     if !rename && sys::stat_at(&pfd, name).is_ok() {
-        return Err(RestoreError::Conflict(
-            "exists; not replacing it (use --rename)".into(),
-        ));
+        return Err(RestoreError::Conflict);
     }
 
     let pid = sys::ident(&pfd)?;
@@ -738,6 +727,56 @@ fn blocking_ancestor<'a>(blocked: &'a [PathBuf], original: &Path) -> Option<&'a 
         .map(PathBuf::as_path)
 }
 
+/// Restores `items` parents first, printing each restored path and
+/// reporting each failure; returns whether every item came back. Once a
+/// batch item's own restore is declined, refused or fails, every later item
+/// under it is skipped and reported (design §5.3). A conflict names the
+/// item's trash path in a `--rename` hint.
+fn restore_batch(
+    cx: &Cx,
+    trashes: &[Trash],
+    mut items: Vec<&Item>,
+    rename: bool,
+    yes: bool,
+) -> bool {
+    sort_parents_first(&mut items);
+    let mut ok = true;
+    let mut blocked: Vec<PathBuf> = Vec::new();
+    for it in items {
+        if let Some(parent) = blocking_ancestor(&blocked, &it.original) {
+            eprintln!(
+                "rip: cannot restore '{}': its parent {} was not restored; it stays in the trash",
+                esc_path(&it.original),
+                esc_path(parent)
+            );
+            ok = false;
+            continue;
+        }
+        match restore_item(cx, trashes, it, rename, yes) {
+            Ok(Some(path)) => print_path(&cx.cwd, &path),
+            Ok(None) => blocked.push(it.original.clone()),
+            Err(e) => {
+                match e {
+                    RestoreError::Conflict => {
+                        let trash_path = trashes[it.trash].path.join("files").join(&it.name);
+                        eprintln!(
+                            "rip: cannot restore '{}': it exists; use `rip restore --rename {}`",
+                            esc_path(&it.original),
+                            esc_path(&trash_path)
+                        );
+                    }
+                    RestoreError::Other(msg) => {
+                        eprintln!("rip: cannot restore '{}': {msg}", esc_path(&it.original));
+                    }
+                }
+                ok = false;
+                blocked.push(it.original.clone());
+            }
+        }
+    }
+    ok
+}
+
 pub fn restore(
     cx: &Cx,
     paths: &[PathBuf],
@@ -757,31 +796,7 @@ pub fn restore(
             Entry::Orphan(_) => return Err("internal error: restore selected an orphan".into()),
         }
     }
-    sort_parents_first(&mut items);
-
-    let mut ok = true;
-    let mut blocked: Vec<PathBuf> = Vec::new();
-    for it in items {
-        if let Some(parent) = blocking_ancestor(&blocked, &it.original) {
-            eprintln!(
-                "rip: cannot restore '{}': its parent {} was not restored; it stays in the trash",
-                esc_path(&it.original),
-                esc_path(parent)
-            );
-            ok = false;
-            continue;
-        }
-        match restore_item(cx, &trashes, it, rename, yes) {
-            Ok(Some(path)) => print_path(&cx.cwd, &path),
-            Ok(None) => blocked.push(it.original.clone()),
-            Err(e) => {
-                eprintln!("rip: cannot restore '{}': {e}", esc_path(&it.original));
-                ok = false;
-                blocked.push(it.original.clone());
-            }
-        }
-    }
-    Ok(ok)
+    Ok(restore_batch(cx, &trashes, items, rename, yes))
 }
 
 // ---------------------------------------------------------------------------
@@ -794,11 +809,9 @@ fn newest_date(items: &[Item]) -> Option<civil::DateTime> {
     items.iter().map(|it| it.date).max()
 }
 
-/// Every item with exactly `date`, sorted parents first.
+/// Every item with exactly `date`.
 fn undo_batch(items: &[Item], date: civil::DateTime) -> Vec<&Item> {
-    let mut batch: Vec<&Item> = items.iter().filter(|it| it.date == date).collect();
-    sort_parents_first(&mut batch);
-    batch
+    items.iter().filter(|it| it.date == date).collect()
 }
 
 pub fn undo(cx: &Cx, yes: bool) -> Result<bool, String> {
@@ -809,40 +822,7 @@ pub fn undo(cx: &Cx, yes: bool) -> Result<bool, String> {
         return Err("nothing to undo".into());
     };
     let batch = undo_batch(&contents.items, newest);
-
-    let mut ok = true;
-    let mut blocked: Vec<PathBuf> = Vec::new();
-    for it in batch {
-        if let Some(parent) = blocking_ancestor(&blocked, &it.original) {
-            eprintln!(
-                "rip: cannot restore '{}': its parent {} was not restored; it stays in the trash",
-                esc_path(&it.original),
-                esc_path(parent)
-            );
-            ok = false;
-            continue;
-        }
-        match restore_item(cx, &trashes, it, false, yes) {
-            Ok(Some(path)) => print_path(&cx.cwd, &path),
-            Ok(None) => blocked.push(it.original.clone()),
-            Err(RestoreError::Conflict(_)) => {
-                let trash_path = trashes[it.trash].path.join("files").join(&it.name);
-                eprintln!(
-                    "rip: cannot restore '{}': it exists; use `rip restore --rename {}`",
-                    esc_path(&it.original),
-                    esc_path(&trash_path)
-                );
-                ok = false;
-                blocked.push(it.original.clone());
-            }
-            Err(RestoreError::Other(msg)) => {
-                eprintln!("rip: cannot restore '{}': {msg}", esc_path(&it.original));
-                ok = false;
-                blocked.push(it.original.clone());
-            }
-        }
-    }
-    Ok(ok)
+    Ok(restore_batch(cx, &trashes, batch, false, yes))
 }
 
 // ---------------------------------------------------------------------------
@@ -1012,14 +992,15 @@ mod tests {
     }
 
     #[test]
-    fn undo_batch_sorts_parents_first() {
+    fn sort_parents_first_puts_a_dir_before_its_contents() {
         // `rip dir/f dir` then `rip undo`: dir must come back before dir/f.
-        let items = vec![
+        let items = [
             item(0, "/home/u/dir/f", "2026-01-01T00:00:00", 1),
             item(0, "/home/u/dir", "2026-01-01T00:00:00", 2),
             item(0, "/home/u/dir/sub/g", "2026-01-01T00:00:00", 3),
         ];
-        let batch = undo_batch(&items, "2026-01-01T00:00:00".parse().unwrap());
+        let mut batch: Vec<&Item> = items.iter().collect();
+        sort_parents_first(&mut batch);
         let names: Vec<&str> = batch
             .iter()
             .map(|it| it.original.to_str().unwrap())

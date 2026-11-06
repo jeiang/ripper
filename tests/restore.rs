@@ -1435,6 +1435,49 @@ fn undo_skips_child_when_parent_restore_is_declined() {
     );
 }
 
+// docs/design.md §5.3: `restore` follows the same skip-child rule as `undo`.
+// The child is named first, so only the parents-first sort makes the
+// parent's refusal (its destination exists) block it; the refusal names the
+// parent's trash path in its `--rename` hint.
+#[test]
+fn restore_skips_child_when_parent_restore_conflicts() {
+    let sandbox = Sandbox::artemis();
+    std::fs::create_dir_all(sandbox.host("/home/u/Downloads/dir")).unwrap();
+    sandbox.plant(
+        "/home/u/.local/share/Trash",
+        b"dir",
+        b"/home/u/Downloads/dir",
+        "2026-01-01T00:00:00",
+        Body::Dir,
+    );
+    sandbox.plant(
+        "/home/u/.local/share/Trash",
+        b"dir_f",
+        b"/home/u/Downloads/dir/f",
+        "2026-01-01T00:00:00",
+        Body::File(b"inside".to_vec()),
+    );
+
+    let out = sandbox.rip(
+        "/",
+        &[
+            "restore",
+            "/home/u/Downloads/dir/f",
+            "/home/u/Downloads/dir",
+        ],
+    );
+    assert_fails(&out, "restore with a conflicting parent");
+    let err = stderr_str(&out);
+    assert!(
+        err.contains("it exists; use `rip restore --rename /home/u/.local/share/Trash/files/dir`"),
+        "{err}"
+    );
+    assert!(err.contains("was not restored"), "{err}");
+    assert!(!sandbox.host("/home/u/Downloads/dir/f").exists());
+    assert!(trash_host_path(&sandbox, "/home/u/.local/share/Trash", b"dir").exists());
+    assert!(trash_host_path(&sandbox, "/home/u/.local/share/Trash", b"dir_f").exists());
+}
+
 #[test]
 fn undo_empty() {
     let sandbox = Sandbox::artemis();

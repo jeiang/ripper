@@ -381,12 +381,15 @@ copy-fallback rollback calls the same `discard_verified`, tied to the
 identity it captured right after publishing its own entry, for the same
 reason.
 
-`restore`/`undo` sort a batch parents first; once a batch item's own
-restore is declined, refused or fails, every later item whose original
-path lies under it is skipped and reported ("its parent PATH was not
-restored; it stays in the trash") instead of being restored into a
-directory `restore` would otherwise have to fabricate in the real parent's
-place. This counts as a failure (exit 1) even for the declined-parent case.
+`restore`/`undo` run a batch through one runner (`restore_batch`). It sorts
+the batch parents first; once a batch item's own restore is declined,
+refused or fails, every later item whose original path lies under it is
+skipped and reported ("its parent PATH was not restored; it stays in the
+trash") instead of being restored into a directory `restore` would
+otherwise have to fabricate in the real parent's place. This counts as a
+failure (exit 1) even for the declined-parent case. An item whose
+destination already exists (without `--rename`) is refused with a hint
+naming its trash path: "it exists; use `rip restore --rename TRASH_PATH`".
 
 ### 5.4 Empty and purge (`delete_batch`)
 
@@ -428,7 +431,7 @@ is mid-deletion through an open fd.
 | A `files` symlink makes empty delete home | Discovery opens with `O_NOFOLLOW` | `skips_invalid_dirs` |
 | empty deletes an item restored concurrently, or a reused name | `LOCK_EX`, identity and byte recheck, tombstones | `delete_batch_skips_reused_name`, `waits_for_lock` |
 | A copy-back restore, or put's copy-fallback rollback, discards a name reused by an unrelated item in the meantime | `discard_verified`, tied to the entry's own identity, refuses and puts it back on mismatch | `concurrent_restore_does_not_discard_a_name_reused_by_an_unrelated_item`; `discard_verified_puts_back_an_entry_that_changed_identity` |
-| Undo/restore fabricates a parent directory for a child whose own parent restore was declined, refused or failed | Parents-first sort, then later children under a blocked parent are skipped | `undo_skips_child_when_parent_restore_is_declined` |
+| Undo/restore fabricates a parent directory for a child whose own parent restore was declined, refused or failed | Parents-first sort, then later children under a blocked parent are skipped | `undo_skips_child_when_parent_restore_is_declined`, `restore_skips_child_when_parent_restore_conflicts` |
 | empty deletes an in-flight put's info or box | `LOCK_SH` across the whole put; reserve after the copy | `waits_for_lock`, `crash_states` |
 | A racing writer makes a `.trashinfo` read past its size cap | The read itself is capped, not just the `fstat` | `reread_info_never_exceeds_the_cap_even_if_the_file_grows_after_fstat` |
 | A deep tree fails midway | Explicit stack, `RLIMIT_NOFILE` raise (called from `dispatch`), tombstone retry | 5000-level unit; `dispatch_raises_the_soft_nofile_limit` |

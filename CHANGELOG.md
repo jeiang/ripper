@@ -7,6 +7,11 @@ and `rip` uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- `restore` now refuses an existing destination with the same hint as `undo`,
+  naming the item's trash path (`use rip restore --rename TRASH_PATH`).
+
 ## [1.0.0] - 2026-09-22
 
 ### Added
