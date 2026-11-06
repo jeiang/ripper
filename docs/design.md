@@ -212,7 +212,7 @@ Output rules:
 - `-v` and restored paths go to stdout.
 - `BrokenPipe` on stdout in `list` counts as success.
 
-`src/main.rs` builds the shared `Cx` (config, mountinfo, uid, cwd, home) after
+`src/main.rs` builds the shared `Cx` (config, mountinfo, uid, cwd) after
 argv parsing and config loading succeed, then dispatches to `put`, `restore`
 or `empty`. A command function returning `Err(String)` at that point is always
 an operational failure (exit 1): every usage/config/environment problem is

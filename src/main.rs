@@ -68,7 +68,7 @@ fn dispatch(mut cli: Cli) -> u8 {
             return 2;
         }
     };
-    let cx = match Cx::new(cfg, home) {
+    let cx = match Cx::new(cfg) {
         Ok(cx) => cx,
         Err(e) => {
             eprintln!("rip: {e}");
@@ -492,11 +492,10 @@ pub struct Cx {
     pub mounts: mounts::Mounts,
     pub uid: u32,
     pub cwd: PathBuf,
-    pub home: PathBuf,
 }
 
 impl Cx {
-    fn new(cfg: Config, home: PathBuf) -> Result<Self, String> {
+    fn new(cfg: Config) -> Result<Self, String> {
         let uid = rustix::process::getuid().as_raw();
         let cwd = match std::env::current_dir() {
             Ok(cwd) => cwd,
@@ -516,7 +515,6 @@ impl Cx {
             mounts,
             uid,
             cwd,
-            home,
         })
     }
 }
