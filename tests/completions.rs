@@ -9,12 +9,12 @@ mod common;
 
 use common::{Body, Sandbox};
 
-/// Runs `fish --no-config -c "source /run/rip/rip.fish; complete -C 'CMDLINE'"`
+/// Runs `fish --no-config -c "source /run/rip/completions/rip.fish; complete -C 'CMDLINE'"`
 /// inside the sandbox and returns each candidate's completion word (the part
 /// before fish's `\t` description, when it has one).
-fn complete(sandbox: &Sandbox, cwd: &str, cmdline: &str) -> Vec<String> {
+fn complete_fish(sandbox: &Sandbox, cwd: &str, cmdline: &str) -> Vec<String> {
     let script = format!(
-        "source /run/rip/rip.fish; complete -C {}",
+        "source /run/rip/completions/rip.fish; complete -C {}",
         single_quote(cmdline)
     );
     let out = sandbox.exec(cwd, &["fish", "--no-config", "-c", script.as_str()]);
@@ -34,11 +34,11 @@ fn single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// A sandbox with `completions/` (this crate's, not a copy) bound at
-/// `/run/rip/completions`, for the bash and zsh harnesses below.
+/// A sandbox with `completions/` (this crate's, not a copy) bound read-only
+/// at `/run/rip/completions`, for the fish, bash and zsh harnesses below.
 fn sandbox_with_shell_completions() -> Sandbox {
     let mut sandbox = Sandbox::artemis();
-    sandbox.bind(
+    sandbox.bind_ro(
         concat!(env!("CARGO_MANIFEST_DIR"), "/completions"),
         "/run/rip/completions",
     );
@@ -299,182 +299,205 @@ fn zsh_words(got: &[(String, String)]) -> Vec<String> {
 
 const SUBCOMMANDS: [&str; 5] = ["undo", "list", "restore", "empty", "purge"];
 
-#[test]
-fn rip_gives_subcommands_and_files() {
-    let sandbox = Sandbox::artemis();
-    let downloads_host = sandbox.host("/home/u/Downloads");
-    std::fs::write(downloads_host.join("fixture.txt"), b"x").unwrap();
+/// The working directory every scenario completes in.
+const CWD: &str = "/home/u/Downloads";
 
-    let got = complete(&sandbox, "/home/u/Downloads", "rip ");
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Shell {
+    Fish,
+    Bash,
+    Zsh,
+}
+
+/// The candidate words `shell`'s real completion offers for `cmdline` in
+/// `CWD` (fish: the word before its `\t` description; zsh: every word given
+/// to `compadd`, without its display string).
+fn candidates(shell: Shell, sandbox: &Sandbox, cmdline: &str) -> Vec<String> {
+    match shell {
+        Shell::Fish => complete_fish(sandbox, CWD, cmdline),
+        Shell::Bash => complete_bash(sandbox, CWD, cmdline),
+        Shell::Zsh => zsh_words(&complete_zsh(sandbox, CWD, cmdline)),
+    }
+}
+
+fn write_cwd_file(sandbox: &Sandbox, name: &str) {
+    std::fs::write(sandbox.host(CWD).join(name), b"x").unwrap();
+}
+
+fn plant_trashed(sandbox: &Sandbox, name: &[u8], original: &[u8], date: &str) {
+    sandbox.plant(
+        "/home/u/.local/share/Trash",
+        name,
+        original,
+        date,
+        Body::File(b"data".to_vec()),
+    );
+}
+
+fn assert_all_subcommands(got: &[String], ctx: &str) {
     for sub in SUBCOMMANDS {
         assert!(
             got.iter().any(|w| w == sub),
-            "missing subcommand {sub}: {got:?}"
+            "missing subcommand {sub} {ctx}: {got:?}"
         );
     }
-    assert!(
-        got.iter().any(|w| w == "fixture.txt"),
-        "missing the fixture file: {got:?}"
-    );
 }
 
-#[test]
-fn double_dash_gives_no_subcommands() {
-    let sandbox = Sandbox::artemis();
-    let downloads_host = sandbox.host("/home/u/Downloads");
-    std::fs::write(downloads_host.join("fixture.txt"), b"x").unwrap();
-
-    let got = complete(&sandbox, "/home/u/Downloads", "rip -- ");
+fn assert_no_subcommands(got: &[String], ctx: &str) {
     for sub in SUBCOMMANDS {
         assert!(
             !got.iter().any(|w| w == sub),
-            "unexpected subcommand {sub} after --: {got:?}"
+            "unexpected subcommand {sub} {ctx}: {got:?}"
         );
     }
+}
+
+fn assert_has(got: &[String], word: &str, ctx: &str) {
     assert!(
-        got.iter().any(|w| w == "fixture.txt"),
-        "files must still complete after --: {got:?}"
+        got.iter().any(|w| w == word),
+        "missing {word:?} {ctx}: {got:?}"
     );
 }
 
-#[test]
-fn a_file_argument_gives_no_subcommands() {
-    let sandbox = Sandbox::artemis();
-    let downloads_host = sandbox.host("/home/u/Downloads");
-    std::fs::write(downloads_host.join("somefile"), b"x").unwrap();
+// ---------------------------------------------------------------------------
+// Rules every script must follow (docs/design.md §2.1): one scenario per
+// rule, run by a thin `#[test]` per shell (separate tests, so the slow zsh
+// pty runs stay parallel).
+// ---------------------------------------------------------------------------
 
-    let got = complete(&sandbox, "/home/u/Downloads", "rip somefile ");
-    for sub in SUBCOMMANDS {
-        assert!(
-            !got.iter().any(|w| w == sub),
-            "unexpected subcommand {sub} after a file argument: {got:?}"
-        );
-    }
+fn rip_gives_subcommands_and_files(shell: Shell) {
+    let sandbox = sandbox_with_shell_completions();
+    write_cwd_file(&sandbox, "fixture.txt");
+
+    let got = candidates(shell, &sandbox, "rip ");
+    assert_all_subcommands(&got, "at the first word");
+    assert_has(&got, "fixture.txt", "at the first word");
 }
 
-#[test]
-fn restore_gives_planted_trashed_paths() {
-    let sandbox = Sandbox::artemis();
-    sandbox.plant(
-        "/home/u/.local/share/Trash",
-        b"x",
-        b"/home/u/Downloads/x",
-        "2026-01-01T00:00:00",
-        Body::File(b"data".to_vec()),
-    );
+fn double_dash_gives_no_subcommands(shell: Shell) {
+    let sandbox = sandbox_with_shell_completions();
+    write_cwd_file(&sandbox, "fixture.txt");
 
-    let got = complete(&sandbox, "/home/u/Downloads", "rip restore ");
-    assert!(
-        got.iter().any(|w| w == "x"),
-        "expected the planted trashed path 'x': {got:?}"
-    );
+    let got = candidates(shell, &sandbox, "rip -- ");
+    assert_no_subcommands(&got, "after --");
+    assert_has(&got, "fixture.txt", "after -- (files must still complete)");
 }
 
-// ---- c29: fish 4's qmark-noglob made `-?*` a dead pattern, so ANY option
-// word (not just `--config=PATH`) fell to `case '*'`, and every one of them
-// -- including `--config=PATH` -- was treated as a non-option, ending the
-// scan and reporting "files". ----
+fn a_file_argument_gives_no_subcommands(shell: Shell) {
+    let sandbox = sandbox_with_shell_completions();
+    write_cwd_file(&sandbox, "somefile");
 
-#[test]
-fn config_equals_form_still_gives_subcommands_at_the_first_word() {
-    let sandbox = Sandbox::artemis();
-    std::fs::write(sandbox.host("/home/u/Downloads").join("c.toml"), b"").unwrap();
-
-    let got = complete(&sandbox, "/home/u/Downloads", "rip --config=c.toml ");
-    for sub in SUBCOMMANDS {
-        assert!(
-            got.iter().any(|w| w == sub),
-            "missing subcommand {sub} after --config=PATH: {got:?}"
-        );
-    }
+    let got = candidates(shell, &sandbox, "rip somefile ");
+    assert_no_subcommands(&got, "after a file argument");
 }
 
-#[test]
-fn config_equals_form_then_restore_gives_trashed_paths_not_cwd_files() {
-    let sandbox = Sandbox::artemis();
-    std::fs::write(sandbox.host("/home/u/Downloads").join("c.toml"), b"").unwrap();
-    sandbox.plant(
-        "/home/u/.local/share/Trash",
-        b"x",
-        b"/home/u/Downloads/x",
-        "2026-01-01T00:00:00",
-        Body::File(b"data".to_vec()),
-    );
-
-    let got = complete(
+fn restore_gives_planted_trashed_paths(shell: Shell) {
+    let sandbox = sandbox_with_shell_completions();
+    plant_trashed(
         &sandbox,
-        "/home/u/Downloads",
-        "rip --config=c.toml restore ",
+        b"x",
+        b"/home/u/Downloads/x",
+        "2026-01-01T00:00:00",
     );
-    assert!(
-        got.iter().any(|w| w == "x"),
-        "expected the planted trashed path 'x' after --config=PATH restore: {got:?}"
+
+    let got = candidates(shell, &sandbox, "rip restore ");
+    assert_has(&got, "x", "(the planted trashed path)");
+}
+
+// c29: fish 4's qmark-noglob made `-?*` a dead pattern, so ANY option word
+// (not just `--config=PATH`) fell to `case '*'`, and every one of them --
+// including `--config=PATH` -- was treated as a non-option, ending the scan
+// and reporting "files".
+fn config_equals_form_still_gives_subcommands_at_the_first_word(shell: Shell) {
+    let sandbox = sandbox_with_shell_completions();
+    write_cwd_file(&sandbox, "c.toml");
+
+    let got = candidates(shell, &sandbox, "rip --config=c.toml ");
+    assert_all_subcommands(&got, "after --config=PATH");
+}
+
+fn config_equals_form_then_restore_gives_trashed_paths_not_cwd_files(shell: Shell) {
+    let sandbox = sandbox_with_shell_completions();
+    write_cwd_file(&sandbox, "c.toml");
+    plant_trashed(
+        &sandbox,
+        b"x",
+        b"/home/u/Downloads/x",
+        "2026-01-01T00:00:00",
     );
+
+    let got = candidates(shell, &sandbox, "rip --config=c.toml restore ");
+    assert_has(&got, "x", "after --config=PATH restore");
     assert!(
         !got.iter().any(|w| w == "c.toml"),
         "must not fall back to cwd files after --config=PATH restore: {got:?}"
     );
 }
 
-#[test]
-fn rm_style_flag_before_a_subcommand_gives_files_only() {
-    let sandbox = Sandbox::artemis();
-    std::fs::write(sandbox.host("/home/u/Downloads").join("fixture.txt"), b"x").unwrap();
+// The value of `--config=` completes as a file. Real readline splits
+// COMP_WORDS at `=` (a COMP_WORDBREAKS character), so bash sees
+// `--config=c.toml` as three words; zsh keeps it as one word, so `_rip`
+// strips the flag itself; fish completes the whole word, flag included.
+fn config_equals_form_completes_files_for_the_value(shell: Shell) {
+    let sandbox = sandbox_with_shell_completions();
+    write_cwd_file(&sandbox, "c.toml");
 
-    let got = complete(&sandbox, "/home/u/Downloads", "rip -f ");
-    for sub in SUBCOMMANDS {
-        assert!(
-            !got.iter().any(|w| w == sub),
-            "unexpected subcommand {sub} after an rm-style flag: {got:?}"
-        );
+    let want = match shell {
+        Shell::Fish => "--config=c.toml",
+        Shell::Bash | Shell::Zsh => "c.toml",
+    };
+    for line in ["rip --config=", "rip --config=c"] {
+        let got = candidates(shell, &sandbox, line);
+        assert_has(&got, want, &format!("for {line}<TAB>"));
     }
-    assert!(
-        got.iter().any(|w| w == "fixture.txt"),
-        "files must still complete after an rm-style flag: {got:?}"
+}
+
+fn rm_style_flag_before_a_subcommand_gives_files_only(shell: Shell) {
+    let sandbox = sandbox_with_shell_completions();
+    write_cwd_file(&sandbox, "fixture.txt");
+
+    let got = candidates(shell, &sandbox, "rip -f ");
+    assert_no_subcommands(&got, "after an rm-style flag");
+    assert_has(
+        &got,
+        "fixture.txt",
+        "after an rm-style flag (files must still complete)",
     );
 }
 
-#[test]
-fn help_flag_does_not_lock_out_subcommands() {
-    // -h is neither an rm-style flag nor a --config/--completions value
-    // (src/main.rs's first_word() leaves the scan state unchanged for it),
-    // so it must not be treated like `-f` and lock the state to "files".
-    let sandbox = Sandbox::artemis();
-    let got = complete(&sandbox, "/home/u/Downloads", "rip -h ");
-    assert!(
-        got.iter().any(|w| w == "list"),
-        "-h must not change the completion state: {got:?}"
-    );
+// -h is neither an rm-style flag nor a --config/--completions value
+// (src/main.rs's first_word() leaves the scan state unchanged for it), so it
+// must not be treated like `-f` and lock the state to "files".
+fn help_flag_does_not_lock_out_subcommands(shell: Shell) {
+    let sandbox = sandbox_with_shell_completions();
+    let got = candidates(shell, &sandbox, "rip -h ");
+    assert_has(&got, "list", "after -h");
 }
 
-// ---- c28: piping `string split0`'s output further (into `string replace`,
-// then again through `complete`'s own `(__rip_trashed)` command
-// substitution) re-splits on any newline embedded in a trashed path, so a
-// hostile or merely oddly named file forged extra candidates out of
-// whatever text followed the newline. ----
-
-#[test]
-fn restore_skips_a_trashed_path_with_an_embedded_newline() {
-    let sandbox = Sandbox::artemis();
+// c28: piping `string split0`'s output further (into `string replace`, then
+// again through `complete`'s own `(__rip_trashed)` command substitution)
+// re-splits on any newline embedded in a trashed path, so a hostile or
+// merely oddly named file forged extra candidates out of whatever text
+// followed the newline.
+fn restore_skips_a_trashed_path_with_an_embedded_newline(shell: Shell) {
+    let sandbox = sandbox_with_shell_completions();
     // A trashed item whose original path holds a literal newline (e.g. from
     // an extracted archive) -- no planted/hostile topdir needed.
-    sandbox.plant(
-        "/home/u/.local/share/Trash",
+    plant_trashed(
+        &sandbox,
         b"evil",
         b"/home/u/Downloads/a\n/etc/attacker-controlled",
         "2026-01-01T00:00:00",
-        Body::File(b"x".to_vec()),
     );
     // An unaffected item must still complete normally.
-    sandbox.plant(
-        "/home/u/.local/share/Trash",
+    plant_trashed(
+        &sandbox,
         b"good",
         b"/home/u/Downloads/good",
         "2026-01-02T00:00:00",
-        Body::File(b"y".to_vec()),
     );
 
-    let got = complete(&sandbox, "/home/u/Downloads", "rip restore ");
+    let got = candidates(shell, &sandbox, "rip restore ");
     assert!(
         !got.iter().any(|w| w == "/etc/attacker-controlled"),
         "a newline in a trashed path must not forge a completion candidate: {got:?}"
@@ -483,239 +506,211 @@ fn restore_skips_a_trashed_path_with_an_embedded_newline() {
         !got.iter().any(|w| w == "a"),
         "the newline-bearing record must be skipped whole, not split: {got:?}"
     );
-    assert!(
-        got.iter().any(|w| w == "good"),
-        "an item unaffected by the newline must still complete: {got:?}"
+    assert_has(&got, "good", "(an item unaffected by the newline)");
+}
+
+// c30: bash's `COMPREPLY+=($(compgen ...))` word-split its output, so a file
+// or a trashed path with a space was offered as two separate candidates
+// instead of one; `_rip_add` (completions/rip.bash) reads compgen's matches
+// one per line with `mapfile` instead. Every shell must offer each as one
+// whole candidate.
+fn candidates_with_a_space_are_not_split(shell: Shell) {
+    let sandbox = sandbox_with_shell_completions();
+    write_cwd_file(&sandbox, "has space");
+    plant_trashed(
+        &sandbox,
+        b"x",
+        b"/home/u/Downloads/has space too",
+        "2026-01-01T00:00:00",
+    );
+
+    // zsh's own `_files` pre-escapes a match's special characters itself
+    // (its compadd call passes `-Q`, "don't re-quote, I already did"), so
+    // there the captured file candidate is "has\ space"; either way it must
+    // be the file's whole name in one candidate, not two.
+    let file = match shell {
+        Shell::Zsh => "has\\ space",
+        Shell::Fish | Shell::Bash => "has space",
+    };
+    let files = candidates(shell, &sandbox, "rip ");
+    assert_has(&files, file, "(the file with a space, as one candidate)");
+
+    let trashed = candidates(shell, &sandbox, "rip restore ");
+    assert_has(
+        &trashed,
+        "has space too",
+        "(the trashed path with a space, as one candidate)",
     );
 }
 
-// ---------------------------------------------------------------------------
-// bash: a counterpart of every fish test above, driving completions/rip.bash
-// directly (docs/design.md §2.1).
-// ---------------------------------------------------------------------------
+#[test]
+fn fish_rip_gives_subcommands_and_files() {
+    rip_gives_subcommands_and_files(Shell::Fish);
+}
 
 #[test]
 fn bash_rip_gives_subcommands_and_files() {
-    let sandbox = sandbox_with_shell_completions();
-    let downloads_host = sandbox.host("/home/u/Downloads");
-    std::fs::write(downloads_host.join("fixture.txt"), b"x").unwrap();
+    rip_gives_subcommands_and_files(Shell::Bash);
+}
 
-    let got = complete_bash(&sandbox, "/home/u/Downloads", "rip ");
-    for sub in SUBCOMMANDS {
-        assert!(
-            got.iter().any(|w| w == sub),
-            "missing subcommand {sub}: {got:?}"
-        );
-    }
-    assert!(
-        got.iter().any(|w| w == "fixture.txt"),
-        "missing the fixture file: {got:?}"
-    );
+#[test]
+fn zsh_rip_gives_subcommands_and_files() {
+    rip_gives_subcommands_and_files(Shell::Zsh);
+}
+
+#[test]
+fn fish_double_dash_gives_no_subcommands() {
+    double_dash_gives_no_subcommands(Shell::Fish);
 }
 
 #[test]
 fn bash_double_dash_gives_no_subcommands() {
-    let sandbox = sandbox_with_shell_completions();
-    let downloads_host = sandbox.host("/home/u/Downloads");
-    std::fs::write(downloads_host.join("fixture.txt"), b"x").unwrap();
+    double_dash_gives_no_subcommands(Shell::Bash);
+}
 
-    let got = complete_bash(&sandbox, "/home/u/Downloads", "rip -- ");
-    for sub in SUBCOMMANDS {
-        assert!(
-            !got.iter().any(|w| w == sub),
-            "unexpected subcommand {sub} after --: {got:?}"
-        );
-    }
-    assert!(
-        got.iter().any(|w| w == "fixture.txt"),
-        "files must still complete after --: {got:?}"
-    );
+#[test]
+fn zsh_double_dash_gives_no_subcommands() {
+    double_dash_gives_no_subcommands(Shell::Zsh);
+}
+
+#[test]
+fn fish_a_file_argument_gives_no_subcommands() {
+    a_file_argument_gives_no_subcommands(Shell::Fish);
 }
 
 #[test]
 fn bash_a_file_argument_gives_no_subcommands() {
-    let sandbox = sandbox_with_shell_completions();
-    let downloads_host = sandbox.host("/home/u/Downloads");
-    std::fs::write(downloads_host.join("somefile"), b"x").unwrap();
+    a_file_argument_gives_no_subcommands(Shell::Bash);
+}
 
-    let got = complete_bash(&sandbox, "/home/u/Downloads", "rip somefile ");
-    for sub in SUBCOMMANDS {
-        assert!(
-            !got.iter().any(|w| w == sub),
-            "unexpected subcommand {sub} after a file argument: {got:?}"
-        );
-    }
+#[test]
+fn zsh_a_file_argument_gives_no_subcommands() {
+    a_file_argument_gives_no_subcommands(Shell::Zsh);
+}
+
+#[test]
+fn fish_restore_gives_planted_trashed_paths() {
+    restore_gives_planted_trashed_paths(Shell::Fish);
 }
 
 #[test]
 fn bash_restore_gives_planted_trashed_paths() {
-    let sandbox = sandbox_with_shell_completions();
-    sandbox.plant(
-        "/home/u/.local/share/Trash",
-        b"x",
-        b"/home/u/Downloads/x",
-        "2026-01-01T00:00:00",
-        Body::File(b"data".to_vec()),
-    );
+    restore_gives_planted_trashed_paths(Shell::Bash);
+}
 
-    let got = complete_bash(&sandbox, "/home/u/Downloads", "rip restore ");
-    assert!(
-        got.iter().any(|w| w == "x"),
-        "expected the planted trashed path 'x': {got:?}"
-    );
+#[test]
+fn zsh_restore_gives_planted_trashed_paths() {
+    restore_gives_planted_trashed_paths(Shell::Zsh);
+}
+
+#[test]
+fn fish_config_equals_form_still_gives_subcommands_at_the_first_word() {
+    config_equals_form_still_gives_subcommands_at_the_first_word(Shell::Fish);
 }
 
 #[test]
 fn bash_config_equals_form_still_gives_subcommands_at_the_first_word() {
-    let sandbox = sandbox_with_shell_completions();
-    std::fs::write(sandbox.host("/home/u/Downloads").join("c.toml"), b"").unwrap();
+    config_equals_form_still_gives_subcommands_at_the_first_word(Shell::Bash);
+}
 
-    let got = complete_bash(&sandbox, "/home/u/Downloads", "rip --config=c.toml ");
-    for sub in SUBCOMMANDS {
-        assert!(
-            got.iter().any(|w| w == sub),
-            "missing subcommand {sub} after --config=PATH: {got:?}"
-        );
-    }
+#[test]
+fn zsh_config_equals_form_still_gives_subcommands_at_the_first_word() {
+    config_equals_form_still_gives_subcommands_at_the_first_word(Shell::Zsh);
+}
+
+#[test]
+fn fish_config_equals_form_then_restore_gives_trashed_paths_not_cwd_files() {
+    config_equals_form_then_restore_gives_trashed_paths_not_cwd_files(Shell::Fish);
 }
 
 #[test]
 fn bash_config_equals_form_then_restore_gives_trashed_paths_not_cwd_files() {
-    let sandbox = sandbox_with_shell_completions();
-    std::fs::write(sandbox.host("/home/u/Downloads").join("c.toml"), b"").unwrap();
-    sandbox.plant(
-        "/home/u/.local/share/Trash",
-        b"x",
-        b"/home/u/Downloads/x",
-        "2026-01-01T00:00:00",
-        Body::File(b"data".to_vec()),
-    );
+    config_equals_form_then_restore_gives_trashed_paths_not_cwd_files(Shell::Bash);
+}
 
-    let got = complete_bash(
-        &sandbox,
-        "/home/u/Downloads",
-        "rip --config=c.toml restore ",
-    );
-    assert!(
-        got.iter().any(|w| w == "x"),
-        "expected the planted trashed path 'x' after --config=PATH restore: {got:?}"
-    );
-    assert!(
-        !got.iter().any(|w| w == "c.toml"),
-        "must not fall back to cwd files after --config=PATH restore: {got:?}"
-    );
+#[test]
+fn zsh_config_equals_form_then_restore_gives_trashed_paths_not_cwd_files() {
+    config_equals_form_then_restore_gives_trashed_paths_not_cwd_files(Shell::Zsh);
+}
+
+#[test]
+fn fish_config_equals_form_completes_files_for_the_value() {
+    config_equals_form_completes_files_for_the_value(Shell::Fish);
+}
+
+#[test]
+fn bash_config_equals_form_completes_files_for_the_value() {
+    config_equals_form_completes_files_for_the_value(Shell::Bash);
+}
+
+#[test]
+fn zsh_config_equals_form_completes_files_for_the_value() {
+    config_equals_form_completes_files_for_the_value(Shell::Zsh);
+}
+
+#[test]
+fn fish_rm_style_flag_before_a_subcommand_gives_files_only() {
+    rm_style_flag_before_a_subcommand_gives_files_only(Shell::Fish);
 }
 
 #[test]
 fn bash_rm_style_flag_before_a_subcommand_gives_files_only() {
-    let sandbox = sandbox_with_shell_completions();
-    std::fs::write(sandbox.host("/home/u/Downloads").join("fixture.txt"), b"x").unwrap();
+    rm_style_flag_before_a_subcommand_gives_files_only(Shell::Bash);
+}
 
-    let got = complete_bash(&sandbox, "/home/u/Downloads", "rip -f ");
-    for sub in SUBCOMMANDS {
-        assert!(
-            !got.iter().any(|w| w == sub),
-            "unexpected subcommand {sub} after an rm-style flag: {got:?}"
-        );
-    }
-    assert!(
-        got.iter().any(|w| w == "fixture.txt"),
-        "files must still complete after an rm-style flag: {got:?}"
-    );
+#[test]
+fn zsh_rm_style_flag_before_a_subcommand_gives_files_only() {
+    rm_style_flag_before_a_subcommand_gives_files_only(Shell::Zsh);
+}
+
+#[test]
+fn fish_help_flag_does_not_lock_out_subcommands() {
+    help_flag_does_not_lock_out_subcommands(Shell::Fish);
 }
 
 #[test]
 fn bash_help_flag_does_not_lock_out_subcommands() {
-    let sandbox = sandbox_with_shell_completions();
-    let got = complete_bash(&sandbox, "/home/u/Downloads", "rip -h ");
-    assert!(
-        got.iter().any(|w| w == "list"),
-        "-h must not change the completion state: {got:?}"
-    );
+    help_flag_does_not_lock_out_subcommands(Shell::Bash);
+}
+
+#[test]
+fn zsh_help_flag_does_not_lock_out_subcommands() {
+    help_flag_does_not_lock_out_subcommands(Shell::Zsh);
+}
+
+#[test]
+fn fish_restore_skips_a_trashed_path_with_an_embedded_newline() {
+    restore_skips_a_trashed_path_with_an_embedded_newline(Shell::Fish);
 }
 
 #[test]
 fn bash_restore_skips_a_trashed_path_with_an_embedded_newline() {
-    let sandbox = sandbox_with_shell_completions();
-    sandbox.plant(
-        "/home/u/.local/share/Trash",
-        b"evil",
-        b"/home/u/Downloads/a\n/etc/attacker-controlled",
-        "2026-01-01T00:00:00",
-        Body::File(b"x".to_vec()),
-    );
-    sandbox.plant(
-        "/home/u/.local/share/Trash",
-        b"good",
-        b"/home/u/Downloads/good",
-        "2026-01-02T00:00:00",
-        Body::File(b"y".to_vec()),
-    );
-
-    let got = complete_bash(&sandbox, "/home/u/Downloads", "rip restore ");
-    assert!(
-        !got.iter().any(|w| w == "/etc/attacker-controlled"),
-        "a newline in a trashed path must not forge a completion candidate: {got:?}"
-    );
-    assert!(
-        !got.iter().any(|w| w == "a"),
-        "the newline-bearing record must be skipped whole, not split: {got:?}"
-    );
-    assert!(
-        got.iter().any(|w| w == "good"),
-        "an item unaffected by the newline must still complete: {got:?}"
-    );
+    restore_skips_a_trashed_path_with_an_embedded_newline(Shell::Bash);
 }
 
-// c30: `COMPREPLY+=($(compgen ...))` word-splits its output, so a file or a
-// trashed path with a space was offered as two separate candidates instead
-// of one. `_rip_add` (completions/rip.bash) reads compgen's matches one per
-// line with `mapfile` instead.
+#[test]
+fn zsh_restore_skips_a_trashed_path_with_an_embedded_newline() {
+    restore_skips_a_trashed_path_with_an_embedded_newline(Shell::Zsh);
+}
+
+#[test]
+fn fish_candidates_with_a_space_are_not_split() {
+    candidates_with_a_space_are_not_split(Shell::Fish);
+}
+
 #[test]
 fn bash_candidates_with_a_space_are_not_split() {
-    let sandbox = sandbox_with_shell_completions();
-    std::fs::write(sandbox.host("/home/u/Downloads").join("has space"), b"x").unwrap();
-    sandbox.plant(
-        "/home/u/.local/share/Trash",
-        b"x",
-        b"/home/u/Downloads/has space too",
-        "2026-01-01T00:00:00",
-        Body::File(b"data".to_vec()),
-    );
-
-    let files = complete_bash(&sandbox, "/home/u/Downloads", "rip ");
-    assert!(
-        files.iter().any(|w| w == "has space"),
-        "the file with a space must complete as one candidate, not split: {files:?}"
-    );
-
-    let trashed = complete_bash(&sandbox, "/home/u/Downloads", "rip restore ");
-    assert!(
-        trashed.iter().any(|w| w == "has space too"),
-        "the trashed path with a space must complete as one candidate, not split: {trashed:?}"
-    );
+    candidates_with_a_space_are_not_split(Shell::Bash);
 }
 
-// Real readline splits COMP_WORDS at `=` (a COMP_WORDBREAKS character), so
-// `--config=c.toml` arrives as three words, not one; `completions/rip.bash`
-// must still recognize the value and complete it as a file.
 #[test]
-fn bash_config_equals_form_completes_files_for_the_value() {
-    let sandbox = sandbox_with_shell_completions();
-    std::fs::write(sandbox.host("/home/u/Downloads").join("c.toml"), b"").unwrap();
-
-    let got = complete_bash(&sandbox, "/home/u/Downloads", "rip --config=");
-    assert!(
-        got.iter().any(|w| w == "c.toml"),
-        "rip --config=<TAB> must complete files: {got:?}"
-    );
-
-    let got = complete_bash(&sandbox, "/home/u/Downloads", "rip --config=c");
-    assert!(
-        got.iter().any(|w| w == "c.toml"),
-        "rip --config=c<TAB> must complete files: {got:?}"
-    );
+fn zsh_candidates_with_a_space_are_not_split() {
+    candidates_with_a_space_are_not_split(Shell::Zsh);
 }
+
+// ---------------------------------------------------------------------------
+// bash only: readline's COMP_WORDBREAKS splitting and backslash escapes.
+// ---------------------------------------------------------------------------
 
 // `:` is also a COMP_WORDBREAKS character, so a colon-bearing trashed path
 // (e.g. a screenshot's default name, "...at 10:00:00.png") splits mid-word
@@ -777,69 +772,11 @@ fn bash_completes_an_escaped_partial_prefix_with_a_space_for_a_file() {
 }
 
 // ---------------------------------------------------------------------------
-// zsh: a counterpart of every fish test above, driving the real _rip under
-// compinit from a real interactive session (docs/design.md §2.1).
+// zsh only: the restore menu's display strings.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn zsh_rip_gives_subcommands_and_files() {
-    let sandbox = sandbox_with_shell_completions();
-    let downloads_host = sandbox.host("/home/u/Downloads");
-    std::fs::write(downloads_host.join("fixture.txt"), b"x").unwrap();
-
-    let got = zsh_words(&complete_zsh(&sandbox, "/home/u/Downloads", "rip "));
-    for sub in SUBCOMMANDS {
-        assert!(
-            got.iter().any(|w| w == sub),
-            "missing subcommand {sub}: {got:?}"
-        );
-    }
-    assert!(
-        got.iter().any(|w| w == "fixture.txt"),
-        "missing the fixture file: {got:?}"
-    );
-}
-
-#[test]
-fn zsh_double_dash_gives_no_subcommands() {
-    let sandbox = sandbox_with_shell_completions();
-    let downloads_host = sandbox.host("/home/u/Downloads");
-    std::fs::write(downloads_host.join("fixture.txt"), b"x").unwrap();
-
-    let got = zsh_words(&complete_zsh(&sandbox, "/home/u/Downloads", "rip -- "));
-    for sub in SUBCOMMANDS {
-        assert!(
-            !got.iter().any(|w| w == sub),
-            "unexpected subcommand {sub} after --: {got:?}"
-        );
-    }
-    assert!(
-        got.iter().any(|w| w == "fixture.txt"),
-        "files must still complete after --: {got:?}"
-    );
-}
-
-#[test]
-fn zsh_a_file_argument_gives_no_subcommands() {
-    let sandbox = sandbox_with_shell_completions();
-    let downloads_host = sandbox.host("/home/u/Downloads");
-    std::fs::write(downloads_host.join("somefile"), b"x").unwrap();
-
-    let got = zsh_words(&complete_zsh(
-        &sandbox,
-        "/home/u/Downloads",
-        "rip somefile ",
-    ));
-    for sub in SUBCOMMANDS {
-        assert!(
-            !got.iter().any(|w| w == sub),
-            "unexpected subcommand {sub} after a file argument: {got:?}"
-        );
-    }
-}
-
-#[test]
-fn zsh_restore_gives_planted_trashed_paths() {
+fn zsh_restore_menu_shows_each_path_and_its_date() {
     let sandbox = sandbox_with_shell_completions();
     sandbox.plant(
         "/home/u/.local/share/Trash",
@@ -866,159 +803,5 @@ fn zsh_restore_gives_planted_trashed_paths() {
     assert!(
         display.contains("2026-01-01 00:00:00"),
         "the restore menu's display for 'x' must also show its deletion date: {got:?}"
-    );
-}
-
-#[test]
-fn zsh_config_equals_form_still_gives_subcommands_at_the_first_word() {
-    let sandbox = sandbox_with_shell_completions();
-    std::fs::write(sandbox.host("/home/u/Downloads").join("c.toml"), b"").unwrap();
-
-    let got = zsh_words(&complete_zsh(
-        &sandbox,
-        "/home/u/Downloads",
-        "rip --config=c.toml ",
-    ));
-    for sub in SUBCOMMANDS {
-        assert!(
-            got.iter().any(|w| w == sub),
-            "missing subcommand {sub} after --config=PATH: {got:?}"
-        );
-    }
-}
-
-// zsh keeps `--config=PATH` as one word, so `_rip` must strip the flag
-// itself before completing the value as a file.
-#[test]
-fn zsh_config_equals_form_completes_files_for_the_value() {
-    let sandbox = sandbox_with_shell_completions();
-    std::fs::write(sandbox.host("/home/u/Downloads").join("c.toml"), b"").unwrap();
-
-    for line in ["rip --config=", "rip --config=c"] {
-        let got = zsh_words(&complete_zsh(&sandbox, "/home/u/Downloads", line));
-        assert!(
-            got.iter().any(|w| w == "c.toml"),
-            "{line}<TAB> must complete files: {got:?}"
-        );
-    }
-}
-
-#[test]
-fn zsh_config_equals_form_then_restore_gives_trashed_paths_not_cwd_files() {
-    let sandbox = sandbox_with_shell_completions();
-    std::fs::write(sandbox.host("/home/u/Downloads").join("c.toml"), b"").unwrap();
-    sandbox.plant(
-        "/home/u/.local/share/Trash",
-        b"x",
-        b"/home/u/Downloads/x",
-        "2026-01-01T00:00:00",
-        Body::File(b"data".to_vec()),
-    );
-
-    let got = zsh_words(&complete_zsh(
-        &sandbox,
-        "/home/u/Downloads",
-        "rip --config=c.toml restore ",
-    ));
-    assert!(
-        got.iter().any(|w| w == "x"),
-        "expected the planted trashed path 'x' after --config=PATH restore: {got:?}"
-    );
-    assert!(
-        !got.iter().any(|w| w == "c.toml"),
-        "must not fall back to cwd files after --config=PATH restore: {got:?}"
-    );
-}
-
-#[test]
-fn zsh_rm_style_flag_before_a_subcommand_gives_files_only() {
-    let sandbox = sandbox_with_shell_completions();
-    std::fs::write(sandbox.host("/home/u/Downloads").join("fixture.txt"), b"x").unwrap();
-
-    let got = zsh_words(&complete_zsh(&sandbox, "/home/u/Downloads", "rip -f "));
-    for sub in SUBCOMMANDS {
-        assert!(
-            !got.iter().any(|w| w == sub),
-            "unexpected subcommand {sub} after an rm-style flag: {got:?}"
-        );
-    }
-    assert!(
-        got.iter().any(|w| w == "fixture.txt"),
-        "files must still complete after an rm-style flag: {got:?}"
-    );
-}
-
-#[test]
-fn zsh_help_flag_does_not_lock_out_subcommands() {
-    let sandbox = sandbox_with_shell_completions();
-    let got = zsh_words(&complete_zsh(&sandbox, "/home/u/Downloads", "rip -h "));
-    assert!(
-        got.iter().any(|w| w == "list"),
-        "-h must not change the completion state: {got:?}"
-    );
-}
-
-#[test]
-fn zsh_restore_skips_a_trashed_path_with_an_embedded_newline() {
-    let sandbox = sandbox_with_shell_completions();
-    sandbox.plant(
-        "/home/u/.local/share/Trash",
-        b"evil",
-        b"/home/u/Downloads/a\n/etc/attacker-controlled",
-        "2026-01-01T00:00:00",
-        Body::File(b"x".to_vec()),
-    );
-    sandbox.plant(
-        "/home/u/.local/share/Trash",
-        b"good",
-        b"/home/u/Downloads/good",
-        "2026-01-02T00:00:00",
-        Body::File(b"y".to_vec()),
-    );
-
-    let got = zsh_words(&complete_zsh(&sandbox, "/home/u/Downloads", "rip restore "));
-    assert!(
-        !got.iter().any(|w| w == "/etc/attacker-controlled"),
-        "a newline in a trashed path must not forge a completion candidate: {got:?}"
-    );
-    assert!(
-        !got.iter().any(|w| w == "a"),
-        "the newline-bearing record must be skipped whole, not split: {got:?}"
-    );
-    assert!(
-        got.iter().any(|w| w == "good"),
-        "an item unaffected by the newline must still complete: {got:?}"
-    );
-}
-
-// c30 (zsh side): zsh's own compadd quotes on insertion, but only for the
-// candidates it is actually given; this proves a space-bearing file and a
-// space-bearing trashed path both arrive as one whole candidate each.
-#[test]
-fn zsh_candidates_with_a_space_are_not_split() {
-    let sandbox = sandbox_with_shell_completions();
-    std::fs::write(sandbox.host("/home/u/Downloads").join("has space"), b"x").unwrap();
-    sandbox.plant(
-        "/home/u/.local/share/Trash",
-        b"x",
-        b"/home/u/Downloads/has space too",
-        "2026-01-01T00:00:00",
-        Body::File(b"data".to_vec()),
-    );
-
-    // zsh's own `_files` pre-escapes a match's special characters itself
-    // (its compadd call passes `-Q`, "don't re-quote, I already did"), so
-    // the captured candidate is "has\ space", not "has space"; either way
-    // it must be the file's whole name in one candidate, not two.
-    let files = zsh_words(&complete_zsh(&sandbox, "/home/u/Downloads", "rip "));
-    assert!(
-        files.iter().any(|w| w.replace('\\', "") == "has space"),
-        "the file with a space must complete as one candidate, not split: {files:?}"
-    );
-
-    let trashed = zsh_words(&complete_zsh(&sandbox, "/home/u/Downloads", "rip restore "));
-    assert!(
-        trashed.iter().any(|w| w == "has space too"),
-        "the trashed path with a space must complete as one candidate, not split: {trashed:?}"
     );
 }
