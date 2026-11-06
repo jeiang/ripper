@@ -9,7 +9,7 @@ mod restore;
 mod sys;
 mod trash;
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::os::unix::ffi::OsStrExt;
@@ -323,9 +323,9 @@ fn parse_age(s: &str) -> Result<jiff::Span, String> {
 /// C1 (U+0080..=U+009F, encoded as two valid UTF-8 bytes): a terminal in
 /// UTF-8 mode can act on a C1 control the same as its ESC-prefixed C0
 /// equivalent, so a hostile name cannot smuggle one through as "valid text".
-pub fn escape(b: &[u8]) -> String {
+pub fn escape(s: impl AsRef<OsStr>) -> String {
     let mut out = String::new();
-    for chunk in b.utf8_chunks() {
+    for chunk in s.as_ref().as_bytes().utf8_chunks() {
         for c in chunk.valid().chars() {
             match c {
                 '\\' => out.push_str("\\\\"),
@@ -483,7 +483,7 @@ impl Cx {
                 eprintln!(
                     "rip: cannot determine the current directory ({e}); \
                      using {} instead; a relative operand or PATH may fail",
-                    escape(fallback.as_os_str().as_bytes())
+                    escape(&fallback)
                 );
                 fallback
             }
@@ -516,8 +516,6 @@ fn cwd_fallback(pwd_env: Option<PathBuf>) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsStr;
-
     use super::*;
 
     fn argv(words: &[&str]) -> Vec<OsString> {
@@ -820,11 +818,11 @@ mod tests {
 
     #[test]
     fn escape_bytes() {
-        assert_eq!(escape(b"plain"), "plain");
-        assert_eq!(escape(b"a\\b"), "a\\\\b");
-        assert_eq!(escape(b"a\nb\tc"), "a\\nb\\tc");
-        assert_eq!(escape(&[0x41, 0x01, 0x42]), "A\\x01B");
-        assert_eq!(escape(&[0xff, 0x41]), "\\xffA");
+        assert_eq!(escape("plain"), "plain");
+        assert_eq!(escape("a\\b"), "a\\\\b");
+        assert_eq!(escape("a\nb\tc"), "a\\nb\\tc");
+        assert_eq!(escape(OsStr::from_bytes(&[0x41, 0x01, 0x42])), "A\\x01B");
+        assert_eq!(escape(OsStr::from_bytes(&[0xff, 0x41])), "\\xffA");
     }
 
     // Regression: escape() previously let C1 controls (U+0080..=U+009F,
@@ -834,11 +832,11 @@ mod tests {
     // (docs/design.md §0 invariant 10).
     #[test]
     fn escape_c1_controls() {
-        assert_eq!(escape("a\u{9b}b".as_bytes()), "a\\x9bb");
-        assert_eq!(escape("\u{80}\u{9f}".as_bytes()), "\\x80\\x9f");
+        assert_eq!(escape("a\u{9b}b"), "a\\x9bb");
+        assert_eq!(escape("\u{80}\u{9f}"), "\\x80\\x9f");
         // A full hostile round trip: CSI 31m RED OSC 0;T ST.
         assert_eq!(
-            escape("a\u{9b}31mRED\u{9d}0;T\u{9c}".as_bytes()),
+            escape("a\u{9b}31mRED\u{9d}0;T\u{9c}"),
             "a\\x9b31mRED\\x9d0;T\\x9c"
         );
     }

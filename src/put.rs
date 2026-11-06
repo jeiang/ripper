@@ -484,26 +484,22 @@ impl Done {
     /// `-v` output (design §2.2: goes to stdout). `dest` embeds the item's
     /// trashed name, which carries the operand's own (possibly hostile)
     /// bytes verbatim aside from a collision suffix, so it goes through
-    /// `show` the same as `arg` (docs/design.md §0 invariant 10: human output
+    /// `escape` the same as `arg` (docs/design.md §0 invariant 10: human output
     /// never writes an untrusted name raw to the terminal).
     fn print(&self, arg: &Path) {
         match self {
-            Done::Moved(dest) => println!("trashed '{}' -> {}", show(arg), show(dest)),
+            Done::Moved(dest) => println!("trashed '{}' -> {}", escape(arg), escape(dest)),
             Done::Copied(dest, size) => {
                 println!(
                     "copied '{}' ({}) -> {}",
-                    show(arg),
+                    escape(arg),
                     human(*size),
-                    show(dest)
+                    escape(dest)
                 )
             }
             Done::Declined => {}
         }
     }
-}
-
-fn show(p: &Path) -> String {
-    escape(p.as_os_str().as_bytes())
 }
 
 // ---------------------------------------------------------------------------
@@ -535,7 +531,7 @@ pub fn run(cx: &Cx, cli: &Cli) -> Result<bool, String> {
             }
             Err(e) if cli.force && e.not_found => {}
             Err(e) => {
-                eprintln!("rip: cannot trash '{}': {e}", show(arg));
+                eprintln!("rip: cannot trash '{}': {e}", escape(arg));
                 ok = false;
             }
         }
@@ -567,7 +563,11 @@ fn split_arg(arg: &Path) -> Result<(PathBuf, OsString, bool), PutErr> {
         None => (&b"."[..], trimmed),
     };
     if matches!(last, b"." | b"..") {
-        return Err(format!("'{}': refusing to trash '.' or '..'", escape(trimmed)).into());
+        return Err(format!(
+            "'{}': refusing to trash '.' or '..'",
+            escape(OsStr::from_bytes(trimmed))
+        )
+        .into());
     }
     let parent = if parent.is_empty() { &b"/"[..] } else { parent };
     Ok((
@@ -622,7 +622,7 @@ fn put_one(cx: &Cx, cli: &Cli, s: &mut Session, arg: &Path) -> Result<Done, PutE
         return Err(format!("it contains the trash directory {}", t.display()).into());
     }
 
-    if cli.interactive && !cli.force && !confirm(&format!("trash '{}'?", show(arg)), "-f")? {
+    if cli.interactive && !cli.force && !confirm(&format!("trash '{}'?", escape(arg)), "-f")? {
         return Ok(Done::Declined);
     }
 
@@ -690,7 +690,7 @@ fn move_in(
 fn removal_summary(rm: &Removal) -> String {
     rm.kept
         .iter()
-        .map(|(p, why)| format!("{}: {why}", show(p)))
+        .map(|(p, why)| format!("{}: {why}", escape(p)))
         .collect::<Vec<_>>()
         .join("; ")
 }
@@ -723,7 +723,7 @@ fn copy_to_home(
         && !confirm(
             &format!(
                 "'{}' ({}) has no usable trash on its filesystem ({why}). Copy it into {} and delete the original?",
-                show(path),
+                escape(path),
                 human(w.size),
                 s.home().path.display()
             ),
@@ -734,7 +734,7 @@ fn copy_to_home(
     }
     eprintln!(
         "rip: '{}' has no usable trash on its filesystem ({why}); copying {} into the home trash",
-        show(path),
+        escape(path),
         human(w.size)
     );
 
@@ -815,7 +815,7 @@ fn copy_to_home(
     if !rm.kept.is_empty() {
         return Err(format!(
             "the trash holds a complete copy ({}); these source entries were kept: {}",
-            show(&home.path.join("files").join(&n)),
+            escape(home.path.join("files").join(&n)),
             removal_summary(&rm)
         )
         .into());
