@@ -131,3 +131,107 @@ fn no_real_trash_visible() {
             .is_file()
     );
 }
+
+/// `read_only` turns a layout bind into a genuinely read-only mount: a write
+/// there fails with `EROFS` (not the `EACCES` of a `0555` directory), while
+/// the host directory behind it is still what `host()` reports.
+#[test]
+fn read_only_mount_gives_erofs() {
+    let mut sandbox = Sandbox::artemis();
+    sandbox.read_only("/mnt/other");
+    std::fs::write(sandbox.host("/mnt/other").join("seen"), b"x").unwrap();
+
+    let out = sandbox.exec(
+        "/mnt/other",
+        &["bash", "-c", "cat seen && echo y > written"],
+    );
+    assert!(!out.status.success(), "the write must fail: {out:?}");
+    assert_eq!(out.stdout, b"x", "the bind must still show the host dir");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("Read-only file system"),
+        "expected EROFS: {out:?}"
+    );
+    assert!(!sandbox.host("/mnt/other").join("written").exists());
+}
+
+/// `tmpfs` mounts a size-limited tmpfs: writing past its size fails with
+/// `ENOSPC`.
+#[test]
+fn tmpfs_size_gives_enospc() {
+    let mut sandbox = Sandbox::artemis();
+    sandbox.tmpfs("/mnt/small", 4096);
+
+    let out = sandbox.exec(
+        "/",
+        &["bash", "-c", "head -c 65536 /dev/zero > /mnt/small/f"],
+    );
+    assert!(!out.status.success(), "the write must fail: {out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("No space left on device"),
+        "expected ENOSPC: {out:?}"
+    );
+}
+
+/// A tmpfs has no host path, so `host()` refuses rather than guessing one
+/// from a parent bind.
+#[test]
+#[should_panic(expected = "which has no host path")]
+fn host_panics_on_a_tmpfs() {
+    let mut sandbox = Sandbox::artemis();
+    sandbox.tmpfs("/mnt/other/small", 4096);
+    sandbox.host("/mnt/other/small/f");
+}
+
+/// `without_fzf` leaves no `fzf` on `PATH` at all, neither the fake one nor
+/// the dev shell's real one; the default sandbox finds the fake.
+#[test]
+fn without_fzf_leaves_no_fzf_on_path() {
+    let mut sandbox = Sandbox::artemis();
+    let probe = ["bash", "-c", "command -v fzf"];
+
+    let out = sandbox.exec("/", &probe);
+    assert!(out.status.success(), "the fake fzf must be found: {out:?}");
+    assert_eq!(out.stdout, b"/run/rip/fakebin/fzf\n");
+
+    sandbox.without_fzf();
+    let out = sandbox.exec("/", &probe);
+    assert!(
+        !out.status.success(),
+        "no fzf may be on PATH: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+/// `spawn_tty` hands `script` the whole bwrap command line as one shell
+/// string; an argument with a single quote, a space and a non-UTF-8 byte
+/// must still reach `rip` byte for byte (here: name the file it trashes).
+#[test]
+fn spawn_tty_round_trips_a_non_utf8_argument() {
+    use std::io::Read;
+    use std::os::unix::ffi::OsStrExt;
+
+    let sandbox = Sandbox::artemis();
+    let name = std::ffi::OsStr::from_bytes(b"q'uo te\xff");
+    let src = sandbox.host("/home/u/Downloads").join(name);
+    std::fs::write(&src, b"x").unwrap();
+
+    let mut child = sandbox.spawn_tty("/home/u/Downloads", &[name]);
+    drop(child.stdin.take());
+    let mut tty = Vec::new();
+    child.stdout.take().unwrap().read_to_end(&mut tty).unwrap();
+    let status = child.wait().unwrap();
+    assert!(
+        status.success(),
+        "rip failed: {}",
+        String::from_utf8_lossy(&tty)
+    );
+    assert!(!src.exists(), "the file must have been trashed");
+    assert!(
+        sandbox
+            .host("/home/u/.local/share/Trash/files")
+            .join(name)
+            .exists(),
+        "the trashed name must be byte-identical: {}",
+        String::from_utf8_lossy(&tty)
+    );
+}
