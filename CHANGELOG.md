@@ -7,6 +7,8 @@ and `rip` uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-11-06
+
 ### Changed
 
 - `restore` now refuses an existing destination with the same hint as `undo`,
