@@ -548,6 +548,43 @@ fn created_parents_rolled_back_when_no_terminal_prompt() {
     );
 }
 
+// A copy-back whose publish fails after the copy is complete (the
+// destination appeared while the size prompt waited, so the NOREPLACE rename
+// out of the box hits EEXIST) must leave no `.rip-restore.*` box next to the
+// destination, and must not touch either the new file or the trashed item
+// (design §5.3).
+#[test]
+fn copy_back_publish_conflict_leaves_no_box() {
+    let sandbox = Sandbox::artemis();
+    sandbox.config("copy_threshold = \"1\"\n");
+    sandbox.plant(
+        "/home/u/.local/share/Trash",
+        b"X",
+        b"/home/u/X",
+        "2026-01-01T00:00:00",
+        Body::File(b"TRASHED".to_vec()),
+    );
+
+    let hold = rip_tty_hold(&sandbox, "/", &["restore", "/home/u/X"], "[y/N]");
+    std::fs::write(sandbox.host("/home/u/X"), b"NEW").unwrap();
+    let out = hold.finish("y\n");
+    assert!(
+        !out.status.success(),
+        "a publish conflict must fail: {}",
+        stdout_str(&out)
+    );
+
+    assert_eq!(std::fs::read(sandbox.host("/home/u/X")).unwrap(), b"NEW");
+    let trash_x = trash_host_path(&sandbox, "/home/u/.local/share/Trash", b"X");
+    assert_eq!(std::fs::read(&trash_x).unwrap(), b"TRASHED");
+    let leftovers: Vec<_> = std::fs::read_dir(sandbox.host("/home/u"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().starts_with(".rip-restore"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+}
+
 // ---------------------------------------------------------------------------
 // creates_parents (the success path: missing parents are created).
 // ---------------------------------------------------------------------------
@@ -1227,6 +1264,49 @@ fn undo_skips_child_when_parent_restore_is_declined() {
             .len(),
         100
     );
+}
+
+// docs/design.md §5.3: `restore` follows the same skip-child rule as `undo`.
+// The child is named first, so only the parents-first sort makes the
+// parent's refusal (its destination exists) block it; the refusal names the
+// parent's trash path in its `--rename` hint.
+#[test]
+fn restore_skips_child_when_parent_restore_conflicts() {
+    let sandbox = Sandbox::artemis();
+    std::fs::create_dir_all(sandbox.host("/home/u/Downloads/dir")).unwrap();
+    sandbox.plant(
+        "/home/u/.local/share/Trash",
+        b"dir",
+        b"/home/u/Downloads/dir",
+        "2026-01-01T00:00:00",
+        Body::Dir,
+    );
+    sandbox.plant(
+        "/home/u/.local/share/Trash",
+        b"dir_f",
+        b"/home/u/Downloads/dir/f",
+        "2026-01-01T00:00:00",
+        Body::File(b"inside".to_vec()),
+    );
+
+    let out = sandbox.rip(
+        "/",
+        &[
+            "restore",
+            "/home/u/Downloads/dir/f",
+            "/home/u/Downloads/dir",
+        ],
+    );
+    assert_fails(&out, "restore with a conflicting parent");
+    let err = stderr_str(&out);
+    assert!(
+        err.contains("it exists; use `rip restore --rename /home/u/.local/share/Trash/files/dir`"),
+        "{err}"
+    );
+    assert!(err.contains("was not restored"), "{err}");
+    assert!(!sandbox.host("/home/u/Downloads/dir/f").exists());
+    assert!(trash_host_path(&sandbox, "/home/u/.local/share/Trash", b"dir").exists());
+    assert!(trash_host_path(&sandbox, "/home/u/.local/share/Trash", b"dir_f").exists());
 }
 
 #[test]

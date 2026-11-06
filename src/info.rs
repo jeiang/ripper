@@ -1,5 +1,5 @@
 //! `.trashinfo` encode/parse, `Path=` percent-encoding, `DeletionDate` parsing,
-//! trash `Kind`, `Path=` -> absolute path resolution, and `NAME_MAX`-safe
+//! a trash's `Scope`, `Path=` -> absolute path resolution, and `NAME_MAX`-safe
 //! collision names. See docs/design.md §4 (on-disk names).
 
 use std::ffi::{OsStr, OsString};
@@ -9,13 +9,14 @@ use std::path::{Component, Path, PathBuf};
 use jiff::civil;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode, percent_encode};
 
+/// Which `Path=` rules a trash follows (docs/design.md §4).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Kind {
+pub enum Scope {
+    /// The home trash: `Path=` is absolute, written as the user reached it.
     Home,
-    /// `$topdir/.Trash/$uid`
-    Admin,
-    /// `$topdir/.Trash-$uid`
-    User,
+    /// `$topdir/.Trash/$uid` or `$topdir/.Trash-$uid`: `Path=` is relative
+    /// to `$topdir` and must resolve strictly beneath it.
+    Topdir,
 }
 
 /// Bytes left unescaped in a `Path=` value: unreserved (`A-Za-z0-9-._~`) plus
@@ -74,11 +75,11 @@ fn parse_date(v: &[u8]) -> Option<civil::DateTime> {
 }
 
 /// Resolves a decoded `Path=` value to an absolute original path. Rejects an
-/// empty path, a NUL byte, and any `..` component. For `Admin` and `User`
-/// trashes the result must land strictly beneath `base` (`$topdir`); `Home`
-/// accepts any absolute path, since it is written as the user reached it and
-/// may point outside `$XDG_DATA_HOME`.
-pub fn original(kind: Kind, base: &Path, decoded: &[u8]) -> Result<PathBuf, &'static str> {
+/// empty path, a NUL byte, and any `..` component. For a `Topdir` trash the
+/// result must land strictly beneath `base` (`$topdir`); `Home` accepts any
+/// absolute path, since it is written as the user reached it and may point
+/// outside `$XDG_DATA_HOME`.
+pub fn original(scope: Scope, base: &Path, decoded: &[u8]) -> Result<PathBuf, &'static str> {
     if decoded.is_empty() || decoded.contains(&0) {
         return Err("empty Path or NUL byte");
     }
@@ -93,10 +94,26 @@ pub fn original(kind: Kind, base: &Path, decoded: &[u8]) -> Result<PathBuf, &'st
     })
     .components()
     .collect();
-    if kind != Kind::Home && (!abs.starts_with(base) || abs == base) {
+    if scope == Scope::Topdir && (!abs.starts_with(base) || abs == base) {
         return Err("Path is outside its topdir");
     }
     Ok(abs)
+}
+
+/// The raw bytes a `.trashinfo`'s `Path=` holds for `path` (before
+/// percent-encoding): absolute for the home trash, written as the user
+/// reached it; relative to `base` ($topdir) for a topdir trash. The inverse
+/// of `original`.
+pub fn path_field(scope: Scope, base: &Path, path: &Path) -> Vec<u8> {
+    match scope {
+        Scope::Home => path.as_os_str().as_bytes().to_vec(),
+        Scope::Topdir => path
+            .strip_prefix(base)
+            .unwrap_or(path)
+            .as_os_str()
+            .as_bytes()
+            .to_vec(),
+    }
 }
 
 /// `name`, or `name~k` for `k > 0`, cut on bytes so the result plus `reserve`
@@ -258,42 +275,42 @@ mod tests {
     #[test]
     fn original_home_relative_resolves_under_base() {
         let base = Path::new("/home/user/.local/share/Trash");
-        let got = original(Kind::Home, base, b"rel/a").unwrap();
+        let got = original(Scope::Home, base, b"rel/a").unwrap();
         assert_eq!(got, base.join("rel/a"));
     }
 
     #[test]
     fn original_home_absolute_used_as_is_even_outside_base() {
         let base = Path::new("/home/user/.local/share/Trash");
-        let got = original(Kind::Home, base, b"/mnt/Mumei/a").unwrap();
+        let got = original(Scope::Home, base, b"/mnt/Mumei/a").unwrap();
         assert_eq!(got, Path::new("/mnt/Mumei/a"));
     }
 
     #[test]
     fn original_topdir_relative_resolves_under_base() {
         let base = Path::new("/mnt/Mumei");
-        let got = original(Kind::User, base, b"a/b").unwrap();
+        let got = original(Scope::Topdir, base, b"a/b").unwrap();
         assert_eq!(got, base.join("a/b"));
     }
 
     #[test]
     fn original_topdir_absolute_inside_base_accepted() {
         let base = Path::new("/mnt/Mumei");
-        let got = original(Kind::Admin, base, b"/mnt/Mumei/a/b").unwrap();
+        let got = original(Scope::Topdir, base, b"/mnt/Mumei/a/b").unwrap();
         assert_eq!(got, base.join("a/b"));
     }
 
     #[test]
     fn original_topdir_absolute_outside_base_rejected() {
         let base = Path::new("/mnt/Mumei");
-        let err = original(Kind::User, base, b"/home/user/a").unwrap_err();
+        let err = original(Scope::Topdir, base, b"/home/user/a").unwrap_err();
         assert_eq!(err, "Path is outside its topdir");
     }
 
     #[test]
     fn original_topdir_equal_to_base_rejected() {
         let base = Path::new("/mnt/Mumei");
-        let err = original(Kind::User, base, b"/mnt/Mumei").unwrap_err();
+        let err = original(Scope::Topdir, base, b"/mnt/Mumei").unwrap_err();
         assert_eq!(err, "Path is outside its topdir");
     }
 
@@ -301,11 +318,11 @@ mod tests {
     fn original_rejects_dotdot() {
         let base = Path::new("/mnt/Mumei");
         assert_eq!(
-            original(Kind::User, base, b"../etc/passwd").unwrap_err(),
+            original(Scope::Topdir, base, b"../etc/passwd").unwrap_err(),
             "'..' in Path"
         );
         assert_eq!(
-            original(Kind::Home, base, b"/a/../b").unwrap_err(),
+            original(Scope::Home, base, b"/a/../b").unwrap_err(),
             "'..' in Path"
         );
     }
@@ -313,15 +330,36 @@ mod tests {
     #[test]
     fn original_rejects_nul_byte() {
         let base = Path::new("/mnt/Mumei");
-        let err = original(Kind::Home, base, b"/a\0b").unwrap_err();
+        let err = original(Scope::Home, base, b"/a\0b").unwrap_err();
         assert_eq!(err, "empty Path or NUL byte");
     }
 
     #[test]
     fn original_rejects_empty_path() {
         let base = Path::new("/mnt/Mumei");
-        let err = original(Kind::Home, base, b"").unwrap_err();
+        let err = original(Scope::Home, base, b"").unwrap_err();
         assert_eq!(err, "empty Path or NUL byte");
+    }
+
+    // --- path_field() --------------------------------------------------
+
+    #[test]
+    fn path_field_round_trips_through_encode_parse_and_original_per_scope() {
+        let when = date(2026, 1, 2, 3, 4, 5);
+        let path = Path::new(OsStr::from_bytes(b"/mnt/Mumei/a b/%c\xff"));
+        for (scope, base, field) in [
+            (
+                Scope::Home,
+                Path::new("/home/user/.local/share"),
+                &b"/mnt/Mumei/a b/%c\xff"[..],
+            ),
+            (Scope::Topdir, Path::new("/mnt/Mumei"), &b"a b/%c\xff"[..]),
+        ] {
+            assert_eq!(path_field(scope, base, path), field, "{scope:?}");
+            let (decoded, got) = parse(&encode(field, when)).unwrap();
+            assert_eq!(got, when);
+            assert_eq!(original(scope, base, &decoded).unwrap(), path, "{scope:?}");
+        }
     }
 
     // --- candidate() -------------------------------------------------

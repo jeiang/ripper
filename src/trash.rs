@@ -16,9 +16,9 @@ use rustix::fs::{AtFlags, CWD, Mode, OFlags, chmodat, mkdirat, openat, unlinkat}
 use rustix::io::Errno;
 use rustix::process::getuid;
 
-use crate::info::{self, Kind};
+use crate::info::{self, Scope};
 use crate::mounts::{self, Mounts};
-use crate::sys::{self, Ident, Lock, Remove};
+use crate::sys::{self, Ident, Lock, Policy, Remove};
 
 /// A `.trashinfo` is capped here (docs/design.md invariant re: FIFO-safe
 /// reads): a FIFO or symlink never reaches this check (it fails the
@@ -27,7 +27,7 @@ use crate::sys::{self, Ident, Lock, Remove};
 const MAX_INFO_SIZE: u64 = 64 * 1024;
 
 pub struct Trash {
-    pub kind: Kind,
+    pub scope: Scope,
     /// Where it was found (Home: canonical).
     pub path: PathBuf,
     /// Relative `Path=` resolves here: `$XDG_DATA_HOME` for Home, `$topdir` otherwise.
@@ -74,6 +74,41 @@ pub struct Dangling {
     pub trash: usize,
     pub name: OsString,
     pub info: Ident,
+}
+
+/// A `files/` entry with its record: an `Item`, or an `Orphan` (no valid
+/// `.trashinfo`). What `restore`/`purge` select and `empty` dooms;
+/// converts to `Doomed` with `.into()`.
+#[derive(Clone, Copy)]
+pub enum Entry<'a> {
+    Item(&'a Item),
+    Orphan(&'a Orphan),
+}
+
+impl<'a> Entry<'a> {
+    /// Indexes the `[Trash]` slice `load` was given.
+    pub fn trash(self) -> usize {
+        match self {
+            Entry::Item(it) => it.trash,
+            Entry::Orphan(o) => o.trash,
+        }
+    }
+
+    /// The `files/` entry name.
+    pub fn name(self) -> &'a OsStr {
+        match self {
+            Entry::Item(it) => &it.name,
+            Entry::Orphan(o) => &o.name,
+        }
+    }
+
+    /// An item's `DeletionDate`, or an orphan's local lstat ctime.
+    pub fn date(self) -> civil::DateTime {
+        match self {
+            Entry::Item(it) => it.date,
+            Entry::Orphan(o) => o.date,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -258,7 +293,7 @@ pub fn open_home(path: &Path, create: bool, uid: u32) -> io::Result<Option<Trash
     // *both* `files/` and `info/` absent -- exactly like "no home trash at
     // all" to a read-only command, not a warning-worthy oddity. Only one of
     // the two missing is never silenced by `missing_ok` (see `finish_open`).
-    finish_open(dir, Kind::Home, canonical, base, true)
+    finish_open(dir, Scope::Home, canonical, base, true)
 }
 
 /// `create_dir_all($XDG_DATA_HOME)`, then `mkdirat` `Trash`, `files` and
@@ -281,10 +316,10 @@ fn mkdir_ignore_exists(d: impl AsFd, n: impl rustix::path::Arg) -> io::Result<()
     }
 }
 
-/// Opens a topdir trash (`Kind::Admin` or `Kind::User`) at `path`, checking
-/// it the way docs/design.md §0 invariant 5 requires: `O_NOFOLLOW`, owner
-/// `uid`, `files/`+`info/` present and on the same mount.
-pub fn open_trash(path: &Path, kind: Kind, base: &Path, uid: u32) -> io::Result<Option<Trash>> {
+/// Opens a topdir trash (`$topdir/.Trash/$uid` or `$topdir/.Trash-$uid`) at
+/// `path`, checking it the way docs/design.md §0 invariant 5 requires:
+/// `O_NOFOLLOW`, owner `uid`, `files/`+`info/` present and on the same mount.
+pub fn open_trash(path: &Path, base: &Path, uid: u32) -> io::Result<Option<Trash>> {
     let dir = match sys::open_dir(CWD, path) {
         Ok(fd) => fd,
         Err(e) if silent_skip(&e) => return Ok(None),
@@ -297,7 +332,13 @@ pub fn open_trash(path: &Path, kind: Kind, base: &Path, uid: u32) -> io::Result<
     // `files/` and `info/` together (`put::topdir_trash`) before ever
     // returning it from discovery, so one existing without them is unusual
     // enough to warn about rather than silently skip.
-    finish_open(dir, kind, path.to_path_buf(), base.to_path_buf(), false)
+    finish_open(
+        dir,
+        Scope::Topdir,
+        path.to_path_buf(),
+        base.to_path_buf(),
+        false,
+    )
 }
 
 /// Shared by `open_home` and `open_trash`: given an already-opened,
@@ -313,7 +354,7 @@ pub fn open_trash(path: &Path, kind: Kind, base: &Path, uid: u32) -> io::Result<
 /// data if swallowed.
 fn finish_open(
     dir: OwnedFd,
-    kind: Kind,
+    scope: Scope,
     path: PathBuf,
     base: PathBuf,
     missing_ok: bool,
@@ -348,7 +389,7 @@ fn finish_open(
         ));
     }
     Ok(Some(Trash {
-        kind,
+        scope,
         path,
         base,
         dir,
@@ -369,11 +410,11 @@ pub fn discover(home: Option<Trash>, ms: &Mounts, uid: u32, warn: &mut Vec<Strin
         let admin = m.point.join(".Trash");
         if sys::stat_at(CWD, &admin).is_ok_and(|a| a.is_dir() && a.sticky()) {
             let candidate = admin.join(uid.to_string());
-            let result = open_trash(&candidate, Kind::Admin, &m.point, uid);
+            let result = open_trash(&candidate, &m.point, uid);
             push_new(&mut out, result, &candidate, warn);
         }
         let user_path = m.point.join(format!(".Trash-{uid}"));
-        let result = open_trash(&user_path, Kind::User, &m.point, uid);
+        let result = open_trash(&user_path, &m.point, uid);
         push_new(&mut out, result, &user_path, warn);
     }
     out
@@ -607,7 +648,7 @@ fn load_info_entry(
         .then(|| info::parse(&bytes))
         .and_then(Result::ok)
         .and_then(|(path_bytes, date)| {
-            info::original(t.kind, &t.base, &path_bytes)
+            info::original(t.scope, &t.base, &path_bytes)
                 .ok()
                 .map(|orig| (orig, date))
         });
@@ -782,7 +823,7 @@ fn next_tombstone_name(pid: u32) -> OsString {
 /// on the directory itself, to update `..` -- unlike every other entry
 /// kind, so a top-level entry without it (a copy-based trasher, or a chmod
 /// after trashing) would otherwise never tombstone; `remove_tree`'s own
-/// trash-policy repair runs too late, only on entries already inside a
+/// `Policy::Discard` repair runs too late, only on entries already inside a
 /// tombstone. Best-effort and silent: a failure here just means the
 /// rename below reports the real error (docs/design.md §4).
 fn add_owner_write_if_needed(dir: &OwnedFd, name: &OsStr) {
@@ -910,8 +951,7 @@ pub fn discard_verified(
         &tomb,
         &Remove {
             mnt: t.id.mnt,
-            manifest: None,
-            trash: true,
+            policy: Policy::Discard,
         },
     );
     if !removal.kept.is_empty() {
@@ -927,10 +967,20 @@ pub fn discard_verified(
 // delete_batch (empty, purge)
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Copy)]
 pub enum Doomed<'a> {
     Item(&'a Item),
     Orphan(&'a Orphan),
     Dangling(&'a Dangling),
+}
+
+impl<'a> From<Entry<'a>> for Doomed<'a> {
+    fn from(e: Entry<'a>) -> Doomed<'a> {
+        match e {
+            Entry::Item(it) => Doomed::Item(it),
+            Entry::Orphan(o) => Doomed::Orphan(o),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -1012,8 +1062,7 @@ pub fn delete_batch(t: &Trash, ms: &Mounts, doomed: &[Doomed], clean_staging: bo
             &n,
             &Remove {
                 mnt: t.id.mnt,
-                manifest: None,
-                trash: true,
+                policy: Policy::Discard,
             },
         );
         rep.kept.extend(r.kept);
@@ -1113,7 +1162,7 @@ mod tests {
         let id = sys::ident(&dir_fd).unwrap();
         let files_id = sys::ident(&files).unwrap();
         Trash {
-            kind: Kind::User,
+            scope: Scope::Topdir,
             path: dir.to_path_buf(),
             base: dir.to_path_buf(),
             dir: dir_fd,
@@ -1291,16 +1340,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let t = make_trash(dir.path());
         let staging_fd = staging(&t).unwrap();
-        let (box_name, box_fd) = sys::make_box(staging_fd.as_fd(), "put").unwrap();
+        let bx = sys::make_box(staging_fd.as_fd(), "put", t.id.mnt).unwrap();
+        // A crashed put leaves its box behind: the guard never runs.
+        std::mem::forget(bx);
+        let boxes = sys::read_names(&staging_fd).unwrap();
+        assert_eq!(boxes.len(), 1, "{boxes:?}");
         std::fs::write(
             dir.path()
                 .join(STAGING_NAME)
-                .join(&box_name)
+                .join(&boxes[0])
                 .join("leftover"),
             b"x",
         )
         .unwrap();
-        drop(box_fd);
 
         let ms = Mounts::parse(b"");
         let report = delete_batch(&t, &ms, &[], true);

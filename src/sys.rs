@@ -688,10 +688,21 @@ fn walk_child(
     walk_open_dir(dir, &n, rel, &m, ctx, w)
 }
 
+/// What `remove_tree` may delete.
+#[derive(Clone, Copy)]
+pub enum Policy<'a> {
+    /// rip's own data (a tombstone or a staging box): everything goes, and
+    /// a directory we own gets `u+rwx` added where it lacks it (read-only
+    /// trees such as Go's module cache).
+    Discard,
+    /// A user's source after a verified copy: only entries the walk saw,
+    /// unchanged, and never a permission repair.
+    Source(&'a Manifest),
+}
+
 pub struct Remove<'a> {
     pub mnt: u64,
-    pub manifest: Option<&'a Manifest>,
-    pub trash: bool,
+    pub policy: Policy<'a>,
 }
 
 #[derive(Default, Debug)]
@@ -709,11 +720,9 @@ struct RmFrame {
 
 /// Deletes `parent/name` and everything under it with fd-relative calls.
 /// Never follows a symlink, never enters another mount, never stops at the
-/// first error: it removes what it safely can and reports the rest. With a
-/// manifest, it deletes only entries the walk saw, unchanged. `trash` allows
-/// adding `u+rwx` to directories we own (read-only trees such as Go's module
-/// cache); it is never used on user sources. An explicit stack of frames:
-/// depth costs fds, not thread stack.
+/// first error: it removes what it safely can and reports the rest. See
+/// `Policy` for what it may delete. An explicit stack of frames: depth costs
+/// fds, not thread stack.
 pub fn remove_tree(parent: BorrowedFd, name: &OsStr, o: &Remove) -> Removal {
     let mut r = Removal::default();
     let mut stack: Vec<RmFrame> = Vec::new();
@@ -755,10 +764,12 @@ fn enter_or_unlink(
             return None;
         }
     };
+    let (manifest, repair) = match o.policy {
+        Policy::Discard => (None, true),
+        Policy::Source(mf) => (Some(mf), false),
+    };
     if !m.is_dir() {
-        if o.manifest
-            .is_some_and(|mf| !mf.unchanged(&manifest_key(&rel), &m))
-        {
+        if manifest.is_some_and(|mf| !mf.unchanged(&manifest_key(&rel), &m)) {
             r.kept
                 .push((rel, "changed or new since it was copied".into()));
             return None;
@@ -774,15 +785,13 @@ fn enter_or_unlink(
         r.kept.push((rel, "a mount point; not crossing it".into()));
         return None;
     }
-    if o.manifest
-        .is_some_and(|mf| !mf.dir_ok(&manifest_key(&rel), &m))
-    {
+    if manifest.is_some_and(|mf| !mf.dir_ok(&manifest_key(&rel), &m)) {
         r.kept.push((rel, "new since it was copied".into()));
         return None;
     }
     let opened = match open_dir(dir, &n) {
         Err(e)
-            if o.trash
+            if repair
                 && Errno::from_io_error(&e) == Some(Errno::ACCESS)
                 && m.uid == getuid().as_raw() =>
         {
@@ -801,7 +810,7 @@ fn enter_or_unlink(
         r.kept.push((rel, "changed during deletion".into()));
         return None;
     }
-    if o.trash && m.uid == getuid().as_raw() && m.mode & 0o700 != 0o700 {
+    if repair && m.uid == getuid().as_raw() && m.mode & 0o700 != 0o700 {
         let _ = fs::fchmod(&fd, Mode::from_raw_mode(m.mode | 0o700));
     }
     match read_names(&fd) {
@@ -908,16 +917,66 @@ pub fn cp_archive(
     }
 }
 
-/// `mkdirat(dir, "<prefix>.<pid>.<n>", 0700)`, `n+1` on `EEXIST`; returns the
-/// name and an `O_RDONLY|O_DIRECTORY` fd.
-pub fn make_box(dir: BorrowedFd, prefix: &str) -> io::Result<(OsString, OwnedFd)> {
+/// A fresh staging box from `make_box`. Dropping it without `finish()`
+/// removes the box and everything in it (`remove_tree`, `Policy::Discard`, never
+/// leaving `mnt`), so every early return between `make_box` and a
+/// successful publish cleans up on its own -- the same shape as
+/// `trash::Reserved`. Declare it after the trash lock, so it drops (and the
+/// box goes) while that lock is still held (docs/design.md §0 invariant 9).
+pub struct StagingBox<'a> {
+    dir: BorrowedFd<'a>,
+    name: OsString,
+    fd: OwnedFd,
+    mnt: u64,
+    live: bool,
+}
+
+impl StagingBox<'_> {
+    /// The box's own `O_RDONLY|O_DIRECTORY` fd.
+    pub fn fd(&self) -> &OwnedFd {
+        &self.fd
+    }
+
+    /// `rmdir`s the box once its content has been published out of it, and
+    /// disarms the drop-time `remove_tree`.
+    pub fn finish(mut self) {
+        self.live = false;
+        let _ = unlinkat(self.dir, &self.name, AtFlags::REMOVEDIR);
+    }
+}
+
+impl Drop for StagingBox<'_> {
+    fn drop(&mut self) {
+        if self.live {
+            remove_tree(
+                self.dir,
+                &self.name,
+                &Remove {
+                    mnt: self.mnt,
+                    policy: Policy::Discard,
+                },
+            );
+        }
+    }
+}
+
+/// `mkdirat(dir, "<prefix>.<pid>.<n>", 0700)`, `n+1` on `EEXIST`, guarded by
+/// a `StagingBox`. `mnt` is `dir`'s mount id, which the drop-time removal
+/// never leaves.
+pub fn make_box<'a>(dir: BorrowedFd<'a>, prefix: &str, mnt: u64) -> io::Result<StagingBox<'a>> {
     let pid = std::process::id();
     for n in 0u64..1_000_000 {
         let name = OsString::from(format!("{prefix}.{pid}.{n}"));
         match mkdirat(dir, &name, Mode::from_raw_mode(0o700)) {
             Ok(()) => {
                 let fd = open_dir(dir, &name)?;
-                return Ok((name, fd));
+                return Ok(StagingBox {
+                    dir,
+                    name,
+                    fd,
+                    mnt,
+                    live: true,
+                });
             }
             Err(Errno::EXIST) => continue,
             Err(e) => return Err(e.into()),
@@ -1186,8 +1245,7 @@ mod tests {
             OsStr::new("victim"),
             &Remove {
                 mnt,
-                manifest: None,
-                trash: false,
+                policy: Policy::Discard,
             },
         );
         assert!(res.removed_any);
@@ -1213,8 +1271,7 @@ mod tests {
             OsStr::new("d"),
             &Remove {
                 mnt,
-                manifest: None,
-                trash: false,
+                policy: Policy::Discard,
             },
         );
         assert!(res.removed_any);
@@ -1223,7 +1280,7 @@ mod tests {
     }
 
     #[test]
-    fn remove_tree_user_policy_keeps_0555_and_0311_directories() {
+    fn remove_tree_source_policy_keeps_0555_and_0311_directories() {
         let dir = tempfile::tempdir().unwrap();
         let r = root(&dir);
         let mnt = ident(&r).unwrap().mnt;
@@ -1233,20 +1290,24 @@ mod tests {
             std::fs::create_dir(&sub).unwrap();
             std::fs::write(sub.join("f"), b"x").unwrap();
             std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(mode)).unwrap();
+            // Every entry the walk saw counts as verified and unchanged, so
+            // only the missing permission can keep anything.
+            let w = walk(r.as_fd(), OsStr::new(name), Check::Size).unwrap();
+            let manifest = manifest_with_copy_mirroring_pre(&w);
 
             let res = remove_tree(
                 r.as_fd(),
                 OsStr::new(name),
                 &Remove {
                     mnt,
-                    manifest: None,
-                    trash: false,
+                    policy: Policy::Source(&manifest),
                 },
             );
             assert!(
                 !res.kept.is_empty(),
-                "expected {name} ({mode:o}) to be kept under user policy"
+                "expected {name} ({mode:o}) to be kept under the source policy"
             );
+            assert!(sub.join("f").exists(), "{name} ({mode:o})");
 
             // Let tempdir clean itself up.
             std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1254,7 +1315,7 @@ mod tests {
     }
 
     #[test]
-    fn remove_tree_trash_policy_removes_0555_and_0311_directories() {
+    fn remove_tree_discard_policy_removes_0555_and_0311_directories() {
         let dir = tempfile::tempdir().unwrap();
         let r = root(&dir);
         let mnt = ident(&r).unwrap().mnt;
@@ -1270,8 +1331,7 @@ mod tests {
                 OsStr::new(name),
                 &Remove {
                     mnt,
-                    manifest: None,
-                    trash: true,
+                    policy: Policy::Discard,
                 },
             );
             assert!(res.removed_any, "{name} ({mode:o})");
@@ -1329,8 +1389,7 @@ mod tests {
             OsStr::new("victim"),
             &Remove {
                 mnt,
-                manifest: Some(&manifest),
-                trash: false,
+                policy: Policy::Source(&manifest),
             },
         );
         assert!(res.removed_any, "keep.txt should have been removed");
@@ -1395,8 +1454,7 @@ mod tests {
             OsStr::new("victim"),
             &Remove {
                 mnt,
-                manifest: Some(&manifest),
-                trash: false,
+                policy: Policy::Source(&manifest),
             },
         );
 
@@ -1459,8 +1517,7 @@ mod tests {
             OsStr::new("victim"),
             &Remove {
                 mnt,
-                manifest: Some(&w.manifest),
-                trash: false,
+                policy: Policy::Source(&w.manifest),
             },
         );
         assert!(res.removed_any);
@@ -1533,8 +1590,7 @@ mod tests {
             OsStr::new("t"),
             &Remove {
                 mnt,
-                manifest: Some(&w.manifest),
-                trash: false,
+                policy: Policy::Source(&w.manifest),
             },
         );
         assert!(
@@ -1600,8 +1656,7 @@ mod tests {
             OsStr::new("t"),
             &Remove {
                 mnt,
-                manifest: Some(&w.manifest),
-                trash: false,
+                policy: Policy::Source(&w.manifest),
             },
         );
         assert!(
@@ -1635,8 +1690,7 @@ mod tests {
             OsStr::new("d"),
             &Remove {
                 mnt,
-                manifest: None,
-                trash: false,
+                policy: Policy::Discard,
             },
         );
         assert!(res.removed_any);
@@ -1660,8 +1714,7 @@ mod tests {
             OsStr::new("many"),
             &Remove {
                 mnt,
-                manifest: None,
-                trash: false,
+                policy: Policy::Discard,
             },
         );
         assert!(res.removed_any);
@@ -1710,6 +1763,43 @@ mod tests {
             std::fs::read_link(dst_path.join("dangling")).unwrap(),
             Path::new("nowhere")
         );
+    }
+
+    // ---- make_box / StagingBox ----
+
+    #[test]
+    fn staging_box_drop_removes_its_content_and_finish_removes_it_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = root(&dir);
+        let mnt = ident(&r).unwrap().mnt;
+
+        // Dropped unfinished (an error exit): the box and a whole tree in
+        // it go, even a read-only directory (`Policy::Discard`).
+        let bx = make_box(r.as_fd(), "put", mnt).unwrap();
+        mkdirat(bx.fd(), "item", Mode::from_raw_mode(0o700)).unwrap();
+        let item = open_dir(bx.fd(), "item").unwrap();
+        std::fs::write(
+            dir.path()
+                .join(format!("put.{}.0/item/f", std::process::id())),
+            b"x",
+        )
+        .unwrap();
+        rustix::fs::fchmod(&item, Mode::from_raw_mode(0o500)).unwrap();
+        drop(item);
+        drop(bx);
+        assert!(read_names(&r).unwrap().is_empty());
+
+        // Finished once its content was published out of it: rmdir'd.
+        let bx = make_box(r.as_fd(), "put", mnt).unwrap();
+        std::fs::write(
+            dir.path()
+                .join(format!("put.{}.0/item", std::process::id())),
+            b"x",
+        )
+        .unwrap();
+        renameat(bx.fd(), "item", &r, "published").unwrap();
+        bx.finish();
+        assert_eq!(read_names(&r).unwrap(), vec![OsString::from("published")]);
     }
 
     // ---- verify before route()/mount_conflict() rely on them ----

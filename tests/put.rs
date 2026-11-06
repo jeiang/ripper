@@ -378,6 +378,79 @@ fn admin_trash_non_sticky_falls_back_with_warning() {
     );
 }
 
+/// docs/design.md §3.1: a valid sticky `.Trash` where creating `.Trash/UID`
+/// fails (here `.Trash` is not writable) falls back to `.Trash-UID` with a
+/// warning, still renaming on the file's own filesystem: it neither fails
+/// the operand nor copies it to the home trash.
+#[test]
+fn admin_trash_uid_mkdir_failure_falls_back_to_user_trash() {
+    let uid = getuid().as_raw();
+    let sandbox = Sandbox::artemis();
+    let admin = sandbox.host("/mnt/other").join(".Trash");
+    std::fs::create_dir(&admin).unwrap();
+    std::fs::set_permissions(&admin, std::fs::Permissions::from_mode(0o1555)).unwrap();
+    let target = sandbox.host("/mnt/other").join("x");
+    std::fs::write(&target, b"hello").unwrap();
+    let before = inode(&target);
+
+    let out = sandbox.rip("/mnt/other", &["x"]);
+    std::fs::set_permissions(&admin, std::fs::Permissions::from_mode(0o1777)).unwrap();
+    assert_ok(&out);
+
+    let trashed = sandbox
+        .host("/mnt/other")
+        .join(format!(".Trash-{uid}/files/x"));
+    assert!(trashed.is_file());
+    assert_eq!(inode(&trashed), before, "must be a rename, not a copy");
+    assert!(!admin.join(uid.to_string()).exists());
+    let info = read_info(
+        &sandbox
+            .host("/mnt/other")
+            .join(format!(".Trash-{uid}/info/x.trashinfo")),
+    );
+    assert!(info.contains("\nPath=x\n"), "{info}");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains(&format!(
+            "cannot create /mnt/other/.Trash/{uid}: Permission denied"
+        )) && err.contains(&format!("using /mnt/other/.Trash-{uid}")),
+        "{err}"
+    );
+}
+
+/// The same `.Trash/UID` failure when `.Trash-UID` is not usable either (a
+/// plain file): the topdir trash is unusable, not a refusal, so the item is
+/// copied to the home trash like any other operand with no topdir trash.
+#[test]
+fn admin_trash_uid_mkdir_failure_with_an_unusable_user_trash_copies_home() {
+    let uid = getuid().as_raw();
+    let sandbox = Sandbox::artemis();
+    let admin = sandbox.host("/mnt/other").join(".Trash");
+    std::fs::create_dir(&admin).unwrap();
+    std::fs::set_permissions(&admin, std::fs::Permissions::from_mode(0o1555)).unwrap();
+    let user_trash = sandbox.host("/mnt/other").join(format!(".Trash-{uid}"));
+    std::fs::write(&user_trash, b"not a dir").unwrap();
+    let target = sandbox.host("/mnt/other").join("x");
+    std::fs::write(&target, b"hello").unwrap();
+
+    let out = sandbox.rip("/mnt/other", &["x"]);
+    std::fs::set_permissions(&admin, std::fs::Permissions::from_mode(0o1777)).unwrap();
+    assert_ok(&out);
+
+    assert!(!target.exists());
+    assert_eq!(
+        std::fs::read(sandbox.host("/home/u/.local/share/Trash/files/x")).unwrap(),
+        b"hello"
+    );
+    assert_eq!(std::fs::read(&user_trash).unwrap(), b"not a dir");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains(&format!("cannot create /mnt/other/.Trash/{uid}"))
+            && err.contains("its .Trash-UID is not a directory"),
+        "{err}"
+    );
+}
+
 #[test]
 fn invalid_user_trash_symlink_falls_back() {
     let uid = getuid().as_raw();
@@ -624,6 +697,35 @@ fn copy_refused_unwritable_subdir() {
             .join("d")
             .exists()
     );
+}
+
+/// A copy that succeeds but cannot be published (the home trash's `info/`
+/// is not writable, so the reservation fails after the copy is complete)
+/// leaves the source untouched and no copied box behind in `.rip-staging`
+/// (docs/design.md §5.2).
+#[test]
+fn copy_rollback_when_the_reservation_fails() {
+    let sandbox = Sandbox::artemis();
+    let base = sandbox.host("/home/u");
+    std::fs::create_dir_all(base.join("d")).unwrap();
+    std::fs::write(base.join("d/f"), b"x").unwrap();
+    let trash = sandbox.host("/home/u/.local/share/Trash");
+    std::fs::create_dir_all(trash.join("files")).unwrap();
+    std::fs::create_dir_all(trash.join("info")).unwrap();
+    std::fs::set_permissions(trash.join("info"), std::fs::Permissions::from_mode(0o500)).unwrap();
+
+    let out = sandbox.rip("/home/u", &["d"]);
+    std::fs::set_permissions(trash.join("info"), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert_fail(&out);
+    assert!(base.join("d/f").is_file());
+    assert!(empty_dir(&trash.join("files")));
+    assert!(empty_dir(&trash.join("info")));
+    assert!(
+        trash.join(".rip-staging").is_dir(),
+        "the copy must have been staged before the reservation failed"
+    );
+    assert!(empty_dir(&trash.join(".rip-staging")), "no box left behind");
 }
 
 // ---------------------------------------------------------------------------

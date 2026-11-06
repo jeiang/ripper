@@ -13,9 +13,9 @@ use jiff::civil;
 use rustix::fs::{AtFlags, CWD, Mode, OFlags, ResolveFlags, mkdirat, openat2, unlinkat};
 use rustix::io::{Errno, fcntl_dupfd_cloexec};
 
-use crate::info::{self, Kind};
-use crate::sys::{self, Check, Lock, Remove};
-use crate::trash::{self, Contents, Doomed, Item, Orphan, Trash};
+use crate::info::{self, Scope};
+use crate::sys::{self, Check, Lock};
+use crate::trash::{self, Contents, Doomed, Entry, Item, Trash};
 use crate::{Cx, confirm, escape, human};
 
 pub fn list(cx: &Cx, all: bool, null: bool) -> Result<bool, String> {
@@ -124,13 +124,6 @@ fn print_path(cwd: &Path, path: &Path) {
 // Selection (design §5.3), shared by restore and purge
 // ---------------------------------------------------------------------------
 
-/// A selected trash entry: an `Item` for restore or purge, or an `Orphan`
-/// (reachable only by its trash path, and only when `purge` allows it).
-enum Target<'a> {
-    Item(&'a Item),
-    Orphan(&'a Orphan),
-}
-
 fn scope<'a>(items: &'a [Item], cwd: &Path, all: bool) -> Vec<&'a Item> {
     items
         .iter()
@@ -142,15 +135,9 @@ fn scope<'a>(items: &'a [Item], cwd: &Path, all: bool) -> Vec<&'a Item> {
 /// named by two different alias paths) to its first occurrence. `(trash
 /// index, entry name)` identifies a `files/` entry uniquely, regardless of
 /// whether it was reached as an `Item` or an `Orphan`.
-fn dedup(targets: &mut Vec<Target<'_>>) {
+fn dedup(targets: &mut Vec<Entry<'_>>) {
     let mut seen: HashSet<(usize, OsString)> = HashSet::new();
-    targets.retain(|t| {
-        let key = match t {
-            Target::Item(it) => (it.trash, it.name.clone()),
-            Target::Orphan(o) => (o.trash, o.name.clone()),
-        };
-        seen.insert(key)
-    });
+    targets.retain(|t| seen.insert((t.trash(), t.name().to_owned())));
 }
 
 /// Resolves a `restore`/`purge` PATH argument to an absolute path
@@ -204,7 +191,7 @@ fn by_trash_path<'a>(
     abs: &Path,
     orphans_ok: bool,
     verb: &str,
-) -> Result<Option<Target<'a>>, String> {
+) -> Result<Option<Entry<'a>>, String> {
     let ancestors: Vec<&Path> = abs
         .ancestors()
         .skip(1)
@@ -233,7 +220,7 @@ fn by_trash_path<'a>(
             .iter()
             .find(|i| i.trash == idx && i.name.as_os_str() == name)
         {
-            return Ok(Some(Target::Item(it)));
+            return Ok(Some(Entry::Item(it)));
         }
         if let Some(o) = c
             .orphans
@@ -241,7 +228,7 @@ fn by_trash_path<'a>(
             .find(|o| o.trash == idx && o.name.as_os_str() == name)
         {
             return if orphans_ok {
-                Ok(Some(Target::Orphan(o)))
+                Ok(Some(Entry::Orphan(o)))
             } else {
                 Err(format!(
                     "{}: no valid .trashinfo (try `rip purge`)",
@@ -286,8 +273,8 @@ fn select<'a>(
     all: bool,
     verb: &str,
     orphans_ok: bool,
-) -> Result<Vec<Target<'a>>, String> {
-    let mut out: Vec<Target<'a>> = Vec::new();
+) -> Result<Vec<Entry<'a>>, String> {
+    let mut out: Vec<Entry<'a>> = Vec::new();
     if paths.is_empty() {
         let pool = scope(&c.items, &cx.cwd, all);
         if pool.is_empty() {
@@ -296,7 +283,7 @@ fn select<'a>(
                 esc_path(&cx.cwd)
             ));
         }
-        out.extend(pick(&pool, verb, &cx.cwd)?.into_iter().map(Target::Item));
+        out.extend(pick(&pool, verb, &cx.cwd)?.into_iter().map(Entry::Item));
     } else {
         for p in paths {
             let abs = resolve(&cx.cwd, p);
@@ -312,9 +299,9 @@ fn select<'a>(
                         esc_path(&abs)
                     ));
                 }
-                1 => out.push(Target::Item(matches[0])),
+                1 => out.push(Entry::Item(matches[0])),
                 _ if io::stdin().is_terminal() => {
-                    out.extend(pick(&matches, verb, &cx.cwd)?.into_iter().map(Target::Item));
+                    out.extend(pick(&matches, verb, &cx.cwd)?.into_iter().map(Entry::Item));
                 }
                 _ => return Err(variants_message(ts, &abs, &matches)),
             }
@@ -423,20 +410,11 @@ fn pick<'a>(items: &[&'a Item], verb: &str, cwd: &Path) -> Result<Vec<&'a Item>,
 // ---------------------------------------------------------------------------
 
 /// `restore_item`'s failure. `Conflict` is specifically "the destination
-/// already exists"; `undo` (which never takes `--rename`) turns that one
-/// into a `rip restore --rename <trash path>` hint. Everything else is
-/// `Other`.
+/// already exists" (only without `--rename`); `restore_batch` turns it into
+/// a `rip restore --rename <trash path>` hint. Everything else is `Other`.
 enum RestoreError {
-    Conflict(String),
+    Conflict,
     Other(String),
-}
-
-impl std::fmt::Display for RestoreError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RestoreError::Conflict(m) | RestoreError::Other(m) => write!(f, "{m}"),
-        }
-    }
 }
 
 impl From<io::Error> for RestoreError {
@@ -595,8 +573,8 @@ fn restore_item(
     // Home: resolve from "/" (the user's own paths; symlinks followed).
     // Topdir: every lookup is RESOLVE_BENEATH the topdir fd, so a hostile
     // Path= or a planted symlink cannot leave the topdir.
-    let (base, rel, beneath) = match t.kind {
-        Kind::Home => {
+    let (base, rel, beneath) = match t.scope {
+        Scope::Home => {
             let base = sys::open_path(CWD, "/")?;
             let rel = parent_orig
                 .strip_prefix("/")
@@ -604,7 +582,7 @@ fn restore_item(
                 .to_path_buf();
             (base, rel, false)
         }
-        _ => {
+        Scope::Topdir => {
             let base = trash::open_top(t)?;
             let rel = parent_orig
                 .strip_prefix(&t.base)
@@ -618,9 +596,7 @@ fn restore_item(
     let created = ParentGuard(created_vec);
 
     if !rename && sys::stat_at(&pfd, name).is_ok() {
-        return Err(RestoreError::Conflict(
-            "exists; not replacing it (use --rename)".into(),
-        ));
+        return Err(RestoreError::Conflict);
     }
 
     let pid = sys::ident(&pfd)?;
@@ -694,36 +670,19 @@ fn restore_item(
 
     // Copy back. The destination is complete and durable before the trash
     // copy goes (design §0 invariant 2).
-    let (bx, bfd) = sys::make_box(pfd.as_fd(), ".rip-restore")?;
-    let discard_box = |bx: &OsStr| {
-        sys::remove_tree(
-            pfd.as_fd(),
-            bx,
-            &Remove {
-                mnt: pid.mnt,
-                manifest: None,
-                trash: true,
-            },
-        );
-    };
+    let bx = sys::make_box(pfd.as_fd(), ".rip-restore", pid.mnt)?; // dropped before _lock
     // Recheck immediately before the copy (design §5.3).
-    if let Err(e) = recheck(t, it) {
-        discard_box(&bx);
-        return Err(e);
-    }
-    if let Err(e) = sys::cp_archive(t.files.as_fd(), &it.name, bfd.as_fd(), OsStr::new("item")) {
-        discard_box(&bx);
-        return Err(RestoreError::Other(format!("copying back failed: {e}")));
-    }
-    let n = match rename_free(&bfd, OsStr::new("item"), &pfd, name, rename) {
-        Ok(n) => n,
-        Err(e) => {
-            discard_box(&bx);
-            return Err(RestoreError::Other(e.to_string()));
-        }
-    };
+    recheck(t, it)?;
+    sys::cp_archive(
+        t.files.as_fd(),
+        &it.name,
+        bx.fd().as_fd(),
+        OsStr::new("item"),
+    )
+    .map_err(|e| RestoreError::Other(format!("copying back failed: {e}")))?;
+    let n = rename_free(bx.fd(), OsStr::new("item"), &pfd, name, rename)?;
     created.disarm();
-    let _ = unlinkat(&pfd, &bx, AtFlags::REMOVEDIR);
+    bx.finish();
     sys::syncfs(&pfd)?;
     // Recheck immediately before discard is `discard_verified`'s own job:
     // it tombstones by name, then verifies the tombstoned file really is
@@ -768,6 +727,56 @@ fn blocking_ancestor<'a>(blocked: &'a [PathBuf], original: &Path) -> Option<&'a 
         .map(PathBuf::as_path)
 }
 
+/// Restores `items` parents first, printing each restored path and
+/// reporting each failure; returns whether every item came back. Once a
+/// batch item's own restore is declined, refused or fails, every later item
+/// under it is skipped and reported (design §5.3). A conflict names the
+/// item's trash path in a `--rename` hint.
+fn restore_batch(
+    cx: &Cx,
+    trashes: &[Trash],
+    mut items: Vec<&Item>,
+    rename: bool,
+    yes: bool,
+) -> bool {
+    sort_parents_first(&mut items);
+    let mut ok = true;
+    let mut blocked: Vec<PathBuf> = Vec::new();
+    for it in items {
+        if let Some(parent) = blocking_ancestor(&blocked, &it.original) {
+            eprintln!(
+                "rip: cannot restore '{}': its parent {} was not restored; it stays in the trash",
+                esc_path(&it.original),
+                esc_path(parent)
+            );
+            ok = false;
+            continue;
+        }
+        match restore_item(cx, trashes, it, rename, yes) {
+            Ok(Some(path)) => print_path(&cx.cwd, &path),
+            Ok(None) => blocked.push(it.original.clone()),
+            Err(e) => {
+                match e {
+                    RestoreError::Conflict => {
+                        let trash_path = trashes[it.trash].path.join("files").join(&it.name);
+                        eprintln!(
+                            "rip: cannot restore '{}': it exists; use `rip restore --rename {}`",
+                            esc_path(&it.original),
+                            esc_path(&trash_path)
+                        );
+                    }
+                    RestoreError::Other(msg) => {
+                        eprintln!("rip: cannot restore '{}': {msg}", esc_path(&it.original));
+                    }
+                }
+                ok = false;
+                blocked.push(it.original.clone());
+            }
+        }
+    }
+    ok
+}
+
 pub fn restore(
     cx: &Cx,
     paths: &[PathBuf],
@@ -782,36 +791,12 @@ pub fn restore(
     let mut items: Vec<&Item> = Vec::with_capacity(targets.len());
     for t in targets {
         match t {
-            Target::Item(it) => items.push(it),
+            Entry::Item(it) => items.push(it),
             // select() with orphans_ok = false never returns an orphan.
-            Target::Orphan(_) => return Err("internal error: restore selected an orphan".into()),
+            Entry::Orphan(_) => return Err("internal error: restore selected an orphan".into()),
         }
     }
-    sort_parents_first(&mut items);
-
-    let mut ok = true;
-    let mut blocked: Vec<PathBuf> = Vec::new();
-    for it in items {
-        if let Some(parent) = blocking_ancestor(&blocked, &it.original) {
-            eprintln!(
-                "rip: cannot restore '{}': its parent {} was not restored; it stays in the trash",
-                esc_path(&it.original),
-                esc_path(parent)
-            );
-            ok = false;
-            continue;
-        }
-        match restore_item(cx, &trashes, it, rename, yes) {
-            Ok(Some(path)) => print_path(&cx.cwd, &path),
-            Ok(None) => blocked.push(it.original.clone()),
-            Err(e) => {
-                eprintln!("rip: cannot restore '{}': {e}", esc_path(&it.original));
-                ok = false;
-                blocked.push(it.original.clone());
-            }
-        }
-    }
-    Ok(ok)
+    Ok(restore_batch(cx, &trashes, items, rename, yes))
 }
 
 // ---------------------------------------------------------------------------
@@ -824,11 +809,9 @@ fn newest_date(items: &[Item]) -> Option<civil::DateTime> {
     items.iter().map(|it| it.date).max()
 }
 
-/// Every item with exactly `date`, sorted parents first.
+/// Every item with exactly `date`.
 fn undo_batch(items: &[Item], date: civil::DateTime) -> Vec<&Item> {
-    let mut batch: Vec<&Item> = items.iter().filter(|it| it.date == date).collect();
-    sort_parents_first(&mut batch);
-    batch
+    items.iter().filter(|it| it.date == date).collect()
 }
 
 pub fn undo(cx: &Cx, yes: bool) -> Result<bool, String> {
@@ -839,56 +822,22 @@ pub fn undo(cx: &Cx, yes: bool) -> Result<bool, String> {
         return Err("nothing to undo".into());
     };
     let batch = undo_batch(&contents.items, newest);
-
-    let mut ok = true;
-    let mut blocked: Vec<PathBuf> = Vec::new();
-    for it in batch {
-        if let Some(parent) = blocking_ancestor(&blocked, &it.original) {
-            eprintln!(
-                "rip: cannot restore '{}': its parent {} was not restored; it stays in the trash",
-                esc_path(&it.original),
-                esc_path(parent)
-            );
-            ok = false;
-            continue;
-        }
-        match restore_item(cx, &trashes, it, false, yes) {
-            Ok(Some(path)) => print_path(&cx.cwd, &path),
-            Ok(None) => blocked.push(it.original.clone()),
-            Err(RestoreError::Conflict(_)) => {
-                let trash_path = trashes[it.trash].path.join("files").join(&it.name);
-                eprintln!(
-                    "rip: cannot restore '{}': it exists; use `rip restore --rename {}`",
-                    esc_path(&it.original),
-                    esc_path(&trash_path)
-                );
-                ok = false;
-                blocked.push(it.original.clone());
-            }
-            Err(RestoreError::Other(msg)) => {
-                eprintln!("rip: cannot restore '{}': {msg}", esc_path(&it.original));
-                ok = false;
-                blocked.push(it.original.clone());
-            }
-        }
-    }
-    Ok(ok)
+    Ok(restore_batch(cx, &trashes, batch, false, yes))
 }
 
 // ---------------------------------------------------------------------------
 // purge (design §5.4)
 // ---------------------------------------------------------------------------
 
-fn purge_line(cwd: &Path, trashes: &[Trash], t: &Target<'_>) -> String {
-    match t {
-        Target::Item(it) => format!(
-            "{}  {}",
-            it.date.strftime("%Y-%m-%d %H:%M:%S"),
+fn purge_line(cwd: &Path, trashes: &[Trash], e: Entry<'_>) -> String {
+    let date = e.date().strftime("%Y-%m-%d %H:%M:%S");
+    match e {
+        Entry::Item(it) => format!(
+            "{date}  {}",
             escape(display_path(cwd, &it.original).as_os_str().as_bytes())
         ),
-        Target::Orphan(o) => format!(
-            "{}  {} (orphan, no .trashinfo)",
-            o.date.strftime("%Y-%m-%d %H:%M:%S"),
+        Entry::Orphan(o) => format!(
+            "{date}  {} (orphan, no .trashinfo)",
             escape(
                 trashes[o.trash]
                     .path
@@ -908,7 +857,7 @@ pub fn purge(cx: &Cx, paths: &[PathBuf], all: bool, yes: bool) -> Result<bool, S
     let targets = select(cx, &trashes, &contents, paths, all, "purge", true)?;
 
     if !yes {
-        for t in targets.iter().take(20) {
+        for &t in targets.iter().take(20) {
             eprintln!("  {}", purge_line(&cx.cwd, &trashes, t));
         }
         if targets.len() > 20 {
@@ -923,11 +872,8 @@ pub fn purge(cx: &Cx, paths: &[PathBuf], all: bool, yes: bool) -> Result<bool, S
     }
 
     let mut by_trash: Vec<Vec<Doomed>> = (0..trashes.len()).map(|_| Vec::new()).collect();
-    for t in &targets {
-        match t {
-            Target::Item(it) => by_trash[it.trash].push(Doomed::Item(it)),
-            Target::Orphan(o) => by_trash[o.trash].push(Doomed::Orphan(o)),
-        }
+    for &t in &targets {
+        by_trash[t.trash()].push(t.into());
     }
 
     let mut ok = true;
@@ -1046,14 +992,15 @@ mod tests {
     }
 
     #[test]
-    fn undo_batch_sorts_parents_first() {
+    fn sort_parents_first_puts_a_dir_before_its_contents() {
         // `rip dir/f dir` then `rip undo`: dir must come back before dir/f.
-        let items = vec![
+        let items = [
             item(0, "/home/u/dir/f", "2026-01-01T00:00:00", 1),
             item(0, "/home/u/dir", "2026-01-01T00:00:00", 2),
             item(0, "/home/u/dir/sub/g", "2026-01-01T00:00:00", 3),
         ];
-        let batch = undo_batch(&items, "2026-01-01T00:00:00".parse().unwrap());
+        let mut batch: Vec<&Item> = items.iter().collect();
+        sort_parents_first(&mut batch);
         let names: Vec<&str> = batch
             .iter()
             .map(|it| it.original.to_str().unwrap())

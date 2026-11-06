@@ -10,12 +10,12 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use jiff::civil;
-use rustix::fs::{AtFlags, CWD, Mode, mkdirat, unlinkat};
+use rustix::fs::{CWD, Mode, mkdirat};
 use rustix::io::Errno;
 
-use crate::info::{self, Kind};
+use crate::info::{self, Scope};
 use crate::mounts::{self, FsId, Mount, Mounts};
-use crate::sys::{self, Check, Dev, Lock, Meta, Removal, Remove};
+use crate::sys::{self, Check, Dev, Lock, Meta, Policy, Removal, Remove};
 use crate::trash::{self, Trash};
 use crate::{Cli, Cx, Fallback, confirm, escape, human};
 
@@ -55,10 +55,13 @@ pub enum Entry {
     Other,
 }
 
+/// Which spec method `choose_topdir` picked: `Admin` is `$topdir/.Trash/$uid`
+/// (method 1), `User` is `$topdir/.Trash-$uid` (method 2). Either is used
+/// as is when it is already the user's directory and created when missing.
 #[derive(Clone, Copy, Debug)]
 pub enum Pick {
-    Admin { create: bool },
-    User { create: bool },
+    Admin,
+    User,
 }
 
 /// Spec methods 1 and 2. `admin_uid` is only meaningful when `admin` is a
@@ -71,14 +74,14 @@ pub fn choose_topdir(
 ) -> Result<Pick, &'static str> {
     if matches!(admin, Entry::Dir { sticky: true, .. }) {
         match admin_uid {
-            Entry::Dir { uid: u, .. } if u == uid => return Ok(Pick::Admin { create: false }),
-            Entry::Missing => return Ok(Pick::Admin { create: true }),
+            Entry::Dir { uid: u, .. } if u == uid => return Ok(Pick::Admin),
+            Entry::Missing => return Ok(Pick::Admin),
             _ => {} // invalid: fall through to method 2
         }
     }
     match user {
-        Entry::Dir { uid: u, .. } if u == uid => Ok(Pick::User { create: false }),
-        Entry::Missing => Ok(Pick::User { create: true }),
+        Entry::Dir { uid: u, .. } if u == uid => Ok(Pick::User),
+        Entry::Missing => Ok(Pick::User),
         Entry::Dir { .. } => Err("its .Trash-UID belongs to another user"),
         Entry::Other => Err("its .Trash-UID is not a directory"),
     }
@@ -110,14 +113,26 @@ fn find_dir(dir: impl AsFd, name: &OsStr) -> Found {
     }
 }
 
-fn found_entry(f: &Found) -> Entry {
-    match f {
-        Found::Missing => Entry::Missing,
-        Found::Dir(_, m) => Entry::Dir {
-            uid: m.uid,
-            sticky: m.sticky(),
-        },
-        Found::Other => Entry::Other,
+impl Found {
+    fn entry(&self) -> Entry {
+        match self {
+            Found::Missing => Entry::Missing,
+            Found::Dir(_, m) => Entry::Dir {
+                uid: m.uid,
+                sticky: m.sticky(),
+            },
+            Found::Other => Entry::Other,
+        }
+    }
+
+    /// The directory itself when it was found; otherwise
+    /// `mkdir_and_open(dir, name)`, which refuses (never follows) whatever
+    /// else is there.
+    fn open_or_mkdir(self, dir: impl AsFd, name: &OsStr) -> io::Result<OwnedFd> {
+        match self {
+            Found::Dir(fd, _) => Ok(fd),
+            Found::Missing | Found::Other => mkdir_and_open(dir, name),
+        }
     }
 }
 
@@ -192,93 +207,53 @@ pub fn topdir_trash(own: &Mount, src: &Meta, uid: u32, path: &Path) -> Result<Tr
     let user_path = own.point.join(&user_name);
 
     let admin = find_dir(&top, OsStr::new(".Trash"));
-    let admin_entry = found_entry(&admin);
-    let (admin_fd, admin_sticky) = match admin {
-        Found::Dir(fd, m) => (Some(fd), m.sticky()),
-        _ => (None, false),
+    // Method 1 looks inside `.Trash` only when it is a sticky directory.
+    let admin_uid = match &admin {
+        Found::Dir(fd, m) if m.sticky() => find_dir(fd, OsStr::new(&uid_s)),
+        _ => Found::Missing,
     };
-    let admin_uid = if admin_sticky {
-        // `admin_fd` is always `Some` here: `admin_sticky` is only true when
-        // `admin` matched `Found::Dir`, which is exactly when `admin_fd` was
-        // set from that same match.
-        find_dir(admin_fd.as_ref().unwrap(), OsStr::new(&uid_s))
-    } else {
-        Found::Missing
-    };
-    let admin_uid_entry = found_entry(&admin_uid);
-    let mut admin_uid_fd = match admin_uid {
-        Found::Dir(fd, _) => Some(fd),
-        _ => None,
-    };
-
     let user = find_dir(&top, OsStr::new(&user_name));
-    let user_entry = found_entry(&user);
-    let mut user_fd = match user {
-        Found::Dir(fd, _) => Some(fd),
-        _ => None,
-    };
 
-    if matches!(admin_entry, Entry::Dir { sticky: false, .. } | Entry::Other) {
+    if matches!(
+        admin.entry(),
+        Entry::Dir { sticky: false, .. } | Entry::Other
+    ) {
         eprintln!(
             "rip: {} is not a sticky directory; not using it",
             admin_path.display()
         );
     }
 
-    let pick = choose_topdir(admin_entry, admin_uid_entry, user_entry, uid)?;
-    let mut kind = match pick {
-        Pick::Admin { .. } => Kind::Admin,
-        Pick::User { .. } => Kind::User,
-    };
-    let mut trash_path = match kind {
-        Kind::Admin => admin_uid_path.clone(),
-        _ => user_path.clone(),
-    };
-
-    let trash_fd: OwnedFd = if let Pick::Admin { create: true } = pick {
-        // Method 1 ("mkdirat(.Trash, uid, 0700)") can still fail even though
-        // .Trash itself passed the sticky/ownership checks above (e.g. a
-        // quota or an ACL); fall back to method 2 rather than failing the
-        // whole operand.
-        let admin_fd = admin_fd
-            .as_ref()
-            .expect("choose_topdir only picks Admin when .Trash is a sticky dir");
-        match mkdir_and_open(admin_fd, OsStr::new(&uid_s)) {
-            Ok(fd) => fd,
-            Err(e) => {
-                eprintln!(
-                    "rip: cannot create {}: {e}; using {}",
-                    admin_uid_path.display(),
-                    user_path.display()
-                );
-                match user_entry {
-                    Entry::Dir { uid: u, .. } if u == uid => {}
-                    Entry::Missing => {}
-                    Entry::Dir { .. } => {
-                        return Err("its .Trash-UID belongs to another user".into());
-                    }
-                    Entry::Other => return Err("its .Trash-UID is not a directory".into()),
-                }
-                kind = Kind::User;
-                trash_path = user_path.clone();
-                match user_fd.take() {
-                    Some(fd) => fd,
-                    None => mkdir_and_open(&top, OsStr::new(&user_name))
-                        .map_err(|e| format!("cannot create {}: {e}", user_path.display()))?,
+    let pick = choose_topdir(admin.entry(), admin_uid.entry(), user.entry(), uid)?;
+    let admin_trash = match (pick, &admin) {
+        (Pick::Admin, Found::Dir(admin_fd, _)) => {
+            match admin_uid.open_or_mkdir(admin_fd, OsStr::new(&uid_s)) {
+                Ok(fd) => Some(fd),
+                // Method 1's mkdirat(.Trash, uid) can still fail even though
+                // .Trash itself passed the sticky check above (e.g. a quota
+                // or an ACL); fall back to method 2 rather than failing the
+                // whole operand.
+                Err(e) => {
+                    eprintln!(
+                        "rip: cannot create {}: {e}; using {}",
+                        admin_uid_path.display(),
+                        user_path.display()
+                    );
+                    choose_topdir(Entry::Missing, Entry::Missing, user.entry(), uid)?;
+                    None
                 }
             }
         }
-    } else if let Pick::Admin { create: false } = pick {
-        admin_uid_fd
-            .take()
-            .expect("choose_topdir Admin{create:false} means admin_uid already opened as a dir")
-    } else if let Pick::User { create: false } = pick {
-        user_fd
-            .take()
-            .expect("choose_topdir User{create:false} means user already opened as a dir")
-    } else {
-        mkdir_and_open(&top, OsStr::new(&user_name))
-            .map_err(|e| format!("cannot create {}: {e}", user_path.display()))?
+        _ => None,
+    };
+    let (trash_fd, trash_path) = match admin_trash {
+        Some(fd) => (fd, admin_uid_path),
+        None => {
+            let fd = user
+                .open_or_mkdir(&top, OsStr::new(&user_name))
+                .map_err(|e| format!("cannot create {}: {e}", user_path.display()))?;
+            (fd, user_path)
+        }
     };
 
     if path.starts_with(&trash_path) {
@@ -316,7 +291,7 @@ pub fn topdir_trash(own: &Mount, src: &Meta, uid: u32, path: &Path) -> Result<Tr
     }
 
     Ok(Trash {
-        kind,
+        scope: Scope::Topdir,
         path: trash_path,
         base: own.point.clone(),
         dir: trash_fd,
@@ -688,21 +663,6 @@ fn put_one(cx: &Cx, cli: &Cli, s: &mut Session, arg: &Path) -> Result<Done, PutE
 // Reservation and the rename path (docs/design.md §5.1)
 // ---------------------------------------------------------------------------
 
-/// The raw bytes a `.trashinfo`'s `Path=` should hold for `path`, landing in
-/// trash `t`: absolute for the home trash (written as the user reached it),
-/// relative to `t.base` ($topdir) otherwise.
-fn path_field(t: &Trash, path: &Path) -> Vec<u8> {
-    if t.kind == Kind::Home {
-        path.as_os_str().as_bytes().to_vec()
-    } else {
-        path.strip_prefix(&t.base)
-            .unwrap_or(path)
-            .as_os_str()
-            .as_bytes()
-            .to_vec()
-    }
-}
-
 fn move_in(
     t: &Trash,
     from: &OwnedFd,
@@ -712,7 +672,8 @@ fn move_in(
     date: civil::DateTime,
 ) -> io::Result<OsString> {
     let _lock = sys::lock(&t.dir, Lock::Shared)?; // empty cannot remove the reserved info meanwhile
-    let mut r = trash::reserve(t, name, info::encode(&path_field(t, path), date))?;
+    let field = info::path_field(t.scope, &t.base, path);
+    let mut r = trash::reserve(t, name, info::encode(&field, date))?;
     loop {
         match sys::rename_noreplace(from, name, to, r.name()) {
             Ok(()) => return Ok(r.commit()),
@@ -780,25 +741,12 @@ fn copy_to_home(
     let home = s.home();
     let _lock = sys::lock(&home.dir, Lock::Shared)?; // held for the whole copy: empty waits
     let staging = trash::staging(home)?;
-    let (bx, bfd) = sys::make_box(staging.as_fd(), "put")?;
-    let drop_box = |bx: &OsStr| {
-        sys::remove_tree(
-            staging.as_fd(),
-            bx,
-            &Remove {
-                mnt: home.id.mnt,
-                manifest: None,
-                trash: true,
-            },
-        );
-    };
+    let bx = sys::make_box(staging.as_fd(), "put", home.id.mnt)?; // dropped before _lock: removed under it
 
     // 1. Copy. The source is only read. No info exists yet, so a long copy
     // leaves nothing dangling.
-    if let Err(e) = sys::cp_archive(pfd.as_fd(), name, bfd.as_fd(), OsStr::new("item")) {
-        drop_box(&bx);
-        return Err(format!("copying into the home trash failed: {e}; left it untouched").into());
-    }
+    sys::cp_archive(pfd.as_fd(), name, bx.fd().as_fd(), OsStr::new("item"))
+        .map_err(|e| format!("copying into the home trash failed: {e}; left it untouched"))?;
 
     // 1b. Verify: walk what `cp` actually produced, so step 5 below deletes
     // a source entry only where the trash demonstrably holds a copy of it at
@@ -806,36 +754,21 @@ fn copy_to_home(
     // still match something the pre-copy walk saw somewhere in the tree
     // (docs/design.md §5.2: a concurrent rename during the copy must not
     // authorize deleting an entry `cp` never actually copied).
-    if let Err(e) = w.manifest.verify_copy(bfd.as_fd(), OsStr::new("item")) {
-        drop_box(&bx);
-        return Err(format!("could not verify the copy: {e}; left it untouched").into());
-    }
+    w.manifest
+        .verify_copy(bx.fd().as_fd(), OsStr::new("item"))
+        .map_err(|e| format!("could not verify the copy: {e}; left it untouched"))?;
 
     // 2. Reserve, 3. publish with NOREPLACE.
-    let mut r = match trash::reserve(
+    let mut r = trash::reserve(
         home,
         name,
         info::encode(path.as_os_str().as_bytes(), s.date),
-    ) {
-        Ok(r) => r,
-        Err(e) => {
-            drop_box(&bx);
-            return Err(e.into());
-        }
-    };
+    )?;
     loop {
-        match sys::rename_noreplace(&bfd, OsStr::new("item"), &home.files, r.name()) {
+        match sys::rename_noreplace(bx.fd(), OsStr::new("item"), &home.files, r.name()) {
             Ok(()) => break,
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                if let Err(e) = r.advance() {
-                    drop_box(&bx);
-                    return Err(e.into());
-                }
-            }
-            Err(e) => {
-                drop_box(&bx);
-                return Err(e.into());
-            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => r.advance()?,
+            Err(e) => return Err(e.into()),
         }
     }
     let n = r.commit();
@@ -849,7 +782,7 @@ fn copy_to_home(
         .ok()
         .map(|m| m.id)
         .zip(trash::reread_info(home, &n));
-    let _ = unlinkat(&staging, &bx, AtFlags::REMOVEDIR);
+    bx.finish();
 
     // 4. The copy, its info and the rename are on disk before any source
     // byte is removed.
@@ -862,8 +795,7 @@ fn copy_to_home(
         name,
         &Remove {
             mnt: st.id.mnt,
-            manifest: Some(&w.manifest),
-            trash: false,
+            policy: Policy::Source(&w.manifest),
         },
     );
     if !rm.removed_any {
@@ -975,13 +907,13 @@ mod tests {
         for admin in entries() {
             for admin_uid in entries() {
                 for user in entries() {
-                    if let Ok(Pick::Admin { .. }) = choose_topdir(admin, admin_uid, user, uid) {
+                    if let Ok(Pick::Admin) = choose_topdir(admin, admin_uid, user, uid) {
                         assert!(
                             usable(admin_uid, uid),
                             "Admin picked with an unusable admin_uid: {admin_uid:?}"
                         );
                     }
-                    if let Ok(Pick::User { .. }) = choose_topdir(admin, admin_uid, user, uid) {
+                    if let Ok(Pick::User) = choose_topdir(admin, admin_uid, user, uid) {
                         assert!(
                             usable(user, uid),
                             "User picked with an unusable user: {user:?}"
@@ -998,7 +930,7 @@ mod tests {
         for admin in entries() {
             for admin_uid in entries() {
                 for user in entries() {
-                    if let Ok(Pick::Admin { .. }) = choose_topdir(admin, admin_uid, user, uid) {
+                    if let Ok(Pick::Admin) = choose_topdir(admin, admin_uid, user, uid) {
                         assert!(
                             is_sticky_dir(admin),
                             "Admin picked without a sticky .Trash: {admin:?}"
@@ -1009,28 +941,32 @@ mod tests {
         }
     }
 
+    /// What `Pick` no longer spells out: the picked directory is reused when
+    /// it was found as a directory and created only when it was missing --
+    /// and anything else there is refused, never followed.
     #[test]
-    fn choose_topdir_create_true_only_for_missing() {
-        let uid = 1000;
-        for admin in entries() {
-            for admin_uid in entries() {
-                for user in entries() {
-                    match choose_topdir(admin, admin_uid, user, uid) {
-                        Ok(Pick::Admin { create }) => {
-                            assert_eq!(
-                                create,
-                                matches!(admin_uid, Entry::Missing),
-                                "{admin_uid:?}"
-                            );
-                        }
-                        Ok(Pick::User { create }) => {
-                            assert_eq!(create, matches!(user, Entry::Missing), "{user:?}");
-                        }
-                        Err(_) => {}
-                    }
-                }
-            }
-        }
+    fn open_or_mkdir_reuses_a_found_dir_and_creates_only_a_missing_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let top = sys::open_dir(CWD, dir.path()).unwrap();
+        std::fs::create_dir(dir.path().join("have")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("have"), dir.path().join("link")).unwrap();
+
+        let have = find_dir(&top, OsStr::new("have"));
+        assert!(matches!(have, Found::Dir(..)));
+        let fd = have.open_or_mkdir(&top, OsStr::new("have")).unwrap();
+        let have_id = sys::stat_at(&top, "have").unwrap().id;
+        assert!(sys::ident(&fd).unwrap().same_file(&have_id));
+
+        let new = find_dir(&top, OsStr::new("new"));
+        assert!(matches!(new, Found::Missing));
+        let fd = new.open_or_mkdir(&top, OsStr::new("new")).unwrap();
+        let m = sys::stat_at(&top, "new").unwrap();
+        assert!(m.is_dir() && sys::ident(&fd).unwrap().same_file(&m.id));
+        assert_eq!(m.mode & 0o777, 0o700);
+
+        let link = find_dir(&top, OsStr::new("link"));
+        assert!(matches!(link, Found::Other));
+        assert!(link.open_or_mkdir(&top, OsStr::new("link")).is_err());
     }
 
     #[test]
@@ -1041,7 +977,7 @@ mod tests {
                 for user in entries() {
                     let method1_valid = is_sticky_dir(admin) && usable(admin_uid, uid);
                     let result = choose_topdir(admin, admin_uid, user, uid);
-                    let picked_admin = matches!(result, Ok(Pick::Admin { .. }));
+                    let picked_admin = matches!(result, Ok(Pick::Admin));
                     assert_eq!(
                         picked_admin, method1_valid,
                         "admin={admin:?} admin_uid={admin_uid:?} user={user:?} -> {result:?}"
@@ -1049,9 +985,9 @@ mod tests {
                     if !method1_valid {
                         // Falls through to method 2's own outcome exactly.
                         match result {
-                            Ok(Pick::User { .. }) => assert!(usable(user, uid)),
+                            Ok(Pick::User) => assert!(usable(user, uid)),
                             Err(_) => assert!(!usable(user, uid)),
-                            Ok(Pick::Admin { .. }) => unreachable!(),
+                            Ok(Pick::Admin) => unreachable!(),
                         }
                     }
                 }
