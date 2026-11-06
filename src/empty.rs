@@ -13,37 +13,8 @@ use std::os::unix::ffi::OsStrExt;
 use jiff::civil;
 
 use crate::sys::{self, Check};
-use crate::trash::{self, Doomed};
+use crate::trash::{self, Doomed, Entry};
 use crate::{Cx, confirm, human};
-
-/// A candidate resolved back to its real `Item`/`Orphan`. `trash::Doomed`
-/// itself is not `Copy`, so it cannot be read out of a `HashMap` behind a
-/// shared borrow (`map[key]`); this small local stand-in is `Copy`, and
-/// converts to `Doomed` with `.into()` once a trash dir's final batch is
-/// built.
-#[derive(Clone, Copy)]
-enum Entry<'a> {
-    Item(&'a trash::Item),
-    Orphan(&'a trash::Orphan),
-}
-
-impl Entry<'_> {
-    fn date(&self) -> civil::DateTime {
-        match self {
-            Entry::Item(it) => it.date,
-            Entry::Orphan(o) => o.date,
-        }
-    }
-}
-
-impl<'a> From<Entry<'a>> for Doomed<'a> {
-    fn from(e: Entry<'a>) -> Doomed<'a> {
-        match e {
-            Entry::Item(it) => Doomed::Item(it),
-            Entry::Orphan(o) => Doomed::Orphan(o),
-        }
-    }
-}
 
 /// One candidate for deletion: an item or an orphan (docs/design.md §4;
 /// dangling infos are not candidates -- every `empty` removes them
@@ -230,7 +201,7 @@ pub fn run(
         by_trash[key.0].push(e);
     }
     for group in &mut by_trash {
-        group.sort_by_key(Entry::date);
+        group.sort_by_key(|e| e.date());
     }
 
     let selected = n_items + n_orphans;

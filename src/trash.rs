@@ -76,6 +76,41 @@ pub struct Dangling {
     pub info: Ident,
 }
 
+/// A `files/` entry with its record: an `Item`, or an `Orphan` (no valid
+/// `.trashinfo`). What `restore`/`purge` select and `empty` dooms;
+/// converts to `Doomed` with `.into()`.
+#[derive(Clone, Copy)]
+pub enum Entry<'a> {
+    Item(&'a Item),
+    Orphan(&'a Orphan),
+}
+
+impl<'a> Entry<'a> {
+    /// Indexes the `[Trash]` slice `load` was given.
+    pub fn trash(self) -> usize {
+        match self {
+            Entry::Item(it) => it.trash,
+            Entry::Orphan(o) => o.trash,
+        }
+    }
+
+    /// The `files/` entry name.
+    pub fn name(self) -> &'a OsStr {
+        match self {
+            Entry::Item(it) => &it.name,
+            Entry::Orphan(o) => &o.name,
+        }
+    }
+
+    /// An item's `DeletionDate`, or an orphan's local lstat ctime.
+    pub fn date(self) -> civil::DateTime {
+        match self {
+            Entry::Item(it) => it.date,
+            Entry::Orphan(o) => o.date,
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct Contents {
     pub items: Vec<Item>,
@@ -927,10 +962,20 @@ pub fn discard_verified(
 // delete_batch (empty, purge)
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Copy)]
 pub enum Doomed<'a> {
     Item(&'a Item),
     Orphan(&'a Orphan),
     Dangling(&'a Dangling),
+}
+
+impl<'a> From<Entry<'a>> for Doomed<'a> {
+    fn from(e: Entry<'a>) -> Doomed<'a> {
+        match e {
+            Entry::Item(it) => Doomed::Item(it),
+            Entry::Orphan(o) => Doomed::Orphan(o),
+        }
+    }
 }
 
 #[derive(Default)]

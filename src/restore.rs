@@ -15,7 +15,7 @@ use rustix::io::{Errno, fcntl_dupfd_cloexec};
 
 use crate::info::{self, Kind};
 use crate::sys::{self, Check, Lock, Remove};
-use crate::trash::{self, Contents, Doomed, Item, Orphan, Trash};
+use crate::trash::{self, Contents, Doomed, Entry, Item, Trash};
 use crate::{Cx, confirm, escape, human};
 
 pub fn list(cx: &Cx, all: bool, null: bool) -> Result<bool, String> {
@@ -124,13 +124,6 @@ fn print_path(cwd: &Path, path: &Path) {
 // Selection (design §5.3), shared by restore and purge
 // ---------------------------------------------------------------------------
 
-/// A selected trash entry: an `Item` for restore or purge, or an `Orphan`
-/// (reachable only by its trash path, and only when `purge` allows it).
-enum Target<'a> {
-    Item(&'a Item),
-    Orphan(&'a Orphan),
-}
-
 fn scope<'a>(items: &'a [Item], cwd: &Path, all: bool) -> Vec<&'a Item> {
     items
         .iter()
@@ -142,15 +135,9 @@ fn scope<'a>(items: &'a [Item], cwd: &Path, all: bool) -> Vec<&'a Item> {
 /// named by two different alias paths) to its first occurrence. `(trash
 /// index, entry name)` identifies a `files/` entry uniquely, regardless of
 /// whether it was reached as an `Item` or an `Orphan`.
-fn dedup(targets: &mut Vec<Target<'_>>) {
+fn dedup(targets: &mut Vec<Entry<'_>>) {
     let mut seen: HashSet<(usize, OsString)> = HashSet::new();
-    targets.retain(|t| {
-        let key = match t {
-            Target::Item(it) => (it.trash, it.name.clone()),
-            Target::Orphan(o) => (o.trash, o.name.clone()),
-        };
-        seen.insert(key)
-    });
+    targets.retain(|t| seen.insert((t.trash(), t.name().to_owned())));
 }
 
 /// Resolves a `restore`/`purge` PATH argument to an absolute path
@@ -204,7 +191,7 @@ fn by_trash_path<'a>(
     abs: &Path,
     orphans_ok: bool,
     verb: &str,
-) -> Result<Option<Target<'a>>, String> {
+) -> Result<Option<Entry<'a>>, String> {
     let ancestors: Vec<&Path> = abs
         .ancestors()
         .skip(1)
@@ -233,7 +220,7 @@ fn by_trash_path<'a>(
             .iter()
             .find(|i| i.trash == idx && i.name.as_os_str() == name)
         {
-            return Ok(Some(Target::Item(it)));
+            return Ok(Some(Entry::Item(it)));
         }
         if let Some(o) = c
             .orphans
@@ -241,7 +228,7 @@ fn by_trash_path<'a>(
             .find(|o| o.trash == idx && o.name.as_os_str() == name)
         {
             return if orphans_ok {
-                Ok(Some(Target::Orphan(o)))
+                Ok(Some(Entry::Orphan(o)))
             } else {
                 Err(format!(
                     "{}: no valid .trashinfo (try `rip purge`)",
@@ -286,8 +273,8 @@ fn select<'a>(
     all: bool,
     verb: &str,
     orphans_ok: bool,
-) -> Result<Vec<Target<'a>>, String> {
-    let mut out: Vec<Target<'a>> = Vec::new();
+) -> Result<Vec<Entry<'a>>, String> {
+    let mut out: Vec<Entry<'a>> = Vec::new();
     if paths.is_empty() {
         let pool = scope(&c.items, &cx.cwd, all);
         if pool.is_empty() {
@@ -296,7 +283,7 @@ fn select<'a>(
                 esc_path(&cx.cwd)
             ));
         }
-        out.extend(pick(&pool, verb, &cx.cwd)?.into_iter().map(Target::Item));
+        out.extend(pick(&pool, verb, &cx.cwd)?.into_iter().map(Entry::Item));
     } else {
         for p in paths {
             let abs = resolve(&cx.cwd, p);
@@ -312,9 +299,9 @@ fn select<'a>(
                         esc_path(&abs)
                     ));
                 }
-                1 => out.push(Target::Item(matches[0])),
+                1 => out.push(Entry::Item(matches[0])),
                 _ if io::stdin().is_terminal() => {
-                    out.extend(pick(&matches, verb, &cx.cwd)?.into_iter().map(Target::Item));
+                    out.extend(pick(&matches, verb, &cx.cwd)?.into_iter().map(Entry::Item));
                 }
                 _ => return Err(variants_message(ts, &abs, &matches)),
             }
@@ -782,9 +769,9 @@ pub fn restore(
     let mut items: Vec<&Item> = Vec::with_capacity(targets.len());
     for t in targets {
         match t {
-            Target::Item(it) => items.push(it),
+            Entry::Item(it) => items.push(it),
             // select() with orphans_ok = false never returns an orphan.
-            Target::Orphan(_) => return Err("internal error: restore selected an orphan".into()),
+            Entry::Orphan(_) => return Err("internal error: restore selected an orphan".into()),
         }
     }
     sort_parents_first(&mut items);
@@ -879,16 +866,15 @@ pub fn undo(cx: &Cx, yes: bool) -> Result<bool, String> {
 // purge (design §5.4)
 // ---------------------------------------------------------------------------
 
-fn purge_line(cwd: &Path, trashes: &[Trash], t: &Target<'_>) -> String {
-    match t {
-        Target::Item(it) => format!(
-            "{}  {}",
-            it.date.strftime("%Y-%m-%d %H:%M:%S"),
+fn purge_line(cwd: &Path, trashes: &[Trash], e: Entry<'_>) -> String {
+    let date = e.date().strftime("%Y-%m-%d %H:%M:%S");
+    match e {
+        Entry::Item(it) => format!(
+            "{date}  {}",
             escape(display_path(cwd, &it.original).as_os_str().as_bytes())
         ),
-        Target::Orphan(o) => format!(
-            "{}  {} (orphan, no .trashinfo)",
-            o.date.strftime("%Y-%m-%d %H:%M:%S"),
+        Entry::Orphan(o) => format!(
+            "{date}  {} (orphan, no .trashinfo)",
             escape(
                 trashes[o.trash]
                     .path
@@ -908,7 +894,7 @@ pub fn purge(cx: &Cx, paths: &[PathBuf], all: bool, yes: bool) -> Result<bool, S
     let targets = select(cx, &trashes, &contents, paths, all, "purge", true)?;
 
     if !yes {
-        for t in targets.iter().take(20) {
+        for &t in targets.iter().take(20) {
             eprintln!("  {}", purge_line(&cx.cwd, &trashes, t));
         }
         if targets.len() > 20 {
@@ -923,11 +909,8 @@ pub fn purge(cx: &Cx, paths: &[PathBuf], all: bool, yes: bool) -> Result<bool, S
     }
 
     let mut by_trash: Vec<Vec<Doomed>> = (0..trashes.len()).map(|_| Vec::new()).collect();
-    for t in &targets {
-        match t {
-            Target::Item(it) => by_trash[it.trash].push(Doomed::Item(it)),
-            Target::Orphan(o) => by_trash[o.trash].push(Doomed::Orphan(o)),
-        }
+    for &t in &targets {
+        by_trash[t.trash()].push(t.into());
     }
 
     let mut ok = true;
