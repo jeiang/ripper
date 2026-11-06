@@ -16,7 +16,7 @@ use rustix::fs::{AtFlags, CWD, Mode, OFlags, chmodat, mkdirat, openat, unlinkat}
 use rustix::io::Errno;
 use rustix::process::getuid;
 
-use crate::info::{self, Kind};
+use crate::info::{self, Scope};
 use crate::mounts::{self, Mounts};
 use crate::sys::{self, Ident, Lock, Policy, Remove};
 
@@ -27,7 +27,7 @@ use crate::sys::{self, Ident, Lock, Policy, Remove};
 const MAX_INFO_SIZE: u64 = 64 * 1024;
 
 pub struct Trash {
-    pub kind: Kind,
+    pub scope: Scope,
     /// Where it was found (Home: canonical).
     pub path: PathBuf,
     /// Relative `Path=` resolves here: `$XDG_DATA_HOME` for Home, `$topdir` otherwise.
@@ -293,7 +293,7 @@ pub fn open_home(path: &Path, create: bool, uid: u32) -> io::Result<Option<Trash
     // *both* `files/` and `info/` absent -- exactly like "no home trash at
     // all" to a read-only command, not a warning-worthy oddity. Only one of
     // the two missing is never silenced by `missing_ok` (see `finish_open`).
-    finish_open(dir, Kind::Home, canonical, base, true)
+    finish_open(dir, Scope::Home, canonical, base, true)
 }
 
 /// `create_dir_all($XDG_DATA_HOME)`, then `mkdirat` `Trash`, `files` and
@@ -316,10 +316,10 @@ fn mkdir_ignore_exists(d: impl AsFd, n: impl rustix::path::Arg) -> io::Result<()
     }
 }
 
-/// Opens a topdir trash (`Kind::Admin` or `Kind::User`) at `path`, checking
-/// it the way docs/design.md §0 invariant 5 requires: `O_NOFOLLOW`, owner
-/// `uid`, `files/`+`info/` present and on the same mount.
-pub fn open_trash(path: &Path, kind: Kind, base: &Path, uid: u32) -> io::Result<Option<Trash>> {
+/// Opens a topdir trash (`$topdir/.Trash/$uid` or `$topdir/.Trash-$uid`) at
+/// `path`, checking it the way docs/design.md §0 invariant 5 requires:
+/// `O_NOFOLLOW`, owner `uid`, `files/`+`info/` present and on the same mount.
+pub fn open_trash(path: &Path, base: &Path, uid: u32) -> io::Result<Option<Trash>> {
     let dir = match sys::open_dir(CWD, path) {
         Ok(fd) => fd,
         Err(e) if silent_skip(&e) => return Ok(None),
@@ -332,7 +332,13 @@ pub fn open_trash(path: &Path, kind: Kind, base: &Path, uid: u32) -> io::Result<
     // `files/` and `info/` together (`put::topdir_trash`) before ever
     // returning it from discovery, so one existing without them is unusual
     // enough to warn about rather than silently skip.
-    finish_open(dir, kind, path.to_path_buf(), base.to_path_buf(), false)
+    finish_open(
+        dir,
+        Scope::Topdir,
+        path.to_path_buf(),
+        base.to_path_buf(),
+        false,
+    )
 }
 
 /// Shared by `open_home` and `open_trash`: given an already-opened,
@@ -348,7 +354,7 @@ pub fn open_trash(path: &Path, kind: Kind, base: &Path, uid: u32) -> io::Result<
 /// data if swallowed.
 fn finish_open(
     dir: OwnedFd,
-    kind: Kind,
+    scope: Scope,
     path: PathBuf,
     base: PathBuf,
     missing_ok: bool,
@@ -383,7 +389,7 @@ fn finish_open(
         ));
     }
     Ok(Some(Trash {
-        kind,
+        scope,
         path,
         base,
         dir,
@@ -404,11 +410,11 @@ pub fn discover(home: Option<Trash>, ms: &Mounts, uid: u32, warn: &mut Vec<Strin
         let admin = m.point.join(".Trash");
         if sys::stat_at(CWD, &admin).is_ok_and(|a| a.is_dir() && a.sticky()) {
             let candidate = admin.join(uid.to_string());
-            let result = open_trash(&candidate, Kind::Admin, &m.point, uid);
+            let result = open_trash(&candidate, &m.point, uid);
             push_new(&mut out, result, &candidate, warn);
         }
         let user_path = m.point.join(format!(".Trash-{uid}"));
-        let result = open_trash(&user_path, Kind::User, &m.point, uid);
+        let result = open_trash(&user_path, &m.point, uid);
         push_new(&mut out, result, &user_path, warn);
     }
     out
@@ -642,7 +648,7 @@ fn load_info_entry(
         .then(|| info::parse(&bytes))
         .and_then(Result::ok)
         .and_then(|(path_bytes, date)| {
-            info::original(t.kind, &t.base, &path_bytes)
+            info::original(t.scope, &t.base, &path_bytes)
                 .ok()
                 .map(|orig| (orig, date))
         });
@@ -1156,7 +1162,7 @@ mod tests {
         let id = sys::ident(&dir_fd).unwrap();
         let files_id = sys::ident(&files).unwrap();
         Trash {
-            kind: Kind::User,
+            scope: Scope::Topdir,
             path: dir.to_path_buf(),
             base: dir.to_path_buf(),
             dir: dir_fd,

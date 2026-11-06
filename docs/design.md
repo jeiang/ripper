@@ -486,7 +486,7 @@ src/main.rs     CLI types, argv pre-scan, config, prompts, display helpers, Cx, 
 src/mounts.rs   [pure] mountinfo parser, FsId, path translation, mount refusals, route candidates
 src/sys.rs      Dev/Ident/Meta, statx, open helpers, fd_path, rename_noreplace, lock, route, walk,
                 remove_tree, cp_archive, make_box and its StagingBox guard, syncfs, raise_nofile
-src/info.rs     [pure] .trashinfo encode/parse, Path= codec, dates, Kind, original(), collision names
+src/info.rs     [pure] .trashinfo encode/parse, Path= codec, dates, Scope, original()/path_field(), collision names
 src/trash.rs    Trash, home trash, discovery, load, Reserved guard, staging, tombstones, delete_batch, discard_verified
 src/put.rs      rip FILE...: resolution, refusals, choose(), topdir trash, rename, copy fallback
 src/restore.rs  list, selection, fzf picker, restore, undo, purge command

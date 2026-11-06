@@ -13,7 +13,7 @@ use jiff::civil;
 use rustix::fs::{CWD, Mode, mkdirat};
 use rustix::io::Errno;
 
-use crate::info::{self, Kind};
+use crate::info::{self, Scope};
 use crate::mounts::{self, FsId, Mount, Mounts};
 use crate::sys::{self, Check, Dev, Lock, Meta, Policy, Removal, Remove};
 use crate::trash::{self, Trash};
@@ -226,13 +226,9 @@ pub fn topdir_trash(own: &Mount, src: &Meta, uid: u32, path: &Path) -> Result<Tr
     }
 
     let pick = choose_topdir(admin_entry, admin_uid_entry, user_entry, uid)?;
-    let mut kind = match pick {
-        Pick::Admin { .. } => Kind::Admin,
-        Pick::User { .. } => Kind::User,
-    };
-    let mut trash_path = match kind {
-        Kind::Admin => admin_uid_path.clone(),
-        _ => user_path.clone(),
+    let mut trash_path = match pick {
+        Pick::Admin { .. } => admin_uid_path.clone(),
+        Pick::User { .. } => user_path.clone(),
     };
 
     let trash_fd: OwnedFd = if let Pick::Admin { create: true } = pick {
@@ -259,7 +255,6 @@ pub fn topdir_trash(own: &Mount, src: &Meta, uid: u32, path: &Path) -> Result<Tr
                     }
                     Entry::Other => return Err("its .Trash-UID is not a directory".into()),
                 }
-                kind = Kind::User;
                 trash_path = user_path.clone();
                 match user_fd.take() {
                     Some(fd) => fd,
@@ -316,7 +311,7 @@ pub fn topdir_trash(own: &Mount, src: &Meta, uid: u32, path: &Path) -> Result<Tr
     }
 
     Ok(Trash {
-        kind,
+        scope: Scope::Topdir,
         path: trash_path,
         base: own.point.clone(),
         dir: trash_fd,
@@ -688,21 +683,6 @@ fn put_one(cx: &Cx, cli: &Cli, s: &mut Session, arg: &Path) -> Result<Done, PutE
 // Reservation and the rename path (docs/design.md §5.1)
 // ---------------------------------------------------------------------------
 
-/// The raw bytes a `.trashinfo`'s `Path=` should hold for `path`, landing in
-/// trash `t`: absolute for the home trash (written as the user reached it),
-/// relative to `t.base` ($topdir) otherwise.
-fn path_field(t: &Trash, path: &Path) -> Vec<u8> {
-    if t.kind == Kind::Home {
-        path.as_os_str().as_bytes().to_vec()
-    } else {
-        path.strip_prefix(&t.base)
-            .unwrap_or(path)
-            .as_os_str()
-            .as_bytes()
-            .to_vec()
-    }
-}
-
 fn move_in(
     t: &Trash,
     from: &OwnedFd,
@@ -712,7 +692,8 @@ fn move_in(
     date: civil::DateTime,
 ) -> io::Result<OsString> {
     let _lock = sys::lock(&t.dir, Lock::Shared)?; // empty cannot remove the reserved info meanwhile
-    let mut r = trash::reserve(t, name, info::encode(&path_field(t, path), date))?;
+    let field = info::path_field(t.scope, &t.base, path);
+    let mut r = trash::reserve(t, name, info::encode(&field, date))?;
     loop {
         match sys::rename_noreplace(from, name, to, r.name()) {
             Ok(()) => return Ok(r.commit()),

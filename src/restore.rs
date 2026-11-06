@@ -13,7 +13,7 @@ use jiff::civil;
 use rustix::fs::{AtFlags, CWD, Mode, OFlags, ResolveFlags, mkdirat, openat2, unlinkat};
 use rustix::io::{Errno, fcntl_dupfd_cloexec};
 
-use crate::info::{self, Kind};
+use crate::info::{self, Scope};
 use crate::sys::{self, Check, Lock};
 use crate::trash::{self, Contents, Doomed, Entry, Item, Trash};
 use crate::{Cx, confirm, escape, human};
@@ -573,8 +573,8 @@ fn restore_item(
     // Home: resolve from "/" (the user's own paths; symlinks followed).
     // Topdir: every lookup is RESOLVE_BENEATH the topdir fd, so a hostile
     // Path= or a planted symlink cannot leave the topdir.
-    let (base, rel, beneath) = match t.kind {
-        Kind::Home => {
+    let (base, rel, beneath) = match t.scope {
+        Scope::Home => {
             let base = sys::open_path(CWD, "/")?;
             let rel = parent_orig
                 .strip_prefix("/")
@@ -582,7 +582,7 @@ fn restore_item(
                 .to_path_buf();
             (base, rel, false)
         }
-        _ => {
+        Scope::Topdir => {
             let base = trash::open_top(t)?;
             let rel = parent_orig
                 .strip_prefix(&t.base)
