@@ -4,7 +4,7 @@
 //! prompts, and hands each trash dir's doomed entries to `trash::delete_batch`
 //! (docs/design.md §5.4).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::io::{self, IsTerminal};
 use std::os::fd::AsFd;
@@ -19,11 +19,13 @@ use crate::{Cx, confirm, human};
 /// One candidate for deletion: an item or an orphan (docs/design.md §4;
 /// dangling infos are not candidates -- every `empty` removes them
 /// unconditionally, see `run` below). `key` is `(trash index, files/ name)`,
-/// which is unique per candidate and lets a caller look the real `Item`/
-/// `Orphan` back up after this sorts purely on dates.
+/// unique per candidate. `entry` indexes the caller's own list of entries,
+/// so the caller can find the real `Item`/`Orphan` again after this sorts
+/// purely on dates.
 pub struct Cand {
     pub date: civil::DateTime,
     pub key: (usize, OsString),
+    pub entry: usize,
     /// Whether this candidate can merge with an adjacent, equal-date
     /// candidate into one `--max-size` batch: only an item can (its
     /// `DeletionDate` names one `rip` invocation, so every item sharing it
@@ -32,9 +34,14 @@ pub struct Cand {
     /// batch even if that ctime happens to equal a neighboring item's
     /// `DeletionDate` (docs/design.md §1).
     pub batchable: bool,
+    /// Its size, once `select_for_empty` needed it (`None` until then):
+    /// each candidate is sized at most once per `empty`, and the prompt
+    /// reads these instead of walking anything again.
+    pub size: Option<u64>,
 }
 
-/// Indices into `c`, after this sorts it newest-first, to delete. No filter:
+/// Indices into `c`, after this sorts it newest-first, to delete, filling in
+/// `Cand::size` (from `size`) for each candidate it had to size. No filter:
 /// every candidate. `cutoff`: `date < cutoff`, per candidate. `max`: groups
 /// candidates into batches -- a run of adjacent, equal-date `batchable`
 /// candidates is one batch, everything else is its own single-item batch --
@@ -72,7 +79,15 @@ pub fn select_for_empty(
             let start = i;
             let mut batch = 0u64;
             loop {
-                batch = batch.saturating_add(size(&c[i]));
+                let s = match c[i].size {
+                    Some(s) => s,
+                    None => {
+                        let s = size(&c[i]);
+                        c[i].size = Some(s);
+                        s
+                    }
+                };
+                batch = batch.saturating_add(s);
                 i += 1;
                 let joins_batch = i < c.len()
                     && c[start].batchable
@@ -106,23 +121,6 @@ fn entry_size(t: &trash::Trash, name: &OsStr) -> u64 {
         .unwrap_or(0)
 }
 
-/// A `size` closure for `select_for_empty` that memoizes by `Cand::key` in
-/// `cache`, shared with the prompt's own size total afterward so an entry is
-/// never walked twice in one `empty` invocation.
-fn cached_size<'c>(
-    trashes: &'c [trash::Trash],
-    cache: &'c mut HashMap<(usize, OsString), u64>,
-) -> impl FnMut(&Cand) -> u64 + 'c {
-    move |c: &Cand| {
-        if let Some(&s) = cache.get(&c.key) {
-            return s;
-        }
-        let s = entry_size(&trashes[c.key.0], &c.key.1);
-        cache.insert(c.key.clone(), s);
-        s
-    }
-}
-
 pub fn run(
     cx: &Cx,
     older_than: Option<jiff::Span>,
@@ -144,36 +142,28 @@ pub fn run(
         None => None,
     };
 
-    // Items and orphans are candidates; each is keyed by (trash index,
-    // name), which `lookup` maps back to the real entry after selection.
-    let mut cands: Vec<Cand> = Vec::with_capacity(contents.items.len() + contents.orphans.len());
-    let mut lookup: HashMap<(usize, OsString), Entry<'_>> = HashMap::new();
-    for it in &contents.items {
-        let key = (it.trash, it.name.clone());
-        cands.push(Cand {
-            date: it.date,
-            key: key.clone(),
-            batchable: true,
-        });
-        lookup.insert(key, Entry::Item(it));
-    }
-    for o in &contents.orphans {
-        let key = (o.trash, o.name.clone());
-        cands.push(Cand {
-            date: o.date,
-            key: key.clone(),
-            batchable: false,
-        });
-        lookup.insert(key, Entry::Orphan(o));
-    }
+    // Items and orphans are candidates; `Cand::entry` indexes `entries`.
+    let entries: Vec<Entry<'_>> = contents
+        .items
+        .iter()
+        .map(Entry::Item)
+        .chain(contents.orphans.iter().map(Entry::Orphan))
+        .collect();
+    let mut cands: Vec<Cand> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, &e)| Cand {
+            date: e.date(),
+            key: (e.trash(), e.name().to_owned()),
+            entry: i,
+            batchable: matches!(e, Entry::Item(_)),
+            size: None,
+        })
+        .collect();
 
-    let mut size_cache: HashMap<(usize, OsString), u64> = HashMap::new();
-    let doomed_idx = match select_for_empty(
-        &mut cands,
-        cutoff,
-        max_size,
-        cached_size(&trashes, &mut size_cache),
-    ) {
+    let doomed_idx = match select_for_empty(&mut cands, cutoff, max_size, |c| {
+        entry_size(&trashes[c.key.0], &c.key.1)
+    }) {
         Ok(idx) => idx,
         Err((have, max)) => {
             return Err(format!(
@@ -185,23 +175,19 @@ pub fn run(
     };
 
     // Group the selected items/orphans by trash dir, oldest first within
-    // each; count for the prompt.
-    let mut by_trash: Vec<Vec<Entry<'_>>> = trashes.iter().map(|_| Vec::new()).collect();
+    // each (`cands` is sorted newest first); count for the prompt.
+    let mut by_trash: Vec<Vec<Doomed<'_>>> = trashes.iter().map(|_| Vec::new()).collect();
     let mut touched: HashSet<usize> = HashSet::new();
     let mut n_items = 0u64;
     let mut n_orphans = 0u64;
-    for &i in &doomed_idx {
-        let key = &cands[i].key;
-        let e = lookup[key];
+    for &i in doomed_idx.iter().rev() {
+        let e = entries[cands[i].entry];
         match e {
             Entry::Item(_) => n_items += 1,
             Entry::Orphan(_) => n_orphans += 1,
         }
-        touched.insert(key.0);
-        by_trash[key.0].push(e);
-    }
-    for group in &mut by_trash {
-        group.sort_by_key(|e| e.date());
+        touched.insert(e.trash());
+        by_trash[e.trash()].push(e.into());
     }
 
     let selected = n_items + n_orphans;
@@ -218,18 +204,10 @@ pub fn run(
         // anything -- so if even one doomed entry was never sized, the
         // size is left out instead of computed.
         if max_size.is_some() {
-            let mut total = 0u64;
-            let mut known = true;
-            for &i in &doomed_idx {
-                match size_cache.get(&cands[i].key) {
-                    Some(&s) => total = total.saturating_add(s),
-                    None => {
-                        known = false;
-                        break;
-                    }
-                }
-            }
-            if known {
+            let total = doomed_idx
+                .iter()
+                .try_fold(0u64, |t, &i| cands[i].size.map(|s| t.saturating_add(s)));
+            if let Some(total) = total {
                 question.push_str(&format!(" ({})", human(total)));
             }
         }
@@ -258,10 +236,7 @@ pub fn run(
     let mut deleted = 0u64;
     let mut ok = true;
     for (idx, t) in trashes.iter().enumerate() {
-        let mut doomed: Vec<Doomed> = std::mem::take(&mut by_trash[idx])
-            .into_iter()
-            .map(Into::into)
-            .collect();
+        let mut doomed = std::mem::take(&mut by_trash[idx]);
         doomed.extend(dangling_by_trash[idx].iter().copied().map(Doomed::Dangling));
         let report = trash::delete_batch(t, &cx.mounts, &doomed, true);
         deleted += report.deleted;
@@ -285,12 +260,15 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     fn cand(trash: usize, name: &str, date: &str) -> Cand {
         Cand {
             date: date.parse().unwrap(),
             key: (trash, OsString::from(name)),
+            entry: 0,
             batchable: true,
+            size: None,
         }
     }
 
@@ -315,6 +293,33 @@ mod tests {
         ];
         let got = select_for_empty(&mut c, None, None, |_| 0).unwrap();
         assert_eq!(got, vec![0, 1]);
+    }
+
+    /// `select_for_empty` stores each size it measures in `Cand::size` and
+    /// reuses it (the prompt reads the same slots), so the size closure runs
+    /// at most once per candidate -- and never past the batch that overflows
+    /// `max`.
+    #[test]
+    fn size_closure_runs_at_most_once_per_candidate() {
+        let mut c = vec![
+            cand(0, "a", "2026-01-04T00:00:00"),
+            cand(0, "b", "2026-01-03T00:00:00"),
+            cand(0, "c", "2026-01-02T00:00:00"), // 30 > 25: overflows here
+            cand(0, "d", "2026-01-01T00:00:00"), // doomed without sizing
+        ];
+        let mut calls: HashMap<OsString, u32> = HashMap::new();
+        let mut size = |cd: &Cand| {
+            *calls.entry(cd.key.1.clone()).or_default() += 1;
+            10
+        };
+        let got = select_for_empty(&mut c, None, Some(25), &mut size).unwrap();
+        assert_eq!(names(&c, &got), vec!["c", "d"]);
+        let again = select_for_empty(&mut c, None, Some(25), &mut size).unwrap();
+        assert_eq!(again, got);
+        assert!(calls.values().all(|&n| n == 1), "{calls:?}");
+        assert_eq!(calls.len(), 3, "{calls:?}");
+        let sizes: Vec<Option<u64>> = c.iter().map(|cd| cd.size).collect();
+        assert_eq!(sizes, vec![Some(10), Some(10), Some(10), None]);
     }
 
     #[test]
