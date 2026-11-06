@@ -31,7 +31,7 @@ fn main() -> ExitCode {
 /// (docs/design.md §2.2). Returns a plain `u8` rather than `ExitCode` (which
 /// has no `PartialEq`) so tests can assert on the result directly; `main` is
 /// the only caller that wraps it for the real process exit.
-fn dispatch(cli: Cli) -> u8 {
+fn dispatch(mut cli: Cli) -> u8 {
     // Best effort; a deep tree can otherwise hit EMFILE in remove_tree/walk
     // well under 1024 open fds (docs/design.md §6 "RLIMIT_NOFILE raise").
     sys::raise_nofile();
@@ -76,22 +76,22 @@ fn dispatch(cli: Cli) -> u8 {
         }
     };
 
-    let result = match &cli.cmd {
-        None => put::run(&cx, &cli),
-        Some(Cmd::Undo { yes }) => restore::undo(&cx, *yes),
-        Some(Cmd::List { all, null }) => restore::list(&cx, *all, *null),
+    let result = match cli.cmd.take() {
+        None => put::run(&cx, &put::PutOpts::from(cli)),
+        Some(Cmd::Undo { yes }) => restore::undo(&cx, yes),
+        Some(Cmd::List { all, null }) => restore::list(&cx, all, null),
         Some(Cmd::Restore {
             all,
             rename,
             yes,
             paths,
-        }) => restore::restore(&cx, paths, *all, *rename, *yes),
+        }) => restore::restore(&cx, &paths, all, rename, yes),
         Some(Cmd::Empty {
             older_than,
             max_size,
             yes,
-        }) => empty::run(&cx, *older_than, *max_size, *yes),
-        Some(Cmd::Purge { all, yes, paths }) => restore::purge(&cx, paths, *all, *yes),
+        }) => empty::run(&cx, older_than, max_size, yes),
+        Some(Cmd::Purge { all, yes, paths }) => restore::purge(&cx, &paths, all, yes),
     };
 
     match result {
@@ -148,6 +148,28 @@ pub struct Cli {
     pub completions: Option<Shell>,
     #[command(subcommand)]
     pub cmd: Option<Cmd>,
+}
+
+/// Flag precedence, independent of argument order: `-f` suppresses both
+/// prompts, and `-i` beats `-I`.
+impl From<Cli> for put::PutOpts {
+    fn from(cli: Cli) -> Self {
+        let prompt = if cli.force {
+            put::Prompt::None
+        } else if cli.interactive {
+            put::Prompt::EachItem
+        } else if cli.interactive_once {
+            put::Prompt::OnceForBatch
+        } else {
+            put::Prompt::None
+        };
+        put::PutOpts {
+            files: cli.files,
+            prompt,
+            force: cli.force,
+            verbose: cli.verbose,
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -636,6 +658,29 @@ mod tests {
     }
 
     // ---- extra cases ----
+
+    #[test]
+    fn put_opts_flag_precedence() {
+        use put::{Prompt, PutOpts};
+        let opts = |words: &[&str]| PutOpts::from(try_parse(words).unwrap());
+        let cases: [(&[&str], Prompt, bool); 7] = [
+            (&["rip", "x"], Prompt::None, false),
+            (&["rip", "-i", "x"], Prompt::EachItem, false),
+            (&["rip", "-I", "x"], Prompt::OnceForBatch, false),
+            (&["rip", "-i", "-I", "x"], Prompt::EachItem, false),
+            (&["rip", "-I", "-i", "x"], Prompt::EachItem, false),
+            (&["rip", "-f", "-i", "-I", "x"], Prompt::None, true),
+            (&["rip", "-i", "-I", "-f", "x"], Prompt::None, true),
+        ];
+        for (words, prompt, force) in cases {
+            let o = opts(words);
+            assert_eq!((o.prompt, o.force), (prompt, force), "{words:?}");
+            assert_eq!(o.files, paths(&["x"]), "{words:?}");
+        }
+        let o = opts(&["rip", "-v", "a", "b"]);
+        assert!(o.verbose);
+        assert_eq!(o.files, paths(&["a", "b"]));
+    }
 
     #[test]
     fn file_then_verbose_then_subcommand_name() {
