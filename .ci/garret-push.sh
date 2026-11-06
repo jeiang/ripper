@@ -12,7 +12,10 @@ if [ $# -lt 1 ]; then
   exit 64
 fi
 
-export PATH=$HOME/.nix-profile/bin:$PATH # the workflows install the client via `nix profile install`
+# The garret client every workflow pushes with, pinned once here so ci.yml
+# and release.yml cannot drift onto different clients.
+nix profile install "github:jeiang/garret/c83cd2a79ea32427555cdd1eb1d255a3d2c0e7db#garret"
+export PATH=$HOME/.nix-profile/bin:$PATH
 
 config=${GARRET_CONFIG:-.ci/garret.toml}
 timeout=${GARRET_PUSH_TIMEOUT:-1800}

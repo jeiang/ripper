@@ -117,9 +117,7 @@ jobs:
       # event_name, job_workflow_ref and ref all match the github-actions
       # issuer in cornn-flaek modules/garret/default.nix. It must list this
       # repo and "jeiang/ripper/.github/workflows/ci.yml@refs/heads/main",
-      # or the push below is rejected server-side.
-      - name: Install the garret client
-        run: nix profile install "github:jeiang/garret/c83cd2a79ea32427555cdd1eb1d255a3d2c0e7db#garret"
-
+      # or the push below is rejected server-side. The script installs the
+      # pinned garret client itself.
       - name: Push the closures to garret
         run: .ci/garret-push.sh ./result ./result-static ./toolchain
