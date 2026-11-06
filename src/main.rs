@@ -9,7 +9,7 @@ mod restore;
 mod sys;
 mod trash;
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::os::unix::ffi::OsStrExt;
@@ -31,7 +31,7 @@ fn main() -> ExitCode {
 /// (docs/design.md §2.2). Returns a plain `u8` rather than `ExitCode` (which
 /// has no `PartialEq`) so tests can assert on the result directly; `main` is
 /// the only caller that wraps it for the real process exit.
-fn dispatch(cli: Cli) -> u8 {
+fn dispatch(mut cli: Cli) -> u8 {
     // Best effort; a deep tree can otherwise hit EMFILE in remove_tree/walk
     // well under 1024 open fds (docs/design.md §6 "RLIMIT_NOFILE raise").
     sys::raise_nofile();
@@ -68,7 +68,7 @@ fn dispatch(cli: Cli) -> u8 {
             return 2;
         }
     };
-    let cx = match Cx::new(cfg, home) {
+    let cx = match Cx::new(cfg) {
         Ok(cx) => cx,
         Err(e) => {
             eprintln!("rip: {e}");
@@ -76,22 +76,22 @@ fn dispatch(cli: Cli) -> u8 {
         }
     };
 
-    let result = match &cli.cmd {
-        None => put::run(&cx, &cli),
-        Some(Cmd::Undo { yes }) => restore::undo(&cx, *yes),
-        Some(Cmd::List { all, null }) => restore::list(&cx, *all, *null),
+    let result = match cli.cmd.take() {
+        None => put::run(&cx, &put::PutOpts::from(cli)),
+        Some(Cmd::Undo { yes }) => restore::undo(&cx, yes),
+        Some(Cmd::List { all, null }) => restore::list(&cx, all, null),
         Some(Cmd::Restore {
             all,
             rename,
             yes,
             paths,
-        }) => restore::restore(&cx, paths, *all, *rename, *yes),
+        }) => restore::restore(&cx, &paths, all, rename, yes),
         Some(Cmd::Empty {
             older_than,
             max_size,
             yes,
-        }) => empty::run(&cx, *older_than, *max_size, *yes),
-        Some(Cmd::Purge { all, yes, paths }) => restore::purge(&cx, paths, *all, *yes),
+        }) => empty::run(&cx, older_than, max_size, yes),
+        Some(Cmd::Purge { all, yes, paths }) => restore::purge(&cx, &paths, all, yes),
     };
 
     match result {
@@ -148,6 +148,28 @@ pub struct Cli {
     pub completions: Option<Shell>,
     #[command(subcommand)]
     pub cmd: Option<Cmd>,
+}
+
+/// Flag precedence, independent of argument order: `-f` suppresses both
+/// prompts, and `-i` beats `-I`.
+impl From<Cli> for put::PutOpts {
+    fn from(cli: Cli) -> Self {
+        let prompt = if cli.force {
+            put::Prompt::None
+        } else if cli.interactive {
+            put::Prompt::EachItem
+        } else if cli.interactive_once {
+            put::Prompt::OnceForBatch
+        } else {
+            put::Prompt::None
+        };
+        put::PutOpts {
+            files: cli.files,
+            prompt,
+            force: cli.force,
+            verbose: cli.verbose,
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -323,9 +345,9 @@ fn parse_age(s: &str) -> Result<jiff::Span, String> {
 /// C1 (U+0080..=U+009F, encoded as two valid UTF-8 bytes): a terminal in
 /// UTF-8 mode can act on a C1 control the same as its ESC-prefixed C0
 /// equivalent, so a hostile name cannot smuggle one through as "valid text".
-pub fn escape(b: &[u8]) -> String {
+pub fn escape(s: impl AsRef<OsStr>) -> String {
     let mut out = String::new();
-    for chunk in b.utf8_chunks() {
+    for chunk in s.as_ref().as_bytes().utf8_chunks() {
         for c in chunk.valid().chars() {
             match c {
                 '\\' => out.push_str("\\\\"),
@@ -470,11 +492,10 @@ pub struct Cx {
     pub mounts: mounts::Mounts,
     pub uid: u32,
     pub cwd: PathBuf,
-    pub home: PathBuf,
 }
 
 impl Cx {
-    fn new(cfg: Config, home: PathBuf) -> Result<Self, String> {
+    fn new(cfg: Config) -> Result<Self, String> {
         let uid = rustix::process::getuid().as_raw();
         let cwd = match std::env::current_dir() {
             Ok(cwd) => cwd,
@@ -483,7 +504,7 @@ impl Cx {
                 eprintln!(
                     "rip: cannot determine the current directory ({e}); \
                      using {} instead; a relative operand or PATH may fail",
-                    escape(fallback.as_os_str().as_bytes())
+                    escape(&fallback)
                 );
                 fallback
             }
@@ -494,7 +515,6 @@ impl Cx {
             mounts,
             uid,
             cwd,
-            home,
         })
     }
 }
@@ -516,8 +536,6 @@ fn cwd_fallback(pwd_env: Option<PathBuf>) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsStr;
-
     use super::*;
 
     fn argv(words: &[&str]) -> Vec<OsString> {
@@ -638,6 +656,29 @@ mod tests {
     }
 
     // ---- extra cases ----
+
+    #[test]
+    fn put_opts_flag_precedence() {
+        use put::{Prompt, PutOpts};
+        let opts = |words: &[&str]| PutOpts::from(try_parse(words).unwrap());
+        let cases: [(&[&str], Prompt, bool); 7] = [
+            (&["rip", "x"], Prompt::None, false),
+            (&["rip", "-i", "x"], Prompt::EachItem, false),
+            (&["rip", "-I", "x"], Prompt::OnceForBatch, false),
+            (&["rip", "-i", "-I", "x"], Prompt::EachItem, false),
+            (&["rip", "-I", "-i", "x"], Prompt::EachItem, false),
+            (&["rip", "-f", "-i", "-I", "x"], Prompt::None, true),
+            (&["rip", "-i", "-I", "-f", "x"], Prompt::None, true),
+        ];
+        for (words, prompt, force) in cases {
+            let o = opts(words);
+            assert_eq!((o.prompt, o.force), (prompt, force), "{words:?}");
+            assert_eq!(o.files, paths(&["x"]), "{words:?}");
+        }
+        let o = opts(&["rip", "-v", "a", "b"]);
+        assert!(o.verbose);
+        assert_eq!(o.files, paths(&["a", "b"]));
+    }
 
     #[test]
     fn file_then_verbose_then_subcommand_name() {
@@ -820,11 +861,11 @@ mod tests {
 
     #[test]
     fn escape_bytes() {
-        assert_eq!(escape(b"plain"), "plain");
-        assert_eq!(escape(b"a\\b"), "a\\\\b");
-        assert_eq!(escape(b"a\nb\tc"), "a\\nb\\tc");
-        assert_eq!(escape(&[0x41, 0x01, 0x42]), "A\\x01B");
-        assert_eq!(escape(&[0xff, 0x41]), "\\xffA");
+        assert_eq!(escape("plain"), "plain");
+        assert_eq!(escape("a\\b"), "a\\\\b");
+        assert_eq!(escape("a\nb\tc"), "a\\nb\\tc");
+        assert_eq!(escape(OsStr::from_bytes(&[0x41, 0x01, 0x42])), "A\\x01B");
+        assert_eq!(escape(OsStr::from_bytes(&[0xff, 0x41])), "\\xffA");
     }
 
     // Regression: escape() previously let C1 controls (U+0080..=U+009F,
@@ -834,11 +875,11 @@ mod tests {
     // (docs/design.md §0 invariant 10).
     #[test]
     fn escape_c1_controls() {
-        assert_eq!(escape("a\u{9b}b".as_bytes()), "a\\x9bb");
-        assert_eq!(escape("\u{80}\u{9f}".as_bytes()), "\\x80\\x9f");
+        assert_eq!(escape("a\u{9b}b"), "a\\x9bb");
+        assert_eq!(escape("\u{80}\u{9f}"), "\\x80\\x9f");
         // A full hostile round trip: CSI 31m RED OSC 0;T ST.
         assert_eq!(
-            escape("a\u{9b}31mRED\u{9d}0;T\u{9c}".as_bytes()),
+            escape("a\u{9b}31mRED\u{9d}0;T\u{9c}"),
             "a\\x9b31mRED\\x9d0;T\\x9c"
         );
     }

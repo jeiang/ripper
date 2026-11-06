@@ -503,21 +503,12 @@ fn count_leaf(rel: &Path, m: &Meta, w: &mut Walk) {
     );
 }
 
-/// Escapes a path or name for a `Walk::problem` message (docs/design.md §0
-/// invariant 10): every one of these embeds an entry's own name from inside the tree
-/// being walked, which can be hostile, and `Display` for `Path`/`OsStr`
-/// writes it raw. `problem` strings end up in put's stderr/prompt output by
-/// way of `PutErr`, never a `Path::display()`.
-fn show(p: impl AsRef<OsStr>) -> String {
-    crate::escape(p.as_ref().as_bytes())
-}
-
 fn flag_immutable(m: &Meta, rel: &Path, w: &mut Walk) {
     if m.attrs
         .intersects(StatxAttributes::IMMUTABLE | StatxAttributes::APPEND)
     {
         w.problem
-            .get_or_insert_with(|| format!("{} is immutable", show(rel)));
+            .get_or_insert_with(|| format!("{} is immutable", crate::escape(rel)));
     }
 }
 
@@ -559,14 +550,17 @@ fn removable_top_checks(parent: BorrowedFd<'_>, name: &OsStr, top: &Meta, uid: u
         }
         if pm.sticky() && pm.uid != uid && top.uid != uid {
             w.problem.get_or_insert_with(|| {
-                format!("{} is in a sticky directory it does not own", show(name))
+                format!(
+                    "{} is in a sticky directory it does not own",
+                    crate::escape(name)
+                )
             });
         }
     }
     flag_immutable(top, Path::new(name), w);
     if top.is_reg() && fs::accessat(parent, name, Access::READ_OK, AtFlags::EACCESS).is_err() {
         w.problem
-            .get_or_insert_with(|| format!("{} is not readable", show(name)));
+            .get_or_insert_with(|| format!("{} is not readable", crate::escape(name)));
     }
 }
 
@@ -596,7 +590,7 @@ fn walk_open_dir(
     if m.id.mnt != ctx.own_mnt {
         if ctx.uid.is_some() {
             w.problem
-                .get_or_insert_with(|| format!("{} is on another mount", show(&rel)));
+                .get_or_insert_with(|| format!("{} is on another mount", crate::escape(&rel)));
         }
         return None;
     }
@@ -605,7 +599,7 @@ fn walk_open_dir(
         Err(e) => {
             if ctx.uid.is_some() {
                 w.problem
-                    .get_or_insert_with(|| format!("{}: {e}", show(&rel)));
+                    .get_or_insert_with(|| format!("{}: {e}", crate::escape(&rel)));
             }
             return None;
         }
@@ -613,7 +607,7 @@ fn walk_open_dir(
     if !ident(&fd).is_ok_and(|i| i.same_file(&m.id) && i.mnt == ctx.own_mnt) {
         if ctx.uid.is_some() {
             w.problem
-                .get_or_insert_with(|| format!("{} changed during the walk", show(&rel)));
+                .get_or_insert_with(|| format!("{} changed during the walk", crate::escape(&rel)));
         }
         return None;
     }
@@ -627,7 +621,10 @@ fn walk_open_dir(
         .is_err()
     {
         w.problem.get_or_insert_with(|| {
-            format!("{} is not readable, writable and searchable", show(&rel))
+            format!(
+                "{} is not readable, writable and searchable",
+                crate::escape(&rel)
+            )
         });
     }
     let todo = match read_names(&fd) {
@@ -635,7 +632,7 @@ fn walk_open_dir(
         Err(e) => {
             if ctx.uid.is_some() {
                 w.problem
-                    .get_or_insert_with(|| format!("{}: {e}", show(&rel)));
+                    .get_or_insert_with(|| format!("{}: {e}", crate::escape(&rel)));
             }
             return None;
         }
@@ -664,7 +661,7 @@ fn walk_child(
         Err(e) => {
             if ctx.uid.is_some() {
                 w.problem
-                    .get_or_insert_with(|| format!("{}: {e}", show(&rel)));
+                    .get_or_insert_with(|| format!("{}: {e}", crate::escape(&rel)));
             }
             return None;
         }
@@ -673,12 +670,15 @@ fn walk_child(
         flag_immutable(&m, &rel, w);
         if sticky && owner != uid && m.uid != uid {
             w.problem.get_or_insert_with(|| {
-                format!("{} is in a sticky directory it does not own", show(&rel))
+                format!(
+                    "{} is in a sticky directory it does not own",
+                    crate::escape(&rel)
+                )
             });
         }
         if m.is_reg() && fs::accessat(dir, &n, Access::READ_OK, AtFlags::EACCESS).is_err() {
             w.problem
-                .get_or_insert_with(|| format!("{} is not readable", show(&rel)));
+                .get_or_insert_with(|| format!("{} is not readable", crate::escape(&rel)));
         }
     }
     if !m.is_dir() {

@@ -549,7 +549,7 @@ fn load_one(idx: usize, t: &Trash, c: &mut Contents) {
                         c.warnings.push(format!(
                             "{}: {}: malformed .trashinfo",
                             t.path.display(),
-                            crate::escape(name.as_bytes())
+                            crate::escape(name)
                         ));
                         c.dangling.push(Dangling {
                             trash: idx,
@@ -632,7 +632,7 @@ fn load_info_entry(
         c.warnings.push(format!(
             "{}: {}: malformed .trashinfo",
             t.path.display(),
-            crate::escape(name.as_bytes())
+            crate::escape(name)
         ));
         c.orphans.push(Orphan {
             trash: idx,
@@ -667,7 +667,7 @@ fn load_info_entry(
             c.warnings.push(format!(
                 "{}: {}: malformed .trashinfo",
                 t.path.display(),
-                crate::escape(name.as_bytes())
+                crate::escape(name)
             ));
             c.orphans.push(Orphan {
                 trash: idx,

@@ -17,7 +17,7 @@ use crate::info::{self, Scope};
 use crate::mounts::{self, FsId, Mount, Mounts};
 use crate::sys::{self, Check, Dev, Lock, Meta, Policy, Removal, Remove};
 use crate::trash::{self, Trash};
-use crate::{Cli, Cx, Fallback, confirm, escape, human};
+use crate::{Cx, Fallback, confirm, escape, human};
 
 // ---------------------------------------------------------------------------
 // Placement (docs/design.md §3.1, pure)
@@ -484,17 +484,17 @@ impl Done {
     /// `-v` output (design §2.2: goes to stdout). `dest` embeds the item's
     /// trashed name, which carries the operand's own (possibly hostile)
     /// bytes verbatim aside from a collision suffix, so it goes through
-    /// `show` the same as `arg` (docs/design.md §0 invariant 10: human output
+    /// `escape` the same as `arg` (docs/design.md §0 invariant 10: human output
     /// never writes an untrusted name raw to the terminal).
     fn print(&self, arg: &Path) {
         match self {
-            Done::Moved(dest) => println!("trashed '{}' -> {}", show(arg), show(dest)),
+            Done::Moved(dest) => println!("trashed '{}' -> {}", escape(arg), escape(dest)),
             Done::Copied(dest, size) => {
                 println!(
                     "copied '{}' ({}) -> {}",
-                    show(arg),
+                    escape(arg),
                     human(*size),
-                    show(dest)
+                    escape(dest)
                 )
             }
             Done::Declined => {}
@@ -502,40 +502,56 @@ impl Done {
     }
 }
 
-fn show(p: &Path) -> String {
-    escape(p.as_os_str().as_bytes())
+/// What a bare `rip FILE...` run was asked to do, resolved once from the
+/// rm-style flags (`main.rs` builds it from `Cli`).
+pub struct PutOpts {
+    pub files: Vec<PathBuf>,
+    pub prompt: Prompt,
+    /// `-f`: silence missing operands and skip the large-copy prompt. It
+    /// has already suppressed `-i`/`-I` by the time it lands here (`prompt`
+    /// is then `Prompt::None`).
+    pub force: bool,
+    pub verbose: bool,
+}
+
+/// The one interactive mode in effect; `-f` beats both, and `-i` beats `-I`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Prompt {
+    /// `-i`: ask before each item.
+    EachItem,
+    /// `-I`: ask once before more than three items or any directory.
+    OnceForBatch,
+    None,
 }
 
 // ---------------------------------------------------------------------------
 // Flow
 // ---------------------------------------------------------------------------
 
-pub fn run(cx: &Cx, cli: &Cli) -> Result<bool, String> {
-    if !cli.force
-        && cli.interactive_once
-        && !cli.interactive
-        && (cli.files.len() > 3
-            || cli
+pub fn run(cx: &Cx, opts: &PutOpts) -> Result<bool, String> {
+    if opts.prompt == Prompt::OnceForBatch
+        && (opts.files.len() > 3
+            || opts
                 .files
                 .iter()
                 .any(|f| std::fs::symlink_metadata(f).is_ok_and(|m| m.is_dir())))
-        && !confirm(&format!("trash {} arguments?", cli.files.len()), "-f")?
+        && !confirm(&format!("trash {} arguments?", opts.files.len()), "-f")?
     {
         return Ok(true);
     }
 
     let mut s = Session::new(cx)?;
     let mut ok = true;
-    for arg in &cli.files {
-        match put_one(cx, cli, &mut s, arg) {
+    for arg in &opts.files {
+        match put_one(cx, opts, &mut s, arg) {
             Ok(done) => {
-                if cli.verbose {
+                if opts.verbose {
                     done.print(arg);
                 }
             }
-            Err(e) if cli.force && e.not_found => {}
+            Err(e) if opts.force && e.not_found => {}
             Err(e) => {
-                eprintln!("rip: cannot trash '{}': {e}", show(arg));
+                eprintln!("rip: cannot trash '{}': {e}", escape(arg));
                 ok = false;
             }
         }
@@ -567,7 +583,11 @@ fn split_arg(arg: &Path) -> Result<(PathBuf, OsString, bool), PutErr> {
         None => (&b"."[..], trimmed),
     };
     if matches!(last, b"." | b"..") {
-        return Err(format!("'{}': refusing to trash '.' or '..'", escape(trimmed)).into());
+        return Err(format!(
+            "'{}': refusing to trash '.' or '..'",
+            escape(OsStr::from_bytes(trimmed))
+        )
+        .into());
     }
     let parent = if parent.is_empty() { &b"/"[..] } else { parent };
     Ok((
@@ -577,7 +597,7 @@ fn split_arg(arg: &Path) -> Result<(PathBuf, OsString, bool), PutErr> {
     ))
 }
 
-fn put_one(cx: &Cx, cli: &Cli, s: &mut Session, arg: &Path) -> Result<Done, PutErr> {
+fn put_one(cx: &Cx, opts: &PutOpts, s: &mut Session, arg: &Path) -> Result<Done, PutErr> {
     let (parent, name, slash) = split_arg(arg)?;
     let pfd = sys::open_path(CWD, &parent)?; // O_PATH|O_DIRECTORY: follows symlinks in the parent, as rm does
     let pid = sys::ident(&pfd)?;
@@ -622,7 +642,7 @@ fn put_one(cx: &Cx, cli: &Cli, s: &mut Session, arg: &Path) -> Result<Done, PutE
         return Err(format!("it contains the trash directory {}", t.display()).into());
     }
 
-    if cli.interactive && !cli.force && !confirm(&format!("trash '{}'?", show(arg)), "-f")? {
+    if opts.prompt == Prompt::EachItem && !confirm(&format!("trash '{}'?", escape(arg)), "-f")? {
         return Ok(Done::Declined);
     }
 
@@ -656,7 +676,7 @@ fn put_one(cx: &Cx, cli: &Cli, s: &mut Session, arg: &Path) -> Result<Done, PutE
         },
         Choice::Fallback(why) => why,
     };
-    copy_to_home(cx, cli, s, &pfd, &name, &path, &st, why)
+    copy_to_home(cx, opts, s, &pfd, &name, &path, &st, why)
 }
 
 // ---------------------------------------------------------------------------
@@ -690,7 +710,7 @@ fn move_in(
 fn removal_summary(rm: &Removal) -> String {
     rm.kept
         .iter()
-        .map(|(p, why)| format!("{}: {why}", show(p)))
+        .map(|(p, why)| format!("{}: {why}", escape(p)))
         .collect::<Vec<_>>()
         .join("; ")
 }
@@ -698,7 +718,7 @@ fn removal_summary(rm: &Removal) -> String {
 #[allow(clippy::too_many_arguments)]
 fn copy_to_home(
     cx: &Cx,
-    cli: &Cli,
+    opts: &PutOpts,
     s: &Session,
     pfd: &OwnedFd,
     name: &OsStr,
@@ -718,12 +738,12 @@ fn copy_to_home(
     if let Some(p) = w.problem {
         return Err(format!("{p}; not copying it").into());
     }
-    if !cli.force
+    if !opts.force
         && w.size > cx.cfg.copy_threshold
         && !confirm(
             &format!(
                 "'{}' ({}) has no usable trash on its filesystem ({why}). Copy it into {} and delete the original?",
-                show(path),
+                escape(path),
                 human(w.size),
                 s.home().path.display()
             ),
@@ -734,7 +754,7 @@ fn copy_to_home(
     }
     eprintln!(
         "rip: '{}' has no usable trash on its filesystem ({why}); copying {} into the home trash",
-        show(path),
+        escape(path),
         human(w.size)
     );
 
@@ -815,7 +835,7 @@ fn copy_to_home(
     if !rm.kept.is_empty() {
         return Err(format!(
             "the trash holds a complete copy ({}); these source entries were kept: {}",
-            show(&home.path.join("files").join(&n)),
+            escape(home.path.join("files").join(&n)),
             removal_summary(&rm)
         )
         .into());

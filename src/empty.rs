@@ -8,7 +8,6 @@ use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::io::{self, IsTerminal};
 use std::os::fd::AsFd;
-use std::os::unix::ffi::OsStrExt;
 
 use jiff::civil;
 
@@ -241,10 +240,7 @@ pub fn run(
         let report = trash::delete_batch(t, &cx.mounts, &doomed, true);
         deleted += report.deleted;
         for (path, why) in &report.kept {
-            eprintln!(
-                "rip: could not delete {}: {why}",
-                crate::escape(path.as_os_str().as_bytes())
-            );
+            eprintln!("rip: could not delete {}: {why}", crate::escape(path));
             ok = false;
         }
     }

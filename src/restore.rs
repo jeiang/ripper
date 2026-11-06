@@ -59,14 +59,6 @@ fn display_path(cwd: &Path, original: &Path) -> PathBuf {
     }
 }
 
-/// Escapes a path the way `escape()` escapes any other name, for the error,
-/// prompt and report messages below whose path can come straight from a
-/// hostile `Path=` (or an entry name in a shared topdir trash) and must not
-/// reach the terminal raw (design §0 invariant 10).
-fn esc_path(p: &Path) -> String {
-    escape(p.as_os_str().as_bytes())
-}
-
 /// Writes `-0`'s `DATE<TAB>PATH<NUL>` records, or plain `DATE  PATH\n`
 /// lines, oldest first (the order `items` is already sorted in). PATH is
 /// written as raw bytes throughout, except that it is passed through
@@ -88,7 +80,7 @@ fn write_items(
             out.write_all(path.as_os_str().as_bytes())?;
             out.write_all(b"\0")?;
         } else if term {
-            writeln!(out, "{date}  {}", escape(path.as_os_str().as_bytes()))?;
+            writeln!(out, "{date}  {}", escape(path))?;
         } else {
             write!(out, "{date}  ")?;
             out.write_all(path.as_os_str().as_bytes())?;
@@ -113,7 +105,7 @@ fn print_path(cwd: &Path, path: &Path) {
     let stdout = io::stdout();
     let mut out = stdout.lock();
     if out.is_terminal() {
-        let _ = writeln!(out, "{}", escape(rel.as_os_str().as_bytes()));
+        let _ = writeln!(out, "{}", escape(rel));
     } else {
         let _ = out.write_all(rel.as_os_str().as_bytes());
         let _ = out.write_all(b"\n");
@@ -208,8 +200,8 @@ fn by_trash_path<'a>(
             let item_name = ancestors[depth - 1].file_name().unwrap_or(OsStr::new(""));
             return Err(format!(
                 "{}: {verb} the whole item '{}'",
-                esc_path(abs),
-                escape(item_name.as_bytes())
+                escape(abs),
+                escape(item_name)
             ));
         }
         let Some(name) = abs.file_name() else {
@@ -232,7 +224,7 @@ fn by_trash_path<'a>(
             } else {
                 Err(format!(
                     "{}: no valid .trashinfo (try `rip purge`)",
-                    esc_path(abs)
+                    escape(abs)
                 ))
             };
         }
@@ -245,7 +237,7 @@ fn by_trash_path<'a>(
 fn variants_message(ts: &[Trash], abs: &Path, matches: &[&Item]) -> String {
     let mut msg = format!(
         "{} names {} trashed items; pass one of these trash paths instead:",
-        esc_path(abs),
+        escape(abs),
         matches.len()
     );
     for it in matches {
@@ -253,7 +245,7 @@ fn variants_message(ts: &[Trash], abs: &Path, matches: &[&Item]) -> String {
         msg.push_str(&format!(
             "\n  {}  {}",
             it.date.strftime("%Y-%m-%d %H:%M:%S"),
-            esc_path(&trash_path)
+            escape(&trash_path)
         ));
     }
     msg
@@ -280,7 +272,7 @@ fn select<'a>(
         if pool.is_empty() {
             return Err(format!(
                 "nothing trashed under {} (try --all)",
-                esc_path(&cx.cwd)
+                escape(&cx.cwd)
             ));
         }
         out.extend(pick(&pool, verb, &cx.cwd)?.into_iter().map(Entry::Item));
@@ -296,7 +288,7 @@ fn select<'a>(
                 0 => {
                     return Err(format!(
                         "nothing in the trash has the original path {}",
-                        esc_path(&abs)
+                        escape(&abs)
                     ));
                 }
                 1 => out.push(Entry::Item(matches[0])),
@@ -336,9 +328,7 @@ fn fzf_args(verb: &str) -> Vec<String> {
 fn fzf_record(index: usize, it: &Item, cwd: &Path) -> Vec<u8> {
     let mut buf = Vec::new();
     write!(buf, "{index}\t{}\t", it.date.strftime("%Y-%m-%d %H:%M:%S")).unwrap();
-    buf.extend_from_slice(
-        escape(display_path(cwd, &it.original).as_os_str().as_bytes()).as_bytes(),
-    );
+    buf.extend_from_slice(escape(display_path(cwd, &it.original)).as_bytes());
     buf.push(0);
     buf
 }
@@ -619,7 +609,7 @@ fn restore_item(
         let size = sys::walk(t.files.as_fd(), &it.name, Check::Size)?.size;
         if !yes && size > cx.cfg.copy_threshold {
             let confirmed = confirm(
-                &format!("copy {} back to {}?", human(size), esc_path(&it.original)),
+                &format!("copy {} back to {}?", human(size), escape(&it.original)),
                 "-y",
             )
             .map_err(RestoreError::Other)?;
@@ -746,8 +736,8 @@ fn restore_batch(
         if let Some(parent) = blocking_ancestor(&blocked, &it.original) {
             eprintln!(
                 "rip: cannot restore '{}': its parent {} was not restored; it stays in the trash",
-                esc_path(&it.original),
-                esc_path(parent)
+                escape(&it.original),
+                escape(parent)
             );
             ok = false;
             continue;
@@ -761,12 +751,12 @@ fn restore_batch(
                         let trash_path = trashes[it.trash].path.join("files").join(&it.name);
                         eprintln!(
                             "rip: cannot restore '{}': it exists; use `rip restore --rename {}`",
-                            esc_path(&it.original),
-                            esc_path(&trash_path)
+                            escape(&it.original),
+                            escape(&trash_path)
                         );
                     }
                     RestoreError::Other(msg) => {
-                        eprintln!("rip: cannot restore '{}': {msg}", esc_path(&it.original));
+                        eprintln!("rip: cannot restore '{}': {msg}", escape(&it.original));
                     }
                 }
                 ok = false;
@@ -832,20 +822,10 @@ pub fn undo(cx: &Cx, yes: bool) -> Result<bool, String> {
 fn purge_line(cwd: &Path, trashes: &[Trash], e: Entry<'_>) -> String {
     let date = e.date().strftime("%Y-%m-%d %H:%M:%S");
     match e {
-        Entry::Item(it) => format!(
-            "{date}  {}",
-            escape(display_path(cwd, &it.original).as_os_str().as_bytes())
-        ),
+        Entry::Item(it) => format!("{date}  {}", escape(display_path(cwd, &it.original))),
         Entry::Orphan(o) => format!(
             "{date}  {} (orphan, no .trashinfo)",
-            escape(
-                trashes[o.trash]
-                    .path
-                    .join("files")
-                    .join(&o.name)
-                    .as_os_str()
-                    .as_bytes()
-            )
+            escape(trashes[o.trash].path.join("files").join(&o.name))
         ),
     }
 }
@@ -883,7 +863,7 @@ pub fn purge(cx: &Cx, paths: &[PathBuf], all: bool, yes: bool) -> Result<bool, S
         }
         let report = trash::delete_batch(&trashes[idx], &cx.mounts, &doomed, false);
         for (path, why) in &report.kept {
-            eprintln!("rip: cannot delete '{}': {why}", esc_path(path));
+            eprintln!("rip: cannot delete '{}': {why}", escape(path));
             ok = false;
         }
     }
