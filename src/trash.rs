@@ -18,7 +18,7 @@ use rustix::process::getuid;
 
 use crate::info::{self, Kind};
 use crate::mounts::{self, Mounts};
-use crate::sys::{self, Ident, Lock, Remove};
+use crate::sys::{self, Ident, Lock, Policy, Remove};
 
 /// A `.trashinfo` is capped here (docs/design.md invariant re: FIFO-safe
 /// reads): a FIFO or symlink never reaches this check (it fails the
@@ -817,7 +817,7 @@ fn next_tombstone_name(pid: u32) -> OsString {
 /// on the directory itself, to update `..` -- unlike every other entry
 /// kind, so a top-level entry without it (a copy-based trasher, or a chmod
 /// after trashing) would otherwise never tombstone; `remove_tree`'s own
-/// trash-policy repair runs too late, only on entries already inside a
+/// `Policy::Discard` repair runs too late, only on entries already inside a
 /// tombstone. Best-effort and silent: a failure here just means the
 /// rename below reports the real error (docs/design.md §4).
 fn add_owner_write_if_needed(dir: &OwnedFd, name: &OsStr) {
@@ -945,8 +945,7 @@ pub fn discard_verified(
         &tomb,
         &Remove {
             mnt: t.id.mnt,
-            manifest: None,
-            trash: true,
+            policy: Policy::Discard,
         },
     );
     if !removal.kept.is_empty() {
@@ -1057,8 +1056,7 @@ pub fn delete_batch(t: &Trash, ms: &Mounts, doomed: &[Doomed], clean_staging: bo
             &n,
             &Remove {
                 mnt: t.id.mnt,
-                manifest: None,
-                trash: true,
+                policy: Policy::Discard,
             },
         );
         rep.kept.extend(r.kept);

@@ -15,7 +15,7 @@ use rustix::io::Errno;
 
 use crate::info::{self, Kind};
 use crate::mounts::{self, FsId, Mount, Mounts};
-use crate::sys::{self, Check, Dev, Lock, Meta, Removal, Remove};
+use crate::sys::{self, Check, Dev, Lock, Meta, Policy, Removal, Remove};
 use crate::trash::{self, Trash};
 use crate::{Cli, Cx, Fallback, confirm, escape, human};
 
@@ -834,8 +834,7 @@ fn copy_to_home(
         name,
         &Remove {
             mnt: st.id.mnt,
-            manifest: Some(&w.manifest),
-            trash: false,
+            policy: Policy::Source(&w.manifest),
         },
     );
     if !rm.removed_any {
