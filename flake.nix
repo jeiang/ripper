@@ -67,6 +67,8 @@
       devShells = forSystems (linux ++ [ "aarch64-darwin" ]) (pkgs: {
         default = pkgs.mkShell {
           packages = with pkgs; [ cargo rustc clippy rustfmt rust-analyzer just actionlint ]
+            # Editor language servers for the Nix, shell and TOML files.
+            ++ [ nixd bash-language-server taplo ]
             # Sandbox tests: bwrap, btrfs subvolumes, `script` for terminals,
             # fish, fzf, and bash-completion for tests/completions.rs's
             # bash/zsh sandbox tests (zsh needs zsh/zpty and compinit; bash
